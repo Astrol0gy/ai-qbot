@@ -38,6 +38,18 @@ BOT_SYSTEM_PROMPT = os.getenv(
 )
 MAX_HISTORY_LENGTH = int(os.getenv("MAX_HISTORY_LENGTH", "10"))
 
+# ============================================
+# Qwen 视觉识别（阿里云百炼 Model Studio）
+# ============================================
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+VISION_BASE_URL = os.getenv(
+    "VISION_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen3-vl-flash")
+VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").lower() == "true"
+VISION_HIGH_RES = os.getenv("VISION_HIGH_RES", "false").lower() == "true"
+
 
 def validate():
     """检查必要配置是否已填写"""

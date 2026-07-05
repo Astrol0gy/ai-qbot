@@ -13,11 +13,13 @@ from botpy.message import GroupMessage
 from .config import (
     QQ_BOT_APP_ID,
     QQ_BOT_APP_SECRET,
+    DASHSCOPE_API_KEY,
     DEEPSEEK_ENABLE_THINKING,
     DEEPSEEK_ENABLE_SEARCH,
     validate,
 )
 from .deepseek_client import chat, clear_history
+from .vision_utils import describe_image
 
 # ============================================
 # 消息清理
@@ -61,7 +63,48 @@ class QBot(botpy.Client):
             if not user_msg:
                 user_msg = "用户引用了一条消息，请根据上下文尽力理解"
 
-        print(f"[📩 群消息] 群={group_id} 用户={user_id}：{user_msg}")
+        # --- 图片识别（VLM 预处理）---
+        attachments = getattr(message, "attachments", []) or []
+        image_attachments = [
+            a for a in attachments
+            if getattr(a, "content_type", "").startswith("image/")
+        ]
+        if image_attachments:
+            print(f"[图片消息] 检测到 {len(image_attachments)} 个图片附件")
+
+            # 检查 VLM 是否可用
+            if not DASHSCOPE_API_KEY:
+                print("[图片消息] VLM 未配置，跳过")
+                await self._safe_reply(
+                    message,
+                    "抱歉，视觉识别功能未配置，无法识别图片内容。\n"
+                    "请在 .env 中填写 DASHSCOPE_API_KEY（百炼 API Key）后重试。"
+                )
+                return
+
+            media_descs = []
+            for i, att in enumerate(image_attachments):
+                media_url = getattr(att, "url", "")
+                if not media_url:
+                    continue
+                print(f"[VLM] 图片 {i + 1}/{len(image_attachments)}: {media_url[:80]}...")
+
+                desc = describe_image(media_url, question=user_msg if i == 0 else "")
+                label = f"图片{i + 1}"
+
+                if desc:
+                    media_descs.append(f"{label}：{desc}")
+                else:
+                    media_descs.append(f"{label}：识别失败")
+
+            if media_descs:
+                media_text = "\n\n".join(media_descs)
+                if user_msg:
+                    user_msg = f"用户发送了{len(image_attachments)}张图片：\n{media_text}\n\n用户的问题：{user_msg}"
+                else:
+                    user_msg = f"用户发送了{len(image_attachments)}张图片，请根据以下描述回答：\n{media_text}"
+
+        print(f"[📩 群消息] 群={group_id} 用户={user_id}：{user_msg[:100]}{'...' if len(user_msg) > 100 else ''}")
 
         # --- 空消息 ---
         if not user_msg:
