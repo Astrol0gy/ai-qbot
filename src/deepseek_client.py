@@ -58,6 +58,9 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     system_prompt = (
         f"{BOT_SYSTEM_PROMPT}\n\n"
         f"当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。\n\n"
+        "【可用命令】\n"
+        "/help — 查看全部功能  /reset — 清除对话记忆\n"
+        "/look <信息> — 让我记住你的偏好  /forget <关键词> — 忘记已记录的偏好  /list — 查看已记录的偏好\n\n"
         "【回复格式要求 — 必须遵守】\n"
         "你的回复发送到 QQ 群聊，QQ 不支持 Markdown 渲染，禁止使用任何 Markdown 语法。\n"
         "请使用以下纯文本格式替代：\n"

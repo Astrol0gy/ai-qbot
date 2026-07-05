@@ -28,6 +28,24 @@ from . import user_profile
 _AT_PATTERN = re.compile(r"<@!\d+>|@\S+")
 _IMG_MARKER = re.compile(r"\[img\](.*?)\[/img\]")
 
+HELP_TEXT = """【小Q 功能指南】
+
+聊天空谈、查资料、搜图片视频，@我就能帮你～
+
+命令：
+  /help  - 查看本帮助
+  /reset - 清除对话记忆
+  /look <信息> - 让我记住你的偏好（如 /look 我喜欢简短回答）
+  /forget <关键词> - 忘记已记录的偏好（/forget all 清除全部）
+  /list - 查看已记录的偏好
+
+能力：
+  · 联网搜索 - 查天气、新闻、实时信息
+  · 图片识别 - 发图让我帮你分析图片内容
+  · 图片搜索 - 告诉我你想看什么图
+  · 视频搜索 - B站搜视频直达链接
+  · 用户画像 - 记住你的偏好，越聊越懂你"""
+
 
 def clean_message(raw: str) -> str:
     """去掉 @机器人 部分，返回纯文本消息"""
@@ -110,10 +128,14 @@ class QBot(botpy.Client):
 
         # --- 空消息 ---
         if not user_msg:
-            await self._safe_reply(message, "你好呀～请问有什么可以帮你的？")
+            await self._safe_reply(message, "你好呀～请问有什么可以帮你的？\n发送 /help 查看我的全部功能～")
             return
 
         # --- 内置指令 ---
+        if user_msg.strip() == "/help":
+            await self._safe_reply(message, HELP_TEXT)
+            return
+
         if user_msg.strip() == "/reset":
             clear_history(group_id, user_id)
             await self._safe_reply(message, "记忆已清除，让我们重新开始吧！")
