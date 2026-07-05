@@ -24,6 +24,7 @@ from .config import (
     MAX_HISTORY_LENGTH,
 )
 from .tools import execute as execute_tool, get_definitions
+from . import skills
 
 # 异步客户端
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -45,9 +46,24 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     key = _make_key(group_id, user_id)
     history = _conversations[key]
 
-    # 构建请求消息（注入当前日期，避免模型不知道"今天"是哪天）
+    # 构建请求消息（注入当前日期 + skill 指引）
     today = datetime.now().strftime("%Y年%m月%d日 %A")
-    system_prompt = f"{BOT_SYSTEM_PROMPT}\n\n当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。"
+    skills_meta = skills.get_metadata_section()        # Level 1: 元数据摘要
+    skills_body = skills.get_all_skill_bodies()         # 完整 skill body
+    system_prompt = (
+        f"{BOT_SYSTEM_PROMPT}\n\n"
+        f"当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。\n\n"
+        "【回复格式要求 — 必须遵守】\n"
+        "你的回复发送到 QQ 群聊，QQ 不支持 Markdown 渲染，禁止使用任何 Markdown 语法。\n"
+        "请使用以下纯文本格式替代：\n"
+        "- 用【标题】或「关键词」突出重点，代替 **粗体**\n"
+        "- 用数字序号 1. 2. 3. 表达分点，代替 ### 标题\n"
+        "- 用 · 开头表示列表项，代替 - 或 * 列表\n"
+        "- 禁止使用 # * _ ` ``` ~~ 等 Markdown 标记\n"
+        "- 禁止使用 [文字](链接) 格式，直接写链接 URL 即可\n"
+        f"{skills_meta}"                                # skill 列表
+        f"\n\n## 技能详细指引\n{skills_body}"            # 完整流程
+    )
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history[-MAX_HISTORY_LENGTH * 2:])
     messages.append({"role": "user", "content": user_message})
