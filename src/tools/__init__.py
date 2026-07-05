@@ -93,10 +93,12 @@ _registry = ToolRegistry()
 from .search_provider import SearchProvider  # noqa: E402
 from .image_provider import ImageProvider  # noqa: E402
 from .bilibili_provider import BilibiliProvider  # noqa: E402
+from .profile_provider import ProfileProvider  # noqa: E402
 
 _registry.register_provider(SearchProvider())
 _registry.register_provider(ImageProvider())
 _registry.register_provider(BilibiliProvider())
+_registry.register_provider(ProfileProvider())
 
 
 # ============================================

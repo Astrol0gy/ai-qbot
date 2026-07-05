@@ -22,3 +22,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# 用户画像数据（不应提交到 git）
+data/

@@ -20,6 +20,7 @@ from .config import (
 )
 from .deepseek_client import chat, clear_history
 from .vision_utils import describe_image
+from . import user_profile
 
 # ============================================
 # 消息清理
@@ -117,6 +118,27 @@ class QBot(botpy.Client):
             await self._safe_reply(message, "记忆已清除，让我们重新开始吧！")
             return
 
+        # 用户画像指令
+        profile_result = self._handle_profile_cmd(user_msg.strip(), group_id, user_id)
+        if profile_result is not None:
+            await self._safe_reply(message, profile_result)
+            return
+
+        # /look 指令：交给 LLM 总结提炼后自行调用工具存储
+        if user_msg.startswith("/look "):
+            raw_info = user_msg[6:].strip()
+            if not raw_info:
+                await self._safe_reply(message, "请提供要记住的信息，例如：/look 我喜欢简短的回答")
+                return
+            user_msg = (
+                f"用户要求记住关于ta的使用偏好或设定：「{raw_info}」\n\n"
+                "请按以下步骤处理：\n"
+                "1. 理解用户意图：是简单的风格偏好，还是引用了某个角色/人名/风格？\n"
+                "2. 如果是角色引用（如'像哆啦A梦一样'、'用鲁迅的风格'），且你对具体特点不够了解，请先用 web_search 搜索相关信息，总结关键特征\n"
+                "3. 将信息提炼成简洁的要点后，使用 manage_user_profile 工具以 action=remember 记录下来\n"
+                "4. 最后简短告知用户你已记住什么"
+            )
+
         # --- 交给 DeepSeek ---
         try:
             reply = await chat(group_id, user_id, user_msg)
@@ -125,6 +147,27 @@ class QBot(botpy.Client):
             reply = "抱歉，我暂时无法回复，请稍后再试～"
 
         await self._safe_reply(message, reply)
+
+    @staticmethod
+    def _handle_profile_cmd(user_msg: str, group_id: str, user_id: str) -> str | None:
+        """
+        处理用户画像指令：/forget, /list
+        /look 由 LLM 处理器负责（总结提炼后调用 manage_user_profile 工具）
+        返回操作结果字符串，非指令时返回 None。
+        """
+        if user_msg.startswith("/forget"):
+            info = user_msg[7:].strip()
+            if not info:
+                return "请提供要忘记的信息关键词，例如：/forget 简短\n或使用 /forget all 清除所有记录。"
+            return user_profile.forget_info(info, group_id, user_id)
+
+        elif user_msg == "/list":
+            result = user_profile.list_profile(group_id, user_id)
+            if result == "暂无任何记录。" or result == "暂无记录。":
+                return "还没有记录任何关于你的使用偏好。\n你可以用 /look <信息> 来记录，或者我会在对话中自己记住你的偏好。"
+            return f"已记录的偏好和习惯：\n{result}"
+
+        return None
 
     @staticmethod
     async def _safe_reply(message: GroupMessage, content: str):

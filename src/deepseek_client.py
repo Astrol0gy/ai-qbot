@@ -25,6 +25,7 @@ from .config import (
 )
 from .tools import execute as execute_tool, get_definitions
 from . import skills
+from . import user_profile
 
 # 异步客户端
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -46,10 +47,14 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     key = _make_key(group_id, user_id)
     history = _conversations[key]
 
-    # 构建请求消息（注入当前日期 + skill 指引）
+    # 设置当前用户上下文（供 profile 工具使用）
+    user_profile.set_current_context(group_id, user_id)
+
+    # 构建请求消息（注入当前日期 + skill 指引 + 用户画像）
     today = datetime.now().strftime("%Y年%m月%d日 %A")
     skills_meta = skills.get_metadata_section()        # Level 1: 元数据摘要
     skills_body = skills.get_all_skill_bodies()         # 完整 skill body
+    profile_text = user_profile.get_profile_for_prompt()
     system_prompt = (
         f"{BOT_SYSTEM_PROMPT}\n\n"
         f"当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。\n\n"
@@ -63,6 +68,7 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
         "- 禁止使用 [文字](链接) 格式，直接写链接 URL 即可\n"
         f"{skills_meta}"                                # skill 列表
         f"\n\n## 技能详细指引\n{skills_body}"            # 完整流程
+        f"{profile_text}"                                # 用户画像（如有）
     )
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history[-MAX_HISTORY_LENGTH * 2:])
