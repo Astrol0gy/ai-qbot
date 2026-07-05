@@ -85,14 +85,24 @@ class QBot(botpy.Client):
 
     @staticmethod
     async def _safe_reply(message: GroupMessage, content: str):
-        """安全回复，截断过长的消息"""
-        max_len = 2000  # QQ 群消息大致上限
+        """安全回复，截断过长的消息，断连时自动等待 SDK 重连"""
+        import asyncio
+        max_len = 2000
         if len(content) > max_len:
             content = content[: max_len - 30] + "\n\n……(内容过长，已截断)"
-        try:
-            await message.reply(content=content)
-        except Exception as e:
-            print(f"[❌ 回复失败] {e}")
+        for attempt in range(1, 6):
+            try:
+                await message.reply(content=content)
+                if attempt > 1:
+                    print(f"[✅ 回复成功] 第 {attempt} 次重试")
+                return
+            except Exception as e:
+                wait = attempt * 2  # 2, 4, 6, 8, 10 秒
+                if attempt < 5:
+                    print(f"[⚠️ 回复等待重连 {attempt}/5] 等 {wait}s... {e}")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"[❌ 回复最终失败] {e}")
 
 
 # ============================================

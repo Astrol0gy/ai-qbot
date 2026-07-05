@@ -55,8 +55,8 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     # 工具列表
     tools = get_definitions() if DEEPSEEK_ENABLE_SEARCH else None
 
-    # 工具调用循环（最多 5 轮：search → fetch → 可能需要再次 search/fetch）
-    for _ in range(5):
+    # 工具调用循环（最多 8 轮。思考模式下每轮 15-30s，复杂搜索需要更多轮次）
+    for round_num in range(1, 9):
         kwargs = _build_request_kwargs(messages, tools)
         response = await client.chat.completions.create(**kwargs)
         msg = response.choices[0].message
@@ -64,16 +64,16 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
         # 调试：打印思考过程
         reasoning = getattr(msg, "reasoning_content", None)
         if reasoning:
-            print(f"[🧠 思考]\n{reasoning}")
+            print(f"[🧠 思考 R{round_num}]\n{reasoning}")
 
         # 有工具调用 → 执行并继续
         if msg.tool_calls:
-            print(f"[🔧 工具调用] {[tc.function.name for tc in msg.tool_calls]}")
+            print(f"[🔧 工具调用 R{round_num}] {[tc.function.name for tc in msg.tool_calls]}")
             messages.append(msg)
 
             for tc in msg.tool_calls:
                 result = execute_tool(tc.function.name, tc.function.arguments)
-                print(f"[📡 搜索结果]\n{result}")
+                print(f"[📡 搜索结果 R{round_num}]\n{result}")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -83,15 +83,40 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
 
         # 最终回答
         reply = msg.content or ""
+        print(f"[✅ 完成] 共 {round_num} 轮")
         break
     else:
-        reply = "抱歉，处理超时，请稍后再试。"
+        # fallback：轮数用完，用已获取的信息做最终总结
+        tool_count = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "tool")
+        print(f"[⚠️ 超时] 达到 8 轮上限，已获取 {tool_count} 条搜索结果，执行 fallback 总结...")
+        reply = await _fallback_summarize(messages)
 
     # 保存对话历史（只存 user/assistant，不存中间 tool 消息）
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": reply})
 
     return reply
+
+
+async def _fallback_summarize(messages: list[dict]) -> str:
+    """用已有的搜索结果做最终总结，告知用户信息不完整"""
+    try:
+        messages.append({
+            "role": "user",
+            "content": (
+                "以上是你多次搜索和抓取网页获取到的所有信息。"
+                "请根据这些已有信息做一个总结回答用户的原始问题。"
+                "如果信息不足以完整回答，请在总结后诚实地告知用户：由于搜索次数超限，可能未能获取到全部所需信息。"
+            ),
+        })
+        kwargs = _build_request_kwargs(messages, tools=None)
+        response = await client.chat.completions.create(**kwargs)
+        reply = response.choices[0].message.content or ""
+        print(f"[🔄 Fallback 总结]\n{reply[:200]}...")
+        return reply
+    except Exception as e:
+        print(f"[❌ Fallback 失败] {e}")
+        return "抱歉，搜索耗时过长，请稍后重试。"
 
 
 def _build_request_kwargs(messages: list[dict], tools: list[dict] | None) -> dict:
