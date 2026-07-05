@@ -41,7 +41,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._providers: list[ToolProvider] = []
-        self._tool_map: dict[str, tuple[dict, Callable]] = {}  # name → (def, handler)
+        self._tool_map: dict[str, tuple[dict, Callable, int]] = {}  # name → (def, handler, max_calls)
 
     def register_provider(self, provider: ToolProvider):
         """注册一个 Provider，将其所有工具加入注册表"""
@@ -56,7 +56,8 @@ class ToolRegistry:
                     "parameters": tool_meta["parameters"],
                 },
             }
-            self._tool_map[name] = (definition, tool_meta["handler"])
+            max_calls = tool_meta.get("max_calls", 5)  # 默认 5 次
+            self._tool_map[name] = (definition, tool_meta["handler"], max_calls)
         print(f"[ToolRegistry] 注册 Provider「{provider.name}」 -> 工具: {provider.get_tool_names()}")
 
     def get_definitions(self, whitelist: set[str] | None = None) -> list[dict]:
@@ -65,15 +66,22 @@ class ToolRegistry:
         whitelist: 可选白名单（工具名集合），只返回白名单内的工具。None 则返回全部。
         """
         if whitelist is not None:
-            return [defn for name, (defn, _) in self._tool_map.items() if name in whitelist]
-        return [defn for defn, _ in self._tool_map.values()]
+            return [defn for name, (defn, _, _) in self._tool_map.items() if name in whitelist]
+        return [defn for defn, _, _ in self._tool_map.values()]
+
+    def get_max_calls(self, tool_name: str) -> int:
+        """获取某个工具的调用次数上限。未注册的工具返回 0。"""
+        entry = self._tool_map.get(tool_name)
+        if entry is None:
+            return 0
+        return entry[2]
 
     def execute(self, tool_name: str, arguments: str) -> str:
         """执行指定工具。返回执行结果字符串。"""
         entry = self._tool_map.get(tool_name)
         if entry is None:
             return f"未知工具：{tool_name}"
-        _, handler = entry
+        _, handler, _ = entry
         try:
             args = json.loads(arguments)
             return handler(**args)
@@ -92,12 +100,12 @@ _registry = ToolRegistry()
 # 加载 Provider（新增 Provider 在这里注册）
 from .search_provider import SearchProvider  # noqa: E402
 from .image_provider import ImageProvider  # noqa: E402
-from .bilibili_provider import BilibiliProvider  # noqa: E402
+from .video_provider import VideoProvider  # noqa: E402
 from .profile_provider import ProfileProvider  # noqa: E402
 
 _registry.register_provider(SearchProvider())
 _registry.register_provider(ImageProvider())
-_registry.register_provider(BilibiliProvider())
+_registry.register_provider(VideoProvider())
 _registry.register_provider(ProfileProvider())
 
 
@@ -107,6 +115,11 @@ _registry.register_provider(ProfileProvider())
 def get_definitions(whitelist: set[str] | None = None) -> list[dict]:
     """获取所有已注册工具的 OpenAI Tool Calling 定义"""
     return _registry.get_definitions(whitelist=whitelist)
+
+
+def get_max_calls(tool_name: str) -> int:
+    """获取某个工具的调用次数上限"""
+    return _registry.get_max_calls(tool_name)
 
 
 def execute(tool_name: str, arguments: str) -> str:

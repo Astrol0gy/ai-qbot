@@ -26,6 +26,7 @@ from . import user_profile
 # 消息清理
 # ============================================
 _AT_PATTERN = re.compile(r"<@!\d+>|@\S+")
+_IMG_MARKER = re.compile(r"\[img\](.*?)\[/img\]")
 
 
 def clean_message(raw: str) -> str:
@@ -146,7 +147,18 @@ class QBot(botpy.Client):
             print(f"[❌ DeepSeek 错误] {e}")
             reply = "抱歉，我暂时无法回复，请稍后再试～"
 
-        await self._safe_reply(message, reply)
+        # 解析 [img]URL[/img] 标记，提取图片链接
+        image_urls = _IMG_MARKER.findall(reply)
+        clean_reply = _IMG_MARKER.sub("", reply).strip()
+
+        # 先发图片，再发文字
+        if image_urls:
+            await self._send_group_images(message.group_openid, message.id, image_urls, start_seq=1)
+            text_seq = len(image_urls) + 1
+            text = clean_reply or "为你找到以下图片："
+            await self._safe_send_group(message.group_openid, message.id, text, msg_seq=text_seq)
+        elif clean_reply:
+            await self._safe_reply(message, clean_reply)
 
     @staticmethod
     def _handle_profile_cmd(user_msg: str, group_id: str, user_id: str) -> str | None:
@@ -189,6 +201,59 @@ class QBot(botpy.Client):
                     await asyncio.sleep(wait)
                 else:
                     print(f"[❌ 回复最终失败] {e}")
+
+    async def _send_group_images(self, group_openid: str, msg_id: str, urls: list[str], max_images: int = 3, start_seq: int = 2):
+        """上传图片到 QQ 服务器并以被动回复方式发送到群聊"""
+        sent = 0
+        for i, url in enumerate(urls[:max_images]):
+            try:
+                # 步骤 1: 上传图片（不发送），获取 file_info
+                media_info = await self.api.post_group_file(
+                    group_openid=group_openid,
+                    file_type=1,          # 1 = 图片
+                    url=url,
+                    srv_send_msg=False,   # 不上动发送，只获取 file_info
+                )
+                # 步骤 2: 以被动回复方式发送（msg_type=7 富媒体，递增 msg_seq 避免去重）
+                await self.api.post_group_message(
+                    group_openid=group_openid,
+                    msg_type=7,           # 富媒体消息
+                    media=media_info,
+                    msg_id=msg_id,        # 被动回复
+                    msg_seq=start_seq + i,
+                )
+                sent += 1
+                print(f"[🖼️ 图片] 发送成功 ({sent}/{min(len(urls), max_images)}): {url[:80]}...")
+            except Exception as e:
+                print(f"[🖼️ 图片失败] {url[:80]}... -> {e}")
+        if sent > 0:
+            print(f"[🖼️ 图片] 共发送 {sent}/{min(len(urls), max_images)} 张")
+
+    async def _safe_send_group(self, group_openid: str, msg_id: str, content: str, msg_seq: int = 1):
+        """以被动回复方式发送文字消息并指定 msg_seq（避免与图片 seq 冲突）"""
+        import asyncio
+        max_len = 2000
+        if len(content) > max_len:
+            content = content[: max_len - 30] + "\n\n……(内容过长，已截断)"
+        for attempt in range(1, 6):
+            try:
+                await self.api.post_group_message(
+                    group_openid=group_openid,
+                    msg_type=0,
+                    content=content,
+                    msg_id=msg_id,
+                    msg_seq=msg_seq,
+                )
+                if attempt > 1:
+                    print(f"[✅ 文字发送成功] 第 {attempt} 次重试")
+                return
+            except Exception as e:
+                wait = attempt * 2
+                if attempt < 5:
+                    print(f"[⚠️ 文字发送等待重连 {attempt}/5] 等 {wait}s... {e}")
+                    await asyncio.sleep(wait)
+                else:
+                    print(f"[❌ 文字发送最终失败] {e}")
 
 
 # ============================================

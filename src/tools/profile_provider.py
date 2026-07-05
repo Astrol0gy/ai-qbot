@@ -54,6 +54,7 @@ class ProfileProvider(ToolProvider):
                     "additionalProperties": False,
                 },
                 "handler": self._manage_profile,
+                "max_calls": 3,
             },
         ]
 

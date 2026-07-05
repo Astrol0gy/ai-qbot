@@ -1,5 +1,5 @@
 """
-Bilibili 视频搜索 Tool Provider
+视频类 Tool Provider
 提供 search_bilibili_videos：在B站搜索视频并返回列表（标题、UP主、链接等）
 """
 import re
@@ -34,9 +34,9 @@ def _get_search_session() -> requests.Session:
     return _search_session
 
 
-class BilibiliProvider(ToolProvider):
-    name = "bilibili"
-    description = "B站视频搜索工具：search_bilibili_videos（搜索视频）"
+class VideoProvider(ToolProvider):
+    name = "video"
+    description = "视频搜索工具：search_bilibili_videos（B站视频搜索）"
 
     def get_tools(self) -> list[dict]:
         return [
@@ -64,6 +64,7 @@ class BilibiliProvider(ToolProvider):
                     "additionalProperties": False,
                 },
                 "handler": self._search_bilibili_videos,
+                "max_calls": 3,
             },
         ]
 
@@ -90,7 +91,6 @@ class BilibiliProvider(ToolProvider):
             lines = [f"在B站搜索「{keyword}」的结果（共 {total} 个结果）："]
 
             for i, r in enumerate(results[:count], 1):
-                # 去掉搜索高亮标签 <em class="keyword">
                 title = re.sub(r"<[^>]+>", "", r.get("title", ""))
                 bvid = r.get("bvid", "")
                 duration = r.get("duration", "").lstrip("0:")
@@ -98,7 +98,6 @@ class BilibiliProvider(ToolProvider):
                 author = r.get("author", "")
                 url = f"https://www.bilibili.com/video/{bvid}"
 
-                # 播放量格式化
                 if play >= 10000:
                     play_str = f"{play / 10000:.1f}万"
                 else:
@@ -114,4 +113,3 @@ class BilibiliProvider(ToolProvider):
         except Exception as e:
             print(f"[B站] 搜索失败: {e}")
             return f"B站搜索失败：{e}"
-

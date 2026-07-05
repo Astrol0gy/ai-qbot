@@ -23,7 +23,7 @@ from .config import (
     BOT_SYSTEM_PROMPT,
     MAX_HISTORY_LENGTH,
 )
-from .tools import execute as execute_tool, get_definitions
+from .tools import execute as execute_tool, get_definitions, get_max_calls
 from . import skills
 from . import user_profile
 
@@ -77,8 +77,12 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     # 工具列表
     tools = get_definitions() if DEEPSEEK_ENABLE_SEARCH else None
 
-    # 工具调用循环（最多 8 轮。思考模式下每轮 15-30s，复杂搜索需要更多轮次）
-    for round_num in range(1, 9):
+    # 工具调用循环
+    # 每个工具有独立的调用上限（max_calls），全局安全上限 20 轮防止死循环
+    _MAX_GLOBAL_ROUNDS = 20
+    _tool_call_counts: dict[str, int] = {}  # tool_name → 已调用次数
+
+    for round_num in range(1, _MAX_GLOBAL_ROUNDS + 1):
         kwargs = _build_request_kwargs(messages, tools)
         response = await client.chat.completions.create(**kwargs)
         msg = response.choices[0].message
@@ -88,29 +92,47 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
         if reasoning:
             print(f"[🧠 思考 R{round_num}]\n{reasoning}")
 
-        # 有工具调用 → 执行并继续
+        # 有工具调用 → 检查各工具配额
         if msg.tool_calls:
             print(f"[🔧 工具调用 R{round_num}] {[tc.function.name for tc in msg.tool_calls]}")
             messages.append(msg)
 
+            all_blocked = True
             for tc in msg.tool_calls:
-                result = execute_tool(tc.function.name, tc.function.arguments)
-                print(f"[📡 搜索结果 R{round_num}]\n{result}")
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
-            continue
+                tool_name = tc.function.name
+                max_calls = get_max_calls(tool_name)
+                count = _tool_call_counts.get(tool_name, 0)
 
-        # 最终回答
+                if count >= max_calls:
+                    # 工具已达调用上限，返回提示让模型换其他方式
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": f"工具「{tool_name}」已达到本轮的调用上限（{max_calls}次），请用已有信息回答，或尝试其他工具。",
+                    })
+                    print(f"[🔒 上限] {tool_name} 已达上限 {max_calls} 次，跳过")
+                else:
+                    all_blocked = False
+                    _tool_call_counts[tool_name] = count + 1
+                    result = execute_tool(tool_name, tc.function.arguments)
+                    print(f"[📡 结果 R{round_num}][{tool_name} #{_tool_call_counts[tool_name]}/{max_calls}]\n{result}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+
+            if not all_blocked:
+                continue  # 有工具成功执行，继续下一轮
+
+        # 最终回答（无工具调用 或 所有工具都被阻塞）
         reply = msg.content or ""
         print(f"[✅ 完成] 共 {round_num} 轮")
         break
     else:
-        # fallback：轮数用完，用已获取的信息做最终总结
+        # fallback：全局轮数用完
         tool_count = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "tool")
-        print(f"[⚠️ 超时] 达到 8 轮上限，已获取 {tool_count} 条搜索结果，执行 fallback 总结...")
+        print(f"[⚠️ 超时] 达到 {_MAX_GLOBAL_ROUNDS} 轮全局上限，已获取 {tool_count} 条结果，执行 fallback 总结...")
         reply = await _fallback_summarize(messages)
 
     # 保存对话历史（只存 user/assistant，不存中间 tool 消息）
@@ -121,19 +143,41 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
 
 
 async def _fallback_summarize(messages: list[dict]) -> str:
-    """用已有的搜索结果做最终总结，告知用户信息不完整"""
+    """用已有的搜索结果做最终总结。强制不调用工具，清理残留工具调用文本。"""
+    import re
     try:
         messages.append({
             "role": "user",
             "content": (
                 "以上是你多次搜索和抓取网页获取到的所有信息。"
-                "请根据这些已有信息做一个总结回答用户的原始问题。"
+                "请根据这些已有信息做一个最终总结回答用户的原始问题，不要再调用任何工具。"
                 "如果信息不足以完整回答，请在总结后诚实地告知用户：由于搜索次数超限，可能未能获取到全部所需信息。"
             ),
         })
         kwargs = _build_request_kwargs(messages, tools=None)
+        kwargs["tool_choice"] = "none"  # 强制禁止工具调用
+
         response = await client.chat.completions.create(**kwargs)
-        reply = response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        reply = msg.content or ""
+
+        # 清理可能残留的工具调用 XML 标签
+        reply = re.sub(
+            r"<[|]?\s*(invoke|tool_calls?|function_calls?).*?>.*?</[|]?\s*\1\s*>",
+            "", reply, flags=re.DOTALL | re.IGNORECASE,
+        )
+        reply = re.sub(r"<[|]?\s*invoke\s+name=.*?/>", "", reply, flags=re.IGNORECASE)
+        reply = reply.strip()
+
+        # 模型坚持输出工具调用（content 为空或只剩工具标签）
+        if not reply:
+            reasoning = getattr(msg, "reasoning_content", None) or ""
+            if reasoning:
+                paragraphs = [p.strip() for p in reasoning.split("\n\n") if p.strip()]
+                reply = paragraphs[-1] if paragraphs else reasoning[-500:]
+            else:
+                reply = "抱歉，搜索过程耗时过长，请简化问题后重试。"
+
         print(f"[🔄 Fallback 总结]\n{reply[:200]}...")
         return reply
     except Exception as e:

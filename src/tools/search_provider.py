@@ -41,6 +41,7 @@ class SearchProvider(ToolProvider):
                     "additionalProperties": False,
                 },
                 "handler": self._web_search,
+                "max_calls": 5,
             },
             {
                 "name": "fetch_url",
@@ -60,6 +61,7 @@ class SearchProvider(ToolProvider):
                     "additionalProperties": False,
                 },
                 "handler": self._fetch_url,
+                "max_calls": 5,
             },
         ]
 
