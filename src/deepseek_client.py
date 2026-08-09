@@ -30,25 +30,29 @@ from . import user_profile
 # 异步客户端
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
-# 按群+用户维度存储对话历史：{ "group_id:user_id": [{role, content}, ...] }
+# 按群维度存储对话历史（群内所有用户共享同一上下文，消息带说话者标识区分是谁说的）
 _conversations: dict[str, list[dict]] = defaultdict(list)
 
 
-def _make_key(group_id: str, user_id: str) -> str:
-    return f"{group_id}:{user_id}"
+def _make_key(group_id: str) -> str:
+    return group_id
 
 
-async def chat(group_id: str, user_id: str, user_message: str) -> str:
+async def chat(group_id: str, user_id: str, user_message: str, user_name: str = "") -> str:
     """
     发送消息给 DeepSeek V4 Pro 并获取回复。
-    以 group_id + user_id 区分不同用户的对话上下文。
+    对话上下文按群共享（不按用户隔离），每条消息带【说话者】标识供模型区分是谁在说。
     联网搜索通过 Tool Calling 实现：模型自主决定是否需要搜索。
     """
-    key = _make_key(group_id, user_id)
+    key = _make_key(group_id)
     history = _conversations[key]
 
     # 设置当前用户上下文（供 profile 工具使用）
-    user_profile.set_current_context(group_id, user_id)
+    user_profile.set_current_context(group_id, user_id, user_name)
+
+    # 说话者标识：优先昵称，缺失时用 member_openid 尾号
+    speaker = (user_name or "").strip() or f"用户{str(user_id)[-4:]}"
+    tagged_message = f"【{speaker}】{user_message}"
 
     # 构建请求消息（注入当前日期 + skill 指引 + 用户画像）
     today = datetime.now().strftime("%Y年%m月%d日 %A")
@@ -58,6 +62,10 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     system_prompt = (
         f"{BOT_SYSTEM_PROMPT}\n\n"
         f"当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。\n\n"
+        "【群聊共享对话说明 — 必须遵守】\n"
+        "你在 QQ 群里服务，群内所有用户共享同一段对话上下文，不会因换了说话者而遗忘前面的内容。\n"
+        "每条用户消息都以【说话者】开头，请据此区分是谁在说话，并结合该用户的历史画像调整语气和内容；"
+        "多人同时在场时，注意称呼和回应对应的说话者。\n\n"
         "【可用命令】\n"
         "/help — 查看全部功能  /reset — 清除对话记忆\n"
         "/look <信息> — 让我记住你的偏好  /forget <关键词> — 忘记已记录的偏好  /list — 查看已记录的偏好\n\n"
@@ -75,7 +83,7 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
     )
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history[-MAX_HISTORY_LENGTH * 2:])
-    messages.append({"role": "user", "content": user_message})
+    messages.append({"role": "user", "content": tagged_message})
 
     # 工具列表
     tools = get_definitions() if DEEPSEEK_ENABLE_SEARCH else None
@@ -139,7 +147,7 @@ async def chat(group_id: str, user_id: str, user_message: str) -> str:
         reply = await _fallback_summarize(messages)
 
     # 保存对话历史（只存 user/assistant，不存中间 tool 消息）
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": tagged_message})
     history.append({"role": "assistant", "content": reply})
 
     return reply
@@ -218,16 +226,10 @@ def _build_request_kwargs(messages: list[dict], tools: list[dict] | None) -> dic
 # 对话管理
 # ============================================
 def clear_history(group_id: str, user_id: str = ""):
-    """清除对话记忆。不传 user_id 则清除整个群的所有用户记忆。"""
-    if user_id:
-        _conversations.pop(_make_key(group_id, user_id), None)
-    else:
-        prefix = f"{group_id}:"
-        keys = [k for k in _conversations if k.startswith(prefix)]
-        for k in keys:
-            del _conversations[k]
+    """清除对话记忆（按群，群内所有用户共享同一上下文）"""
+    _conversations.pop(group_id, None)
 
 
-def get_history_length(group_id: str, user_id: str) -> int:
-    """获取指定用户在当前群的对话轮数"""
-    return len(_conversations[_make_key(group_id, user_id)]) // 2
+def get_history_length(group_id: str) -> int:
+    """获取当前群的对话轮数"""
+    return len(_conversations[group_id]) // 2

@@ -106,6 +106,7 @@ def _describe_media(
             extra_body=_build_extra_body(),
         )
         description = response.choices[0].message.content or ""
+        print(f"[VLM] 识别结果:\n{description}")
         return description
     except Exception as e:
         print(f"[VLM] 识别失败: {e}")

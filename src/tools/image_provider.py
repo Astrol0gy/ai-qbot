@@ -1,28 +1,11 @@
 """
 图片类 Tool Provider
-提供 describe_image（VLM 图片描述）、search_images（Bing 图片搜索）两个工具。
+提供 describe_image（VLM 图片描述）、search_images（官方搜索+页面提取图片）两个工具。
 """
-import json
-import re
-
-import requests
-from bs4 import BeautifulSoup
-
 from ..vision_utils import describe_image
 
 from . import ToolProvider
-
-# --- search_images 相关 ---
-_IMG_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
-
-_TITLE_CLEAN = re.compile(r"\s+的?(图像|图片|照片)结果$")
+from .search_provider import extract_page_images, official_search_results
 
 
 class ImageProvider(ToolProvider):
@@ -59,9 +42,10 @@ class ImageProvider(ToolProvider):
             {
                 "name": "search_images",
                 "description": (
-                    "搜索互联网上的图片。返回图片标题、图片直链(murl)和来源页面链接(purl)。"
+                    "搜索互联网上的图片（官方搜索+从来源页提取图片直链）。"
+                    "返回图片标题、图片直链和来源页面链接。"
                     "用于用户想看某个事物的图片、找素材、找参考图等场景。"
-                    "将图片 murl 用 [img]URL[/img] 格式集中放在回复最前面（最多3张），"
+                    "将图片直链用 [img]URL[/img] 格式集中放在回复最前面（最多3张），"
                     "系统会自动先发送图片再到群聊。文字部分简明介绍即可，不需要逐张编号。"
                 ),
                 "parameters": {
@@ -73,7 +57,7 @@ class ImageProvider(ToolProvider):
                         },
                         "count": {
                             "type": "integer",
-                            "description": "返回结果数量，默认 5，最多 10",
+                            "description": "返回结果数量，默认 3，最多 6",
                         },
                     },
                     "required": ["query"],
@@ -94,44 +78,34 @@ class ImageProvider(ToolProvider):
 
     # --- search_images ---
     @staticmethod
-    def _search_images(query: str, count: int = 5) -> str:
-        """使用 Bing 图片搜索"""
-        count = min(max(count, 1), 10)
+    def _search_images(query: str, count: int = 3) -> str:
+        """
+        官方 web search 找相关页面 → 抓取页面提取图片直链。
+        """
+        count = min(max(count, 1), 6)
         try:
-            resp = requests.get(
-                "https://www.bing.com/images/search",
-                params={"q": query, "count": count},
-                headers=_IMG_HEADERS,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            results = []
-            for a_tag in soup.select("a.iusc")[:count]:
-                m_data = a_tag.get("m", "")
-                try:
-                    info = json.loads(m_data)
-                except json.JSONDecodeError:
-                    continue
-
-                murl = info.get("murl", "")
-                purl = info.get("purl", "")
-                if not murl:
-                    continue
-
-                title = a_tag.get("aria-label", "")
-                title = _TITLE_CLEAN.sub("", title).strip()
-
-                idx = len(results) + 1
-                lines = [f"{idx}. {title}" if title else f"{idx}. 图片"]
-                lines.append(f"   图片链接: {murl}")
-                if purl:
-                    lines.append(f"   来源页面: {purl}")
-                results.append("\n".join(lines))
-
-            if not results:
+            # 附加"图片"让官方搜索优先命中图片类页面；多取一些页面提高提取成功率
+            pages = official_search_results(f"{query} 图片", max_results=count * 2)
+            if not pages:
                 return f"未找到「{query}」的相关图片。"
-            return "\n\n".join(results)
+
+            lines = []
+            for page in pages:
+                if len(lines) >= count:
+                    break
+                title = (page.get("title") or "图片").strip()
+                page_url = page.get("url", "")
+                imgs = extract_page_images(page_url, max_images=1)
+                if not imgs:
+                    continue  # 该页提取不到图就跳过，试下一个
+                lines.append(
+                    f"- {title}\n"
+                    f"   图片直链: {imgs[0]}\n"
+                    f"   来源页面: {page_url}"
+                )
+
+            if not lines:
+                return f"未找到「{query}」的相关图片。"
+            return "\n\n".join(lines)
         except Exception as e:
             return f"图片搜索失败：{e}"

@@ -28,6 +28,11 @@ DEEPSEEK_TOP_P = float(os.getenv("DEEPSEEK_TOP_P", "1.0"))
 DEEPSEEK_ENABLE_THINKING = os.getenv("DEEPSEEK_ENABLE_THINKING", "false").lower() == "true"
 DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
 DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() == "true"
+# DeepSeek 官方内置 web search（Anthropic 兼容端点）
+DEEPSEEK_ANTHROPIC_BASE_URL = os.getenv(
+    "DEEPSEEK_ANTHROPIC_BASE_URL",
+    "https://api.deepseek.com/anthropic",
+)
 
 # ============================================
 # 机器人行为
@@ -35,6 +40,11 @@ DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() ==
 BOT_SYSTEM_PROMPT = os.getenv(
     "BOT_SYSTEM_PROMPT",
     "你是一个友好的QQ群聊助手，请用简洁有趣的方式回答问题。"
+    "核心特质：1.热情亲切，像朋友一样真诚交流，自然不生硬，适度使用语气词拉近距离；"
+    "2.简洁高效，回答直奔重点、条理清晰，不啰嗦不废话；"
+    "3.诚实可靠，不知道的事如实说明、绝不编造，涉及实时信息（天气/新闻/时间等）主动使用搜索工具核实；"
+    "4.乐于助人，善于使用搜索、查天气、找图、找视频、记偏好等工具解决用户需求；"
+    "5.有分寸感，群聊中注意不刷屏、不打乱话题节奏，语气随和但不油腻。"
 )
 MAX_HISTORY_LENGTH = int(os.getenv("MAX_HISTORY_LENGTH", "10"))
 

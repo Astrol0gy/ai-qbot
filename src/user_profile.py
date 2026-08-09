@@ -14,13 +14,15 @@ PROFILES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", 
 # 当前对话上下文（每次 LLM 调用前由 deepseek_client 设置）
 _current_group_id: str = ""
 _current_user_id: str = ""
+_current_user_name: str = ""
 
 
-def set_current_context(group_id: str, user_id: str):
-    """设置当前对话的群和用户 ID，供 profile 工具使用"""
-    global _current_group_id, _current_user_id
+def set_current_context(group_id: str, user_id: str, user_name: str = ""):
+    """设置当前对话的群、用户 ID 和昵称，供 profile 工具使用"""
+    global _current_group_id, _current_user_id, _current_user_name
     _current_group_id = group_id
     _current_user_id = user_id
+    _current_user_name = user_name or ""
 
 
 # ============================================
@@ -54,12 +56,16 @@ def _get_profile_path(group_id: str, user_id: str) -> str:
     return os.path.join(PROFILES_DIR, f"{group_id}_{safe_id}.md")
 
 
-def _ensure_header(path: str):
-    """确保文件有头部标题和时间"""
+def _ensure_header(path: str, user_name: str = ""):
+    """确保文件有头部标题、时间和用户名（如已知）"""
     if not os.path.exists(path):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = f"# 用户画像\n创建时间: {timestamp}\n"
+        if user_name:
+            header += f"用户名: {user_name}\n"
+        header += "\n"
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f"# 用户画像\n创建时间: {timestamp}\n\n")
+            f.write(header)
 
 
 # ============================================
@@ -85,7 +91,7 @@ def remember_info(info: str, group_id: str = "", user_id: str = "") -> str:
         )
 
     path = _get_profile_path(gid, uid)
-    _ensure_header(path)
+    _ensure_header(path, _current_user_name)
 
     # 去重
     stripped = info.strip()
@@ -173,27 +179,48 @@ def list_profile(group_id: str = "", user_id: str = "") -> str:
 
 def get_profile_for_prompt(group_id: str = "", user_id: str = "") -> str:
     """
-    获取用户画像文本，用于注入 LLM system prompt。
+    获取当前群所有用户的画像文本，用于注入 LLM system prompt。
+    对话按群共享，因此注入群内每位用户的偏好（带用户名），供模型区分说话者。
     如果没有记录，返回空字符串。
     """
     gid = group_id or _current_group_id
-    uid = user_id or _current_user_id
-    if not gid or not uid:
+    if not gid:
         return ""
 
-    path = _get_profile_path(gid, uid)
-    if not os.path.exists(path):
+    prefix = f"{gid}_"
+    try:
+        os.makedirs(PROFILES_DIR, exist_ok=True)
+        files = sorted(f for f in os.listdir(PROFILES_DIR) if f.startswith(prefix) and f.endswith(".md"))
+    except Exception:
         return ""
 
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
+    sections = []
+    for fname in files:
+        path = os.path.join(PROFILES_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            continue
+        records = [l.strip() for l in content.splitlines() if l.strip().startswith("- [")]
+        if not records:
+            continue
+        # 提取文件头部的用户名，缺失时用 user_id 尾号
+        user_name = ""
+        for line in content.splitlines():
+            if line.strip().startswith("用户名:"):
+                user_name = line.split(":", 1)[1].strip()
+                break
+        if not user_name:
+            uid = fname[len(prefix):-3]
+            user_name = f"用户{uid[-4:]}"
+        sections.append(f"【{user_name} 的偏好】\n" + "\n".join(records))
 
-    record_lines = [l.strip() for l in content.splitlines() if l.strip().startswith("- [")]
-    if not record_lines:
+    if not sections:
         return ""
 
     return (
-        "\n\n【当前用户的画像 — 已记录的偏好和习惯】\n"
-        + "\n".join(record_lines)
-        + "\n请根据这些信息调整你的回答风格和内容。"
+        "\n\n【群内用户的画像 — 已记录的偏好和习惯】\n"
+        + "\n\n".join(sections)
+        + "\n请根据这些信息，结合当前说话者调整回答风格和内容。"
     )

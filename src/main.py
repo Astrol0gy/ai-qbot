@@ -6,9 +6,38 @@ QQ 群聊机器人 - 入口文件
 
 前提：已正确填写项目根目录的 .env 文件中的所有配置项。
 """
+import json
+import os
 import re
 import botpy
+from botpy import connection as botpy_connection
 from botpy.message import GroupMessage
+
+# ============================================
+# botpy 原始 payload 透传（monkeypatch）
+# botpy 的 parse_group_at_message_create 构造 GroupMessage 后丢弃原始事件 d，
+# 官方事件实际携带 msg_elements（含被引用消息原文），这里缓存原始数据供上层使用。
+# ============================================
+_RAW_MSG_CACHE: dict[str, dict] = {}
+_orig_parse_group = botpy_connection.ConnectionState.parse_group_at_message_create
+
+
+def _parse_group_with_raw(self, payload):
+    """保留群消息原始事件数据（d 对象），按消息 id 缓存，并打印原始结构供调试"""
+    d = payload.get("d", {}) or {}
+    if d.get("id"):
+        _RAW_MSG_CACHE[d["id"]] = d
+        # 调试：打印官方实际推送的原始事件结构
+        print(f"[📦 原始事件] 字段={list(d.keys())}")
+        try:
+            import json as _json
+            print(f"[📦 原始事件] 内容={_json.dumps(d, ensure_ascii=False, default=str)[:1500]}")
+        except Exception:
+            pass
+    return _orig_parse_group(self, payload)
+
+
+botpy_connection.ConnectionState.parse_group_at_message_create = _parse_group_with_raw
 
 from .config import (
     QQ_BOT_APP_ID,
@@ -27,6 +56,114 @@ from . import user_profile
 # ============================================
 _AT_PATTERN = re.compile(r"<@!\d+>|@\S+")
 _IMG_MARKER = re.compile(r"\[img\](.*?)\[/img\]")
+
+
+# msg_idx -> 消息内容 缓存（官方引用消息机制：REFIDX 索引，需自行缓存回查）
+# 持久化到 data/ref_index.jsonl，避免重启后引用原文丢失
+# 每个用户各自保存最新 _MSG_IDX_CACHE_MAX_PER_USER 条（对话按用户隔离，缓存同理）
+_MSG_IDX_CACHE_MAX_PER_USER = 20
+_REF_INDEX_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ref_index.jsonl"
+)
+
+
+def _load_ref_index() -> dict[str, dict]:
+    """启动时从磁盘加载引用索引缓存（按用户裁剪到上限后重写磁盘）"""
+    cache: dict[str, dict] = {}
+    try:
+        if os.path.exists(_REF_INDEX_FILE):
+            with open(_REF_INDEX_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                        cache[item["k"]] = item["v"]
+                    except Exception:
+                        continue
+    except Exception as e:
+        print(f"[⚠️ 引用索引加载失败] {e}")
+    _prune_cache(cache)
+    if cache:
+        _compact_ref_index(cache)
+    return cache
+
+
+def _prune_cache(cache: dict[str, dict]):
+    """每个用户最多保留最新 _MSG_IDX_CACHE_MAX_PER_USER 条，淘汰该用户时间戳最旧的"""
+    per_user: dict[str, list] = {}
+    for k, v in cache.items():
+        per_user.setdefault(v.get("owner") or "", []).append((k, v))
+    to_remove: list[str] = []
+    for items in per_user.values():
+        items.sort(key=lambda kv: kv[1].get("timestamp") or "")
+        for k, _ in items[: max(0, len(items) - _MSG_IDX_CACHE_MAX_PER_USER)]:
+            to_remove.append(k)
+    for k in to_remove:
+        cache.pop(k, None)
+
+
+def _cache_put(msg_idx: str, info: dict):
+    """写入引用索引缓存：新索引才写；该用户超上限先淘汰最旧一条再写入（内存+磁盘）"""
+    if msg_idx in _MSG_IDX_CACHE:
+        return
+    owner = info.get("owner") or ""
+    evicted = False
+    if owner:
+        same_owner = [k for k, v in _MSG_IDX_CACHE.items() if v.get("owner") == owner]
+        while len(same_owner) >= _MSG_IDX_CACHE_MAX_PER_USER:
+            oldest = min(same_owner, key=lambda k: _MSG_IDX_CACHE[k].get("timestamp") or "")
+            _MSG_IDX_CACHE.pop(oldest, None)
+            same_owner.remove(oldest)
+            evicted = True
+    _MSG_IDX_CACHE[msg_idx] = info
+    _append_ref_index(msg_idx, info)
+    if evicted:
+        _compact_ref_index(_MSG_IDX_CACHE)
+
+
+def _append_ref_index(msg_idx: str, info: dict):
+    """追加写入一条引用索引记录（JSONL）"""
+    try:
+        os.makedirs(os.path.dirname(_REF_INDEX_FILE), exist_ok=True)
+        with open(_REF_INDEX_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"k": msg_idx, "v": info}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[⚠️ 引用索引写入失败] {e}")
+
+
+def _compact_ref_index(cache: dict[str, dict]):
+    """缓存超限时压缩重写磁盘文件"""
+    try:
+        os.makedirs(os.path.dirname(_REF_INDEX_FILE), exist_ok=True)
+        tmp = _REF_INDEX_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for k, v in cache.items():
+                f.write(json.dumps({"k": k, "v": v}, ensure_ascii=False) + "\n")
+        os.replace(tmp, _REF_INDEX_FILE)
+    except Exception as e:
+        print(f"[⚠️ 引用索引压缩失败] {e}")
+
+
+_MSG_IDX_CACHE: dict[str, dict] = _load_ref_index()
+
+
+def parse_msg_indexes(raw: dict) -> tuple[str, str]:
+    """
+    从群消息原始事件中解析消息索引。
+
+    官方机制：每条消息带 msg_idx=<REFIDX...>，引用消息额外带 ref_msg_idx=<REFIDX...>
+    （被引用消息的索引）。事件本身不携带引用原文，需用 ref_msg_idx 在本地缓存回查。
+    """
+    msg_idx, ref_idx = "", ""
+    ext = (raw.get("message_scene") or {}).get("ext") or []
+    for item in ext:
+        if item.startswith("msg_idx="):
+            msg_idx = item.split("=", 1)[1]
+        elif item.startswith("ref_msg_idx="):
+            ref_idx = item.split("=", 1)[1]
+    return msg_idx, ref_idx
 
 HELP_TEXT = """【小Q 功能指南】
 
@@ -76,12 +213,32 @@ class QBot(botpy.Client):
         group_id = getattr(message, "group_openid", "")
         user_id = getattr(message.author, "member_openid", "")
 
-        # 检测引用消息（bot 看不到引用原文）
-        ref = getattr(message, "message_reference", None)
-        if ref and getattr(ref, "message_id", None):
-            print(f"[📎 有引用消息] msg_id={ref.message_id}，但我看不到内容")
-            if not user_msg:
-                user_msg = "用户引用了一条消息，请根据上下文尽力理解"
+        # 取原始事件数据（botpy 丢弃了它，引用索引 REFIDX 就在 message_scene.ext 里）
+        raw = _RAW_MSG_CACHE.pop(message.id, {}) or {}
+        user_name = ((raw.get("author") or {}).get("username")) or ""
+
+        # 引用消息机制：缓存当前消息 msg_idx，引用时用 ref_msg_idx 回查
+        msg_idx, ref_idx = parse_msg_indexes(raw)
+        if msg_idx:
+            _cache_put(msg_idx, {
+                "content": clean_message(message.content or ""),
+                "username": user_name,
+                "timestamp": getattr(message, "timestamp", ""),
+                "owner": f"{group_id}:{user_id}",
+            })
+
+        if ref_idx:
+            quoted = _MSG_IDX_CACHE.get(ref_idx)
+            if quoted:
+                quoted_text = quoted.get("content") or ""
+                quoted_by = quoted.get("username") or ""
+                print(f"[📎 引用原文] {quoted_by}: {quoted_text}")
+                if not user_msg:
+                    user_msg = f"用户引用了「{quoted_by}」的消息：{quoted_text}，请结合上下文回答"
+            else:
+                print(f"[📎 引用未命中缓存] ref_idx={ref_idx}")
+                if not user_msg:
+                    user_msg = "用户引用了一条消息，但机器人无法获取引用原文，请根据上下文尽力理解"
 
         # --- 图片识别（VLM 预处理）---
         attachments = getattr(message, "attachments", []) or []
@@ -137,7 +294,7 @@ class QBot(botpy.Client):
             return
 
         if user_msg.strip() == "/reset":
-            clear_history(group_id, user_id)
+            clear_history(group_id)
             await self._safe_reply(message, "记忆已清除，让我们重新开始吧！")
             return
 
@@ -158,13 +315,13 @@ class QBot(botpy.Client):
                 "请按以下步骤处理：\n"
                 "1. 理解用户意图：是简单的风格偏好，还是引用了某个角色/人名/风格？\n"
                 "2. 如果是角色引用（如'像哆啦A梦一样'、'用鲁迅的风格'），且你对具体特点不够了解，请先用 web_search 搜索相关信息，总结关键特征\n"
-                "3. 将信息提炼成简洁的要点后，使用 manage_user_profile 工具以 action=remember 记录下来\n"
+                "3. 将信息提炼成简洁的要点后，使用 manage_user_profile 工具以 action=remember 记录下来（记录的是当前说话者自己的偏好，与其他用户独立）\n"
                 "4. 最后简短告知用户你已记住什么"
             )
 
         # --- 交给 DeepSeek ---
         try:
-            reply = await chat(group_id, user_id, user_msg)
+            reply = await chat(group_id, user_id, user_msg, user_name)
         except Exception as e:
             print(f"[❌ DeepSeek 错误] {e}")
             reply = "抱歉，我暂时无法回复，请稍后再试～"
