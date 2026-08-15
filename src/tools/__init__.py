@@ -102,11 +102,13 @@ from .search_provider import SearchProvider  # noqa: E402
 from .image_provider import ImageProvider  # noqa: E402
 from .video_provider import VideoProvider  # noqa: E402
 from .profile_provider import ProfileProvider  # noqa: E402
+from .campaign_provider import CampaignProvider  # noqa: E402
 
 _registry.register_provider(SearchProvider())
 _registry.register_provider(ImageProvider())
 _registry.register_provider(VideoProvider())
 _registry.register_provider(ProfileProvider())
+_registry.register_provider(CampaignProvider())
 
 
 # ============================================

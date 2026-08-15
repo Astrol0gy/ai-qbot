@@ -26,6 +26,7 @@ from .config import (
 from .tools import execute as execute_tool, get_definitions, get_max_calls
 from . import skills
 from . import user_profile
+from . import campaign_state
 
 # 异步客户端
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
@@ -47,28 +48,27 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
     key = _make_key(group_id)
     history = _conversations[key]
 
-    # 设置当前用户上下文（供 profile 工具使用）
+    # 设置当前用户上下文（供 profile / campaign 工具使用）
     user_profile.set_current_context(group_id, user_id, user_name)
+    campaign_state.set_current_context(group_id, user_id)
 
     # 说话者标识：优先昵称，缺失时用 member_openid 尾号
     speaker = (user_name or "").strip() or f"用户{str(user_id)[-4:]}"
     tagged_message = f"【{speaker}】{user_message}"
 
-    # 构建请求消息（注入当前日期 + skill 指引 + 用户画像）
+    # 构建请求消息（注入当前日期 + skill 指引 + 用户画像 + 跑团状态）
     today = datetime.now().strftime("%Y年%m月%d日 %A")
     skills_meta = skills.get_metadata_section()        # Level 1: 元数据摘要
-    skills_body = skills.get_all_skill_bodies()         # 完整 skill body
     profile_text = user_profile.get_profile_for_prompt()
-    system_prompt = (
-        f"{BOT_SYSTEM_PROMPT}\n\n"
+    campaign_text = campaign_state.get_state_for_prompt(group_id)
+    dm_mode = campaign_state.is_dm_mode(group_id)
+
+    # 公共系统提示（日期 + 群聊说明 + 回复格式）
+    common_prompt = (
         f"当前日期：{today}。涉及时间、天气、新闻等需要实时信息的问题，请使用 web_search 工具搜索，不要凭记忆编造。\n\n"
         "【群聊共享对话说明 — 必须遵守】\n"
         "你在 QQ 群里服务，群内所有用户共享同一段对话上下文，不会因换了说话者而遗忘前面的内容。\n"
-        "每条用户消息都以【说话者】开头，请据此区分是谁在说话，并结合该用户的历史画像调整语气和内容；"
-        "多人同时在场时，注意称呼和回应对应的说话者。\n\n"
-        "【可用命令】\n"
-        "/help — 查看全部功能  /reset — 清除对话记忆\n"
-        "/look <信息> — 让我记住你的偏好  /forget <关键词> — 忘记已记录的偏好  /list — 查看已记录的偏好\n\n"
+        "每条用户消息都以【说话者】开头，请据此区分是谁在说话。多人同时在场时，注意称呼和回应对应的说话者。\n\n"
         "【回复格式要求 — 必须遵守】\n"
         "你的回复发送到 QQ 群聊，QQ 不支持 Markdown 渲染，禁止使用任何 Markdown 语法。\n"
         "请使用以下纯文本格式替代：\n"
@@ -77,12 +77,46 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
         "- 用 · 开头表示列表项，代替 - 或 * 列表\n"
         "- 禁止使用 # * _ ` ``` ~~ 等 Markdown 标记\n"
         "- 禁止使用 [文字](链接) 格式，直接写链接 URL 即可\n"
-        f"{skills_meta}"                                # skill 列表
-        f"\n\n## 技能详细指引\n{skills_body}"            # 完整流程
-        f"{profile_text}"                                # 用户画像（如有）
     )
+
+    if dm_mode:
+        # --- DM 模式：跑团主持 ---
+        dm_body = skills.get_full_prompt_for_skill("跑团主持")
+        system_prompt = (
+            "你是资深跑团主持人（Dungeon Master），正在主持一场文字冒险（TRPG）游戏。\n"
+            "你的职责是引导剧情、描述场景、判定行动、管理角色状态，让玩家沉浸其中。\n"
+            "多人同场时，根据【说话者】区分不同玩家，并记住各自角色。\n\n"
+            f"{common_prompt}"
+            f"{dm_body}"
+            f"{campaign_text}"
+        )
+    else:
+        # --- 普通模式：原有群 bot 设定 ---
+        skills_body = skills.get_all_skill_bodies()
+        system_prompt = (
+            f"{BOT_SYSTEM_PROMPT}\n\n"
+            f"{common_prompt}"
+            "【可用命令】\n"
+            "/help — 查看全部功能  /reset — 清除对话记忆\n"
+            "/look <信息> — 让我记住你的偏好  /forget <关键词> — 忘记已记录的偏好  /list — 查看已记录的偏好\n\n"
+            f"{skills_meta}"
+            f"\n\n## 技能详细指引\n{skills_body}"
+            f"{profile_text}"
+        )
+
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-MAX_HISTORY_LENGTH * 2:])
+
+    # --- 滑动窗口对话压缩（全局启用）---
+    # 当历史接近上限时，把最旧的若干轮压缩成摘要，保留最近 K 轮原文，避免硬截断丢信息
+    _KEEP_RECENT_ROUNDS = 4  # 保留最近 4 轮原文
+    _COMPRESS_THRESHOLD = MAX_HISTORY_LENGTH * 2
+    if len(history) > _COMPRESS_THRESHOLD:
+        messages = await _compress_history(
+            history, messages, _COMPRESS_THRESHOLD, _KEEP_RECENT_ROUNDS
+        )
+    else:
+        messages.extend(history[-MAX_HISTORY_LENGTH * 2:])
+
     messages.append({"role": "user", "content": tagged_message})
 
     # 工具列表
@@ -151,6 +185,59 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
     history.append({"role": "assistant", "content": reply})
 
     return reply
+
+
+async def _compress_history(
+    history: list[dict],
+    messages: list[dict],
+    threshold: int,
+    keep_recent_rounds: int,
+) -> list[dict]:
+    """
+    滑动窗口对话压缩：把最旧的轮次用 LLM 压缩成摘要，保留最近 keep_recent_rounds 轮原文。
+
+    返回新的 messages 列表（system + 摘要 + 最近若干轮）。
+    压缩失败时退回硬截断（与旧行为一致）。
+    """
+    keep_msgs = keep_recent_rounds * 2  # 每轮 = user + assistant 两条
+    old_part = history[:-keep_msgs] if keep_msgs > 0 else history
+    recent_part = history[-keep_msgs:] if keep_msgs > 0 else []
+
+    if not old_part:
+        messages.extend(history[-threshold:])
+        return messages
+
+    try:
+        # 构造摘要请求（不带工具）
+        summary_input = []
+        for m in old_part:
+            summary_input.append(m)
+        summary_input.append({
+            "role": "user",
+            "content": (
+                "请把以上对话内容压缩成一段简洁的摘要，保留关键信息、事实、决定、人物和上下文。"
+                "用纯文本、中文分点叙述，不要使用 Markdown。只输出摘要本身。"
+            ),
+        })
+        kwargs = _build_request_kwargs(summary_input, tools=None)
+        kwargs["tool_choice"] = "none"
+        response = await client.chat.completions.create(**kwargs)
+        summary = response.choices[0].message.content or ""
+
+        if not summary:
+            messages.extend(history[-threshold:])
+            return messages
+
+        # 摘要作为历史开头（system 之后第一条 user 消息，标记为压缩历史）
+        messages.append({"role": "user", "content": f"【更早的对话摘要】\n{summary}"})
+        messages.append({"role": "assistant", "content": "（已了解以上历史，继续对话）"})
+        messages.extend(recent_part)
+        print(f"[🗜️ 压缩] 将 {len(old_part)} 条旧消息压缩为摘要，保留最近 {len(recent_part)} 条")
+        return messages
+    except Exception as e:
+        print(f"[⚠️ 压缩失败，退回硬截断] {e}")
+        messages.extend(history[-threshold:])
+        return messages
 
 
 async def _fallback_summarize(messages: list[dict]) -> str:

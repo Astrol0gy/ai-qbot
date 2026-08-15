@@ -1,8 +1,9 @@
 """
 图片类 Tool Provider
-提供 describe_image（VLM 图片描述）、search_images（官方搜索+页面提取图片）两个工具。
+提供 describe_image（VLM 图片描述）、search_images（官方搜索+页面提取图片）、
+text_to_image（Qwen-Image 文生图）三个工具。
 """
-from ..vision_utils import describe_image
+from ..vision_utils import describe_image, text_to_image
 
 from . import ToolProvider
 from .search_provider import extract_page_images, official_search_results
@@ -10,7 +11,7 @@ from .search_provider import extract_page_images, official_search_results
 
 class ImageProvider(ToolProvider):
     name = "image"
-    description = "图片相关工具：describe_image（VLM 图片识别）、search_images（Bing 图片搜索）"
+    description = "图片相关工具：describe_image（VLM 图片识别）、search_images（图片搜索）、text_to_image（文生图）"
 
     def get_tools(self) -> list[dict]:
         return [
@@ -66,6 +67,36 @@ class ImageProvider(ToolProvider):
                 "handler": self._search_images,
                 "max_calls": 3,
             },
+            {
+                "name": "text_to_image",
+                "description": (
+                    "根据文字描述生成图片（文生图）。"
+                    "当用户想让你「画一张图」「生成一张图」「画个 XX」等需要 AI 创作图片时使用。"
+                    "生成后把图片直链用 [img]URL[/img] 格式放在回复最前面，"
+                    "系统会自动发送图片到群聊，文字部分简要说明即可。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "图片描述提示词（中英文均可），尽量具体描述画面内容、风格、氛围",
+                        },
+                        "size": {
+                            "type": "string",
+                            "description": "输出分辨率，如 1024*1024、1280*720、720*1280（可选，默认 1024*1024）",
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "生成图片数量，1~6，默认 1",
+                        },
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": False,
+                },
+                "handler": self._text_to_image,
+                "max_calls": 2,
+            },
         ]
 
     # --- describe_image ---
@@ -109,3 +140,13 @@ class ImageProvider(ToolProvider):
             return "\n\n".join(lines)
         except Exception as e:
             return f"图片搜索失败：{e}"
+
+    # --- text_to_image ---
+    @staticmethod
+    def _text_to_image(prompt: str, size: str = "1024*1024", n: int = 1) -> str:
+        urls = text_to_image(prompt, size=size, n=n)
+        if not urls:
+            return "文生图服务未配置或生成失败，请稍后重试。"
+        lines = [f"[img]{u}[/img]" for u in urls]
+        lines.append(f"已生成 {len(urls)} 张图片。")
+        return "\n".join(lines)

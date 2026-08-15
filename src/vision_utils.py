@@ -16,6 +16,8 @@ from .config import (
     VISION_MODEL,
     VISION_ENABLE_THINKING,
     VISION_HIGH_RES,
+    IMAGE_GEN_MODEL,
+    IMAGE_GEN_ENDPOINT,
 )
 
 # 下载限制
@@ -161,3 +163,73 @@ def describe_image(image_url: str, question: str = "") -> str | None:
             return result
 
     return None
+
+
+def text_to_image(
+    prompt: str,
+    size: str = "1024*1024",
+    n: int = 1,
+) -> list[str] | None:
+    """
+    文生图：调用 Qwen-Image 生成图片（DashScope 原生接口，非 OpenAI 兼容）。
+
+    注意：qwen-image 系列模型不支持 OpenAI 兼容端点，必须走原生 HTTP 接口。
+
+    Args:
+        prompt: 文生图提示词（中英文均可）
+        size: 输出分辨率，如 "1024*1024"（总像素需在 512*512 ~ 2048*2048 之间）
+        n: 生成图片数量（1~6）
+
+    Returns:
+        图片 URL 列表；失败时返回 None
+    """
+    if not DASHSCOPE_API_KEY:
+        return None
+
+    n = min(max(int(n), 1), 6)
+    try:
+        body = {
+            "model": IMAGE_GEN_MODEL,
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": prompt}],
+                    }
+                ]
+            },
+            "parameters": {
+                "prompt_extend": True,
+                "size": size,
+                "n": n,
+            },
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DASHSCOPE_API_KEY}",
+        }
+        resp = requests.post(
+            IMAGE_GEN_ENDPOINT,
+            headers=headers,
+            json=body,
+            timeout=180,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # 同步响应：output.choices[0].message.content[].image
+        choices = data.get("output", {}).get("choices", [])
+        urls = []
+        for choice in choices:
+            for item in choice.get("message", {}).get("content", []):
+                if item.get("image"):
+                    urls.append(item["image"])
+        if not urls:
+            print(f"[文生图] 未在响应中找到图片 URL: {str(data)[:500]}")
+            return None
+
+        print(f"[文生图] 成功生成 {len(urls)} 张图片")
+        return urls
+    except Exception as e:
+        print(f"[文生图] 生成失败: {e}")
+        return None

@@ -60,6 +60,16 @@ VISION_MODEL = os.getenv("VISION_MODEL", "qwen3-vl-flash")
 VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").lower() == "true"
 VISION_HIGH_RES = os.getenv("VISION_HIGH_RES", "false").lower() == "true"
 
+# ============================================
+# 文生图（Qwen-Image，DashScope 原生接口）
+# ============================================
+# 注意：文生图模型不支持 OpenAI 兼容接口，需走 DashScope 原生 HTTP 端点
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "qwen-image-3.0-pro")
+IMAGE_GEN_ENDPOINT = os.getenv(
+    "IMAGE_GEN_ENDPOINT",
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+)
+
 
 def validate():
     """检查必要配置是否已填写"""
