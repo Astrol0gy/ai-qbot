@@ -1,6 +1,6 @@
 """
 图片类 Tool Provider
-提供 describe_image（VLM 图片描述）、search_images（官方搜索+页面提取图片）、
+提供 describe_image（DeepSeek 视觉图片描述）、search_images（官方搜索+页面提取图片）、
 text_to_image（Qwen-Image 文生图）三个工具。
 """
 from ..vision_utils import describe_image, text_to_image
@@ -11,23 +11,27 @@ from .search_provider import extract_page_images, official_search_results
 
 class ImageProvider(ToolProvider):
     name = "image"
-    description = "图片相关工具：describe_image（VLM 图片识别）、search_images（图片搜索）、text_to_image（文生图）"
+    description = "图片相关工具：describe_image（看图）、search_images（图片搜索）、text_to_image（文生图）"
 
     def get_tools(self) -> list[dict]:
         return [
             {
                 "name": "describe_image",
                 "description": (
-                    "通过视觉模型（Qwen-VL）分析并描述图片内容。"
-                    "支持场景识别、物体检测、文字提取、图表理解等。"
-                    "当用户发送图片或询问图片相关内容时使用此工具。"
+                    "用视觉模型（DeepSeek）分析图片：结果第一行会判明这是"
+                    "「表情包（用户想表达情绪或态度）」还是「内容图片（照片/截图/图表，"
+                    "想让你看懂里面的信息）」，再给文字提取、场景与物体描述；"
+                    "支持 JPEG/PNG/GIF/WebP，GIF 动图会看到画面里的动作变化。"
+                    "当用户发了图片、或询问图片相关内容时使用。"
+                    "注意：群里用户刚发的图片通常已带着描述进了上下文，先看上下文，"
+                    "别对同一张图反复调用。"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "url": {
                             "type": "string",
-                            "description": "图片的完整 URL 地址",
+                            "description": "图片的完整 URL 地址（http/https 直链）",
                         },
                         "question": {
                             "type": "string",

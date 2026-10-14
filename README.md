@@ -35,7 +35,7 @@ ai-qbot/
     ├── user_profile.py     # 用户画像持久化
     ├── campaign_state.py   # 跑团状态持久化
     ├── dice.py             # 骰子
-    ├── vision_utils.py     # 图片识别 / 文生图
+    ├── vision_utils.py     # 图片理解（DeepSeek 视觉）/ 文生图
     ├── skills/             # Skill（Markdown 定义）
     └── tools/              # Tool Calling 工具（Provider：search/image/video/profile/campaign/chat）
 ```
@@ -148,14 +148,14 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 
 ### 关于图片识别的成本
 
-开启 `TRIGGER_RECOGNIZE_IMAGES` 后，**群里每张图都会产生一次 VLM 调用**（按张计费，与「接话时只带 8 条上下文」无关——那限制的是 LLM 提示词，不是识别次数）。为此内置两层护栏：
+开启 `TRIGGER_RECOGNIZE_IMAGES` 后，**群里每张图都会产生一次视觉调用**（按张计费、单张最多 1024 tokens，与「接话时只带 8 条上下文」无关——那限制的是 LLM 提示词，不是识别次数）。为此内置两层护栏：
 
 | 护栏 | 说明 |
 |---|---|
 | `TRIGGER_IMAGE_RATE_PER_MIN` | 每个群每分钟最多识别 N 张图（默认 10），超出则跳过；**不会**退化成回复时再识别 |
 | `TRIGGER_IMAGE_CACHE_SIZE` | 按图片 URL 缓存描述（默认 200 条），同一条消息重放或同一张图被反复引用时不重复计费 |
 
-若发现费用或延迟偏高，可先把 `TRIGGER_RECOGNIZE_IMAGES=false` 关掉（回到「只在被 @ 时识别」），或调低 `VISION_HIGH_RES` / 关闭 `VISION_ENABLE_THINKING`。
+若发现费用或延迟偏高，可先把 `TRIGGER_RECOGNIZE_IMAGES=false` 关掉（回到「只在被 @ 时识别」），或把 `VISION_DETAIL` 设为 `low`（图片缩到 512×512，最快最省，代价是小字会糊）。
 
 > 识别在触发判定**之前**完成，且失败不会污染上下文：任一张识别失败就整体退回「未识别」，等真要回复时再走一次带提问的完整识别。
 
@@ -251,15 +251,20 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | `BOT_SYSTEM_PROMPT` | 系统提示词 | 友好群聊助手 |
 | `MAX_HISTORY_LENGTH` | 每群记住几轮对话 | `10` |
 
-### 视觉与文生图
+### 图片理解与文生图
+
+**看图走 DeepSeek 官方视觉接口**（`deepseek-flash`），与文字对话共用 `DEEPSEEK_API_KEY`：支持 JPEG/PNG/GIF/WebP（GIF 动图会看到画面里的动作变化）；优先直传图片 URL，服务端拉不到的图（如 QQ CDN）会自己下载后用 base64 或 Files API 送进去（同一张图复用 `file_id`，不重复上传）。文档：[图像理解](https://api-docs.deepseek.com/zh-cn/guides/vision/)、[Files API](https://api-docs.deepseek.com/zh-cn/guides/files_api/)。
+
+**描述的第一行固定是类型判读**：`类型：表情包/内容图片 ｜ 意图：<发送者想表达什么>`。表情包／梗图只写情绪与一句话画面，内容图片才做详细描述——主模型据此决定是**顺着情绪接话**还是**按内容回答**（规则见 `src/skills/image.md`）。这一行必须排在最前：描述进接话上下文时按 `IMAGE_NOTE_MAX` 截断，写在后面会被截掉。
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `DASHSCOPE_API_KEY` | 阿里云百炼 API Key（图片识别/文生图） | 空（未配置则跳过该功能） |
-| `VISION_BASE_URL` | 视觉模型地址 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `VISION_MODEL` | 视觉模型 | `qwen3-vl-flash` |
-| `VISION_ENABLE_THINKING` | 视觉模型思考模式 | `false` |
-| `VISION_HIGH_RES` | 高分辨率识别 | `false` |
+| `VISION_BASE_URL` | 视觉接口地址 | `https://api.deepseek.com` |
+| `VISION_MODEL` | 视觉模型 | `deepseek-flash` |
+| `VISION_DETAIL` | 细节档位：`low`（缩到 512×512，最快最省）/ `high` / `original` / `auto` | `auto` |
+| `VISION_ENABLE_THINKING` | 看图是否走思考模式（推理与可见回答共用 `max_tokens`，开了会变慢且可能截断） | `false` |
+| `VISION_FILES_API` | 自己下载的图怎么送：`auto`（超过 32MiB 才上传 Files API）/ `always` / `off` | `auto` |
+| `DASHSCOPE_API_KEY` | 阿里云百炼 API Key（**仅文生图**使用） | 空（未配置则跳过文生图） |
 | `IMAGE_GEN_MODEL` | 文生图模型 | `qwen-image-3.0-pro` |
 | `IMAGE_GEN_ENDPOINT` | 文生图端点（DashScope 原生接口） | 官方端点 |
 

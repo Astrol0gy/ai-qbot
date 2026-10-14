@@ -7,9 +7,9 @@
 import asyncio
 import re
 
-from ..config import DASHSCOPE_API_KEY, DEEPSEEK_ROUND_TIMEOUT_SEC
+from ..config import DEEPSEEK_ROUND_TIMEOUT_SEC
 from ..deepseek_client import chat, clear_history
-from ..vision_utils import describe_image
+from ..vision_utils import describe_image, vision_available
 from .base import IncomingMessage, Sender
 from .commands import HELP_TEXT, handle_dm_cmd, handle_profile_cmd
 
@@ -69,7 +69,7 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
     if msg.image_descs is not None:
         descs: list[str | None] = list(msg.image_descs)
     else:
-        if not DASHSCOPE_API_KEY:
+        if not vision_available():
             return None
         total = len(msg.image_urls)
         print(f"[图片消息] 检测到 {total} 张图片")
@@ -93,11 +93,11 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     # ---------- 图片识别（VLM 预处理）----------
     media_text = await _image_text(msg, user_msg) if msg.image_urls else ""
     if media_text is None:
-        print("[图片消息] VLM 未配置，跳过")
+        print("[图片消息] 视觉未配置，跳过")
         if not msg.is_interjection:  # 接话是自发的，不该为此在群里报错
             await sender.send(
                 "抱歉，视觉识别功能未配置，无法识别图片内容。\n"
-                "请在 .env 中填写 DASHSCOPE_API_KEY（百炼 API Key）后重试。"
+                "请在 .env 中填写 DEEPSEEK_API_KEY 后重试。"
             )
         return
 

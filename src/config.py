@@ -52,21 +52,28 @@ BOT_SYSTEM_PROMPT = os.getenv(
 MAX_HISTORY_LENGTH = int(os.getenv("MAX_HISTORY_LENGTH", "10"))
 
 # ============================================
-# Qwen 视觉识别（阿里云百炼 Model Studio）
+# 图片理解（DeepSeek 官方视觉接口）
 # ============================================
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-VISION_BASE_URL = os.getenv(
-    "VISION_BASE_URL",
-    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-VISION_MODEL = os.getenv("VISION_MODEL", "qwen3-vl-flash")
+# 看图与文字对话共用 DEEPSEEK_API_KEY；文生图仍走百炼（见下一节）
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", DEEPSEEK_BASE_URL)
+VISION_MODEL = os.getenv("VISION_MODEL", "deepseek-flash")
+# 图片细节档位：low 会把图缩到 512×512（最快最省，小字会糊）；
+# high / original 保留原图；auto 由服务端决定（当前等价 original）
+VISION_DETAIL = os.getenv("VISION_DETAIL", "auto").strip().lower()
+# 看图是否走思考模式。默认 false：实测 deepseek-flash 默认**开着**思考，而推理 token 与
+# 可见回答共用 max_tokens —— 看图这种任务推理能吃到 300+ token，稍大的图直接被挤成空回答。
 VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").lower() == "true"
-VISION_HIGH_RES = os.getenv("VISION_HIGH_RES", "false").lower() == "true"
+# 需要自己下载的图（QQ CDN 等）怎么送：
+#   auto（默认）= 只有内联放不下（>32MiB）才上传 Files API，其余内联 base64
+#   always = 一律上传 Files API 换 file_id（请求体小，同一张图可长期复用）
+#   off = 只用直传 URL / base64，超过 32MiB 直接放弃
+VISION_FILES_API = os.getenv("VISION_FILES_API", "auto").strip().lower()
 
 # ============================================
 # 文生图（Qwen-Image，DashScope 原生接口）
 # ============================================
 # 注意：文生图模型不支持 OpenAI 兼容接口，需走 DashScope 原生 HTTP 端点
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "qwen-image-3.0-pro")
 IMAGE_GEN_ENDPOINT = os.getenv(
     "IMAGE_GEN_ENDPOINT",
