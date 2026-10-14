@@ -24,15 +24,16 @@ from .config import (
     BOT_SYSTEM_PROMPT,
     MAX_HISTORY_LENGTH,
 )
-from .tools import execute as execute_tool, get_definitions, get_max_calls
-from .reply_outbox import ReplyOutbox
+from .tools import (
+    execute as execute_tool,
+    get_definitions,
+    get_max_calls,
+    needs_context as tool_needs_context,
+)
+from .tools.chat_provider import CHAT_TOOL_NAMES, ReplyOutbox
 from . import skills
 from . import user_profile
 from . import campaign_state
-
-# 控制类工具（reply / skip）单轮最多调用几次：一批里可能好几个人同时说话，
-# 要给"各回一条"留足额度，同时防止模型没完没了地"补一句"烧钱
-MAX_CONTROL_CALLS = 6
 
 # 异步客户端。
 # 这里只管**单次请求**的上限；真正的总时限在 core 里（到点就放弃这一轮，晚到的回答一律
@@ -163,10 +164,11 @@ async def chat(
 
     messages.append({"role": "user", "content": tagged_message})
 
-    # 工具列表（普通群聊唤醒时额外带上 reply / skip）
+    # 工具列表（普通群聊唤醒时额外带上控制类工具 reply / skip）
     tools = list(get_definitions()) if DEEPSEEK_ENABLE_SEARCH else []
     if outbox is not None:
-        tools += outbox.tool_defs()
+        # 按白名单显式注入：get_definitions() 默认不含需要会话上下文的工具
+        tools += get_definitions(whitelist=set(CHAT_TOOL_NAMES))
     tools = tools or None  # 空列表会被 API 拒绝，统一成 None
 
     # 工具调用循环
@@ -192,9 +194,8 @@ async def chat(
             all_blocked = True
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
-                # 控制类工具（reply / skip）：不干活，只在本轮记下"要说什么、回给谁"
-                is_control = outbox is not None and ReplyOutbox.owns(tool_name)
-                max_calls = MAX_CONTROL_CALLS if is_control else get_max_calls(tool_name)
+                # 额度写在 Provider 的元信息里（reply / skip 是 6，其余工具各有上限）
+                max_calls = get_max_calls(tool_name)
                 count = _tool_call_counts.get(tool_name, 0)
 
                 if count >= max_calls:
@@ -208,11 +209,12 @@ async def chat(
                 else:
                     all_blocked = False
                     _tool_call_counts[tool_name] = count + 1
-                    if is_control:
-                        result = outbox.handle(tool_name, tc.function.arguments)
+                    # 统一入口：控制类工具（reply / skip）从 outbox 里取本轮上下文，
+                    # 其余工具忽略它 —— 不再按名字特判"该拦截还是该走注册表"
+                    result = execute_tool(tool_name, tc.function.arguments, context=outbox)
+                    if tool_needs_context(tool_name):
                         print(f"[🗣️ 表态 R{round_num}][{tool_name}] {result}")
                     else:
-                        result = execute_tool(tool_name, tc.function.arguments)
                         print(f"[📡 结果 R{round_num}][{tool_name} #{_tool_call_counts[tool_name]}/{max_calls}]\n{result}")
                     messages.append({
                         "role": "tool",

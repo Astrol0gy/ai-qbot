@@ -24,7 +24,12 @@ class ToolProvider:
     def get_tools(self) -> list[dict]:
         """
         返回该 Provider 提供的所有工具元信息列表。
-        每项格式: {"name": str, "description": str, "parameters": dict, "handler": callable}
+        每项格式: {"name": str, "description": str, "parameters": dict, "handler": callable,
+                  "max_calls": int（可选，默认 5）, "needs_context": bool（可选，默认 False）}
+
+        needs_context=True 表示 handler 的第一个参数是**调用方每轮传入的会话上下文**
+        （如 reply / skip 的待发消息箱）：这类工具不产生"给模型看的素材"，只改本轮状态，
+        且默认不会出现在 get_definitions() 里，要由调用方按需显式注入。
         """
         raise NotImplementedError
 
@@ -41,7 +46,8 @@ class ToolRegistry:
 
     def __init__(self):
         self._providers: list[ToolProvider] = []
-        self._tool_map: dict[str, tuple[dict, Callable, int]] = {}  # name → (def, handler, max_calls)
+        # name → (def, handler, max_calls, needs_context)
+        self._tool_map: dict[str, tuple[dict, Callable, int, bool]] = {}
 
     def register_provider(self, provider: ToolProvider):
         """注册一个 Provider，将其所有工具加入注册表"""
@@ -57,17 +63,29 @@ class ToolRegistry:
                 },
             }
             max_calls = tool_meta.get("max_calls", 5)  # 默认 5 次
-            self._tool_map[name] = (definition, tool_meta["handler"], max_calls)
+            self._tool_map[name] = (
+                definition,
+                tool_meta["handler"],
+                max_calls,
+                bool(tool_meta.get("needs_context", False)),
+            )
         print(f"[ToolRegistry] 注册 Provider「{provider.name}」 -> 工具: {provider.get_tool_names()}")
 
     def get_definitions(self, whitelist: set[str] | None = None) -> list[dict]:
         """
         获取 OpenAI Tool Calling 格式的工具定义列表。
-        whitelist: 可选白名单（工具名集合），只返回白名单内的工具。None 则返回全部。
+        whitelist: 可选白名单（工具名集合），只返回白名单内的工具。
+                   None 则返回全部**常规工具** —— 不含 needs_context 的控制类工具
+                   （reply / skip）：它们只在普通群聊唤醒路径显式注入，绝不能混进
+                   私聊、跑团这些不打算让 AI 表态的路径。
         """
         if whitelist is not None:
-            return [defn for name, (defn, _, _) in self._tool_map.items() if name in whitelist]
-        return [defn for defn, _, _ in self._tool_map.values()]
+            return [
+                defn for name, (defn, _, _, _) in self._tool_map.items() if name in whitelist
+            ]
+        return [
+            defn for defn, _, _, needs_context in self._tool_map.values() if not needs_context
+        ]
 
     def get_max_calls(self, tool_name: str) -> int:
         """获取某个工具的调用次数上限。未注册的工具返回 0。"""
@@ -76,14 +94,33 @@ class ToolRegistry:
             return 0
         return entry[2]
 
-    def execute(self, tool_name: str, arguments: str) -> str:
-        """执行指定工具。返回执行结果字符串。"""
+    def needs_context(self, tool_name: str) -> bool:
+        """该工具是否需要调用方提供会话上下文（控制类工具）"""
+        entry = self._tool_map.get(tool_name)
+        return bool(entry[3]) if entry else False
+
+    def execute(self, tool_name: str, arguments: str, context=None) -> str:
+        """
+        执行指定工具。返回执行结果字符串。
+
+        context: 会话上下文，只有 needs_context 的工具会收到它（作为 handler 的第一个参数）；
+                 其余工具忽略。缺上下文时不执行，直接告诉模型（宁可这轮不表态，也不写错地方）。
+        """
         entry = self._tool_map.get(tool_name)
         if entry is None:
             return f"未知工具：{tool_name}"
-        _, handler, _ = entry
+        _, handler, _, needs_context = entry
         try:
-            args = json.loads(arguments)
+            args = json.loads(arguments or "{}")
+        except ValueError as e:
+            return f"工具「{tool_name}」的参数不是合法 JSON（{e}），本次调用没有执行。"
+        if not isinstance(args, dict):
+            return f"工具「{tool_name}」的参数需要是 JSON 对象，本次调用没有执行。"
+        try:
+            if needs_context:
+                if context is None:
+                    return f"工具「{tool_name}」需要会话上下文，本轮没有可用的上下文，本次调用没有执行。"
+                return handler(context, **args)
             return handler(**args)
         except Exception as e:
             return f"工具执行失败：{e}"
@@ -103,12 +140,14 @@ from .image_provider import ImageProvider  # noqa: E402
 from .video_provider import VideoProvider  # noqa: E402
 from .profile_provider import ProfileProvider  # noqa: E402
 from .campaign_provider import CampaignProvider  # noqa: E402
+from .chat_provider import ChatProvider  # noqa: E402
 
 _registry.register_provider(SearchProvider())
 _registry.register_provider(ImageProvider())
 _registry.register_provider(VideoProvider())
 _registry.register_provider(ProfileProvider())
 _registry.register_provider(CampaignProvider())
+_registry.register_provider(ChatProvider())
 
 
 # ============================================
@@ -124,6 +163,11 @@ def get_max_calls(tool_name: str) -> int:
     return _registry.get_max_calls(tool_name)
 
 
-def execute(tool_name: str, arguments: str) -> str:
-    """执行指定工具"""
-    return _registry.execute(tool_name, arguments)
+def execute(tool_name: str, arguments: str, context=None) -> str:
+    """执行指定工具（needs_context 的工具由 context 传入本轮会话上下文）"""
+    return _registry.execute(tool_name, arguments, context=context)
+
+
+def needs_context(tool_name: str) -> bool:
+    """该工具是否需要会话上下文（控制类工具：reply / skip）"""
+    return _registry.needs_context(tool_name)

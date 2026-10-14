@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import re
 import sys
 import time
@@ -99,7 +100,8 @@ SIMS_BY_CONV: dict[str, "Sim"] = {}  # conv_id  → 场景
 from src.channels import core                            # noqa: E402
 from src.channels import onebot as ob                    # noqa: E402
 from src.channels.onebot import OneBotClient             # noqa: E402
-from src.reply_outbox import ReplyItem                   # noqa: E402
+from src.tools import execute as execute_tool            # noqa: E402
+from src.tools.chat_provider import ReplyItem            # noqa: E402
 from src.trigger import trigger                          # noqa: E402
 
 _REAL_CHAT = core.chat
@@ -405,7 +407,85 @@ async def scene_4() -> Sim:
     return sim
 
 
-SCENES = {"1": scene_1, "2": scene_2, "3": scene_3, "4": scene_4}
+# 场景 5 的观测点（打桩模型，不需要 API）
+FLIP: dict[str, object] = {}
+
+
+async def scene_5() -> Sim:
+    """场景 5：reply 之后又调 skip —— 已排队的回复不许被撤掉（打桩，不调 API）"""
+    sim = new_sim(
+        990005,
+        "场景 5：reply×2 之后再调 skip —— 已排队的回复必须照常发出（打桩模型）",
+    )
+
+    async def flip_chat(conv_id, user_id, user_message, user_name="", outbox=None, history_text=None):
+        """
+        复刻真机上的那次来回：先排两条回复，模型随后又把 skip 当「我说完了」用了。
+
+        旧实现里 skip 会清空 items，于是群里一条都收不到（真机上它还因此撤了又重发，
+        白烧一次模型调用）；这里走真实的注册表入口（tools.execute + 本轮上下文），
+        钉的就是注册之后 handler 的语义。
+        """
+        FLIP["ctx"] = history_text or ""
+        if outbox is None:
+            FLIP["no_outbox"] = True
+            return ""
+        ids = sorted(outbox.known_ids)
+        FLIP["r1"] = execute_tool(
+            "reply",
+            json.dumps({"text": "先回一条：在的", "reply_to": ids[0] if ids else ""}),
+            context=outbox,
+        )
+        FLIP["r2"] = execute_tool(
+            "reply", json.dumps({"text": "第二条：刚翻了下记录"}), context=outbox
+        )
+        FLIP["skip"] = execute_tool("skip", "{}", context=outbox)
+        FLIP["items_after_skip"] = len(outbox.items)
+        FLIP["skipped_flag"] = outbox.skipped
+        return ""
+
+    real_chat = core.chat
+    core.chat = flip_chat
+    try:
+        await sim.user_says(ZHANG, "张三", "肥鱼，你刚说的那个记录里到底有啥？", at=True)
+    finally:
+        core.chat = real_chat
+
+    items = int(FLIP.get("items_after_skip") or 0)
+    say(
+        f"  {elapsed():>6}s  [skip 之后] 队列里还剩 {items} 条 / "
+        f"skipped={FLIP.get('skipped_flag')} / skip 返回：「{FLIP.get('skip')}」"
+    )
+    say(
+        f"  {elapsed():>6}s  [群里收到 {len(sim.sent)} 条] "
+        + "；".join(
+            (f"{m['text']}（引用 #{m['reply_to']}）" if m["reply_to"] else m["text"]) for m in sim.sent
+        )
+    )
+
+    check("场景5：唤醒轮确实带上了 outbox", not FLIP.get("no_outbox"))
+    check("场景5：skip 不撤销已排队的回复（队列仍是 2 条）", items == 2, f"实际 {items} 条")
+    check("场景5：有回复时不该被标成「本轮不开口」", FLIP.get("skipped_flag") is False)
+    check(
+        "场景5：skip 的返回文案明确说了不撤销",
+        "不会撤销" in str(FLIP.get("skip") or ""),
+        str(FLIP.get("skip")),
+    )
+    check(
+        "场景5：两条回复都发进群了（旧实现这里会是 0 条）",
+        [m["text"] for m in sim.sent] == ["先回一条：在的", "第二条：刚翻了下记录"],
+        f"实际 {[m['text'] for m in sim.sent]}",
+    )
+    check(
+        "场景5：第一条仍带着引用，第二条是普通发言",
+        len(sim.sent) == 2 and bool(sim.sent[0]["reply_to"]) and not sim.sent[1]["reply_to"],
+        f"reply_to={[m['reply_to'] for m in sim.sent]}",
+    )
+    check("场景5：本轮结束顺手清了缓冲（回过的不会再被答一次）", not trigger.buffer.ids(sim.conv_id))
+    return sim
+
+
+SCENES = {"1": scene_1, "2": scene_2, "3": scene_3, "4": scene_4, "5": scene_5}
 
 
 # ============================================

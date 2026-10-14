@@ -179,7 +179,8 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     outbox = None
     trigger = None
     if msg.ai_decides_reply:
-        from ..reply_outbox import ReplyOutbox  # 局部导入，避免通道层与触发层循环依赖
+        # 局部导入：通道层不在模块级依赖工具层（触发层同理）
+        from ..tools.chat_provider import ReplyOutbox
         from ..trigger import trigger as _trigger
 
         trigger = _trigger
