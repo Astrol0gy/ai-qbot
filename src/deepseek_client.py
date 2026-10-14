@@ -8,7 +8,7 @@ DeepSeek V4 API 封装
 from collections import defaultdict
 from datetime import datetime
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Timeout
 
 from .config import (
     DEEPSEEK_API_KEY,
@@ -20,16 +20,35 @@ from .config import (
     DEEPSEEK_ENABLE_THINKING,
     DEEPSEEK_REASONING_EFFORT,
     DEEPSEEK_ENABLE_SEARCH,
+    DEEPSEEK_ROUND_TIMEOUT_SEC,
     BOT_SYSTEM_PROMPT,
     MAX_HISTORY_LENGTH,
 )
 from .tools import execute as execute_tool, get_definitions, get_max_calls
+from .reply_outbox import ReplyOutbox
 from . import skills
 from . import user_profile
 from . import campaign_state
 
-# 异步客户端
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+# 控制类工具（reply / skip）单轮最多调用几次：一批里可能好几个人同时说话，
+# 要给"各回一条"留足额度，同时防止模型没完没了地"补一句"烧钱
+MAX_CONTROL_CALLS = 6
+
+# 异步客户端。
+# 这里只管**单次请求**的上限；真正的总时限在 core 里（到点就放弃这一轮，晚到的回答一律
+# 作废）。所以既不能让一次请求无限等（SDK 默认 read=600s），也不能让 SDK 悄悄重试出
+# 一堆"晚到的回答"—— 重试 1 次够应付抖动，剩下的交给 core 的总时限。
+client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url=DEEPSEEK_BASE_URL,
+    timeout=Timeout(
+        connect=5.0,
+        read=DEEPSEEK_ROUND_TIMEOUT_SEC,
+        write=DEEPSEEK_ROUND_TIMEOUT_SEC,
+        pool=DEEPSEEK_ROUND_TIMEOUT_SEC,
+    ),
+    max_retries=1,
+)
 
 # 按群维度存储对话历史（群内所有用户共享同一上下文，消息带说话者标识区分是谁说的）
 _conversations: dict[str, list[dict]] = defaultdict(list)
@@ -39,11 +58,25 @@ def _make_key(group_id: str) -> str:
     return group_id
 
 
-async def chat(group_id: str, user_id: str, user_message: str, user_name: str = "") -> str:
+async def chat(
+    group_id: str,
+    user_id: str,
+    user_message: str,
+    user_name: str = "",
+    outbox: ReplyOutbox | None = None,
+    history_text: str | None = None,
+) -> str:
     """
     发送消息给 DeepSeek V4 Pro 并获取回复。
     对话上下文按群共享（不按用户隔离），每条消息带【说话者】标识供模型区分是谁在说。
     联网搜索通过 Tool Calling 实现：模型自主决定是否需要搜索。
+
+    ``outbox`` 非空时（普通群聊唤醒路径）额外注入 reply / skip 两个控制类工具，
+    由模型自己决定这轮开不开口、引用哪条消息。回复不在循环里发出，只记进 outbox，
+    由通道层在返回后按顺序发送；返回值就是「真正发出去的内容」（skip 时为空串）。
+
+    ``history_text`` 是写进对话历史的用户侧原文。唤醒路径的 ``user_message`` 外面
+    包了一层唤醒指令，直接存进历史会污染上下文，所以用原始片段代替。
     """
     key = _make_key(group_id)
     history = _conversations[key]
@@ -55,6 +88,10 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
     # 说话者标识：优先昵称，缺失时用 member_openid 尾号
     speaker = (user_name or "").strip() or f"用户{str(user_id)[-4:]}"
     tagged_message = f"【{speaker}】{user_message}"
+    # 写进对话历史的内容：唤醒路径的 user_message 外面包了唤醒指令，把包装存进历史会
+    # 污染上下文，所以用原始群聊片段代替。片段里每行都已经带【说话者】，不能再套一层——
+    # 否则历史里会出现「【张三】【张三】行，那就先这样」，模型还会照这个格式在自己的回复里也加标签
+    history_user = tagged_message if not history_text else history_text
 
     # 构建请求消息（注入当前日期 + skill 指引 + 用户画像 + 跑团状态）
     today = datetime.now().strftime("%Y年%m月%d日 %A")
@@ -71,12 +108,19 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
         "每条用户消息都以【说话者】开头，请据此区分是谁在说话。多人同时在场时，注意称呼和回应对应的说话者。\n\n"
         "【回复格式要求 — 必须遵守】\n"
         "你的回复发送到 QQ 群聊，QQ 不支持 Markdown 渲染，禁止使用任何 Markdown 语法。\n"
-        "请使用以下纯文本格式替代：\n"
+        "需要强调或分点时，用以下纯文本写法代替：\n"
         "- 用【标题】或「关键词」突出重点，代替 **粗体**\n"
         "- 用数字序号 1. 2. 3. 表达分点，代替 ### 标题\n"
         "- 用 · 开头表示列表项，代替 - 或 * 列表\n"
         "- 禁止使用 # * _ ` ``` ~~ 等 Markdown 标记\n"
         "- 禁止使用 [文字](链接) 格式，直接写链接 URL 即可\n"
+        "- 不要在回复开头加【说话者】这类人名标签（那是用户消息的标识，不是你的），直接说内容\n\n"
+        "【说话风格 — 必须遵守】\n"
+        "这是群聊，你是在跟朋友接话，不是在写作文、报告或说明书：\n"
+        "- 默认就回一两句，像群里随口接话那么短；说完就停，别铺垫、别收尾总结\n"
+        "- 分点、列表是例外：只有对方明确要你「详细说」「列一下」，或者内容本身就是几个并列选项时才用\n"
+        "- 别用「总结一下」「总的来说」收尾，也别复述对方刚说过的话\n"
+        "- 对方没要求展开时，长篇大论只会像个机器人在念稿\n"
     )
 
     if dm_mode:
@@ -119,8 +163,11 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
 
     messages.append({"role": "user", "content": tagged_message})
 
-    # 工具列表
-    tools = get_definitions() if DEEPSEEK_ENABLE_SEARCH else None
+    # 工具列表（普通群聊唤醒时额外带上 reply / skip）
+    tools = list(get_definitions()) if DEEPSEEK_ENABLE_SEARCH else []
+    if outbox is not None:
+        tools += outbox.tool_defs()
+    tools = tools or None  # 空列表会被 API 拒绝，统一成 None
 
     # 工具调用循环
     # 每个工具有独立的调用上限（max_calls），全局安全上限 20 轮防止死循环
@@ -145,7 +192,9 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
             all_blocked = True
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
-                max_calls = get_max_calls(tool_name)
+                # 控制类工具（reply / skip）：不干活，只在本轮记下"要说什么、回给谁"
+                is_control = outbox is not None and ReplyOutbox.owns(tool_name)
+                max_calls = MAX_CONTROL_CALLS if is_control else get_max_calls(tool_name)
                 count = _tool_call_counts.get(tool_name, 0)
 
                 if count >= max_calls:
@@ -159,8 +208,12 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
                 else:
                     all_blocked = False
                     _tool_call_counts[tool_name] = count + 1
-                    result = execute_tool(tool_name, tc.function.arguments)
-                    print(f"[📡 结果 R{round_num}][{tool_name} #{_tool_call_counts[tool_name]}/{max_calls}]\n{result}")
+                    if is_control:
+                        result = outbox.handle(tool_name, tc.function.arguments)
+                        print(f"[🗣️ 表态 R{round_num}][{tool_name}] {result}")
+                    else:
+                        result = execute_tool(tool_name, tc.function.arguments)
+                        print(f"[📡 结果 R{round_num}][{tool_name} #{_tool_call_counts[tool_name]}/{max_calls}]\n{result}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -180,8 +233,22 @@ async def chat(group_id: str, user_id: str, user_message: str, user_name: str = 
         print(f"[⚠️ 超时] 达到 {_MAX_GLOBAL_ROUNDS} 轮全局上限，已获取 {tool_count} 条结果，执行 fallback 总结...")
         reply = await _fallback_summarize(messages)
 
+    # ---------- 普通群聊唤醒：真正的"回答"是模型用工具记下的回复 ----------
+    if outbox is not None:
+        if outbox.has_items:
+            sent = outbox.as_history_text()
+            history.append({"role": "user", "content": history_user})
+            history.append({"role": "assistant", "content": sent})
+            return sent
+        if outbox.skipped:
+            # 选择不开口：什么都不写。这段上下文仍留在缓冲里，
+            # 下次被叫醒时会连同新消息一起重新交给它
+            print("[🤐 skip] 本轮不写入对话历史")
+            return ""
+        # 没调工具：当作普通回复，继续往下走
+
     # 保存对话历史（只存 user/assistant，不存中间 tool 消息）
-    history.append({"role": "user", "content": tagged_message})
+    history.append({"role": "user", "content": history_user})
     history.append({"role": "assistant", "content": reply})
 
     return reply
