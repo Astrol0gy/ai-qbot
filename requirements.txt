@@ -1,4 +1,7 @@
 qq-botpy>=1.1.5
+# OneBot 通道复用 aiohttp 实现 WebSocket 客户端（botpy 也依赖它），
+# 因为被直接 import，所以显式声明，避免未来移除 botpy 时缺少依赖
+aiohttp>=3.9.0
 openai>=1.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
