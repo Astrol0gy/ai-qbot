@@ -103,6 +103,19 @@ def _get_active(group_id: str) -> tuple[dict, dict | None]:
 # ============================================
 # DM 模式开关
 # ============================================
+def _drop_chat_context(gid: str) -> None:
+    """
+    切换模式时丢掉普通群聊攒下的上下文与互动窗口。
+
+    跑团与普通 chat 互斥：留着这些片段，退出跑团后会被当成「刚刚发生的事」
+    喂给 AI；反过来普通 chat 的历史也不该带进跑团。
+    """
+    from .trigger import trigger  # 延迟导入，避免与触发层循环依赖
+
+    trigger.buffer.clear(gid)
+    trigger.leave_session(gid)
+
+
 def is_dm_mode(group_id: str = "") -> bool:
     """当前群是否处于 DM 模式"""
     gid = group_id or _current_group_id
@@ -116,6 +129,7 @@ def enter_dm(group_id: str = "", campaign_name: str = "") -> str:
     gid = group_id or _current_group_id
     if not gid:
         return "无法确定当前群。"
+    _drop_chat_context(gid)
     data = _load(gid)
     data["dm_mode"] = True
 
@@ -134,6 +148,7 @@ def exit_dm(group_id: str = "") -> str:
     gid = group_id or _current_group_id
     if not gid:
         return "无法确定当前群。"
+    _drop_chat_context(gid)
     data = _load(gid)
     data["dm_mode"] = False
     _save(gid, data)

@@ -5,7 +5,10 @@
 
 百炼最新视觉 API 文档: https://help.aliyun.com/zh/model-studio/vision
 """
+import asyncio
 import base64
+import time
+from collections import OrderedDict, deque
 
 import requests
 from openai import OpenAI
@@ -18,6 +21,8 @@ from .config import (
     VISION_HIGH_RES,
     IMAGE_GEN_MODEL,
     IMAGE_GEN_ENDPOINT,
+    TRIGGER_IMAGE_CACHE_SIZE,
+    TRIGGER_IMAGE_RATE_PER_MIN,
 )
 
 # 下载限制
@@ -41,11 +46,22 @@ def _get_client() -> OpenAI | None:
     return _vision_client
 
 
+# 明确支持 enable_thinking 开关的模型族；其余模型带上该参数可能直接报错
+_THINKING_CAPABLE = ("qwen3", "thinking")
+
+
 def _build_extra_body() -> dict | None:
-    """构建百炼特有参数，通过 extra_body 传递"""
+    """
+    构建百炼特有参数，通过 extra_body 传递。
+
+    enable_thinking 必须**显式**传 False 才有效：省略该键会退回模型默认值，
+    而部分模型（如 qwen3.7-flash）默认就是思考模式 —— 实测关掉开关后仍会输出
+    reasoning_content，单张图耗时从 8.2s 涨到 22s。所以只要模型属于支持该开关的
+    族系，就把布尔值显式发出去。
+    """
     extra = {}
-    if VISION_ENABLE_THINKING:
-        extra["enable_thinking"] = True
+    if VISION_ENABLE_THINKING or any(k in VISION_MODEL.lower() for k in _THINKING_CAPABLE):
+        extra["enable_thinking"] = bool(VISION_ENABLE_THINKING)
     if VISION_HIGH_RES:
         extra["vl_high_resolution_images"] = True
     return extra if extra else None
@@ -163,6 +179,93 @@ def describe_image(image_url: str, question: str = "") -> str | None:
             return result
 
     return None
+
+
+# ============================================
+# 上下文预识别（未 @ 的群消息）
+#
+# 机器人「看得见」群里所有人发的图，代价是每张图一次 VLM 调用。
+# 这里加两层护栏：按 URL 缓存描述（同图不重复计费）+ 每会话频控（防刷图）。
+# ============================================
+_IMG_CACHE: "OrderedDict[str, str]" = OrderedDict()  # url -> 描述（LRU）
+_IMG_RATE: dict[str, deque[float]] = {}              # conv_id -> 最近识别时间戳
+_IMG_RATE_WINDOW = 60.0
+
+
+def _cache_get(url: str) -> str | None:
+    desc = _IMG_CACHE.get(url)
+    if desc is not None:
+        _IMG_CACHE.move_to_end(url)
+    return desc
+
+
+def _cache_put(url: str, desc: str) -> None:
+    _IMG_CACHE[url] = desc
+    _IMG_CACHE.move_to_end(url)
+    while len(_IMG_CACHE) > max(1, TRIGGER_IMAGE_CACHE_SIZE):
+        _IMG_CACHE.popitem(last=False)
+
+
+def _take_rate(conv_id: str, n: int) -> bool:
+    """该会话最近一分钟是否还有 n 张图的识别预算（上限 <=0 表示不限制）"""
+    limit = TRIGGER_IMAGE_RATE_PER_MIN
+    if limit <= 0:
+        return True
+
+    now = time.monotonic()
+    stamps = _IMG_RATE.setdefault(conv_id, deque())
+    while stamps and now - stamps[0] > _IMG_RATE_WINDOW:
+        stamps.popleft()
+
+    if len(stamps) + n > limit:
+        return False
+    stamps.extend([now] * n)
+
+    # 窗口滑空后顺手清掉无活动的会话，避免 _IMG_RATE 无界增长
+    if len(_IMG_RATE) > 200:
+        for key in [k for k, v in _IMG_RATE.items() if not v]:
+            _IMG_RATE.pop(key, None)
+    return True
+
+
+async def describe_for_context(conv_id: str, urls: list[str]) -> list[str] | None:
+    """
+    为「上下文」预识别一组图片（未 @ 的群消息）。
+
+    与 describe_image 的区别：带 URL 缓存与每会话频控；**任一张识别失败就返回
+    None**，交由调用方保持「未识别」状态 —— 等真正需要回复时再走完整识别，
+    避免把残缺的描述写进上下文，也避免识别失败被缓存。
+
+    Args:
+        conv_id: 会话标识（频控按会话计）
+        urls: 图片直链列表
+
+    Returns:
+        与 urls 等长的描述列表；未配置 VLM / 超频 / 任一失败时返回 None
+    """
+    if not urls or not DASHSCOPE_API_KEY:
+        return None
+
+    missing = [u for u in urls if _cache_get(u) is None]
+    if missing and not _take_rate(conv_id, len(missing)):
+        print(
+            f"[VLM] 已达频控上限（{TRIGGER_IMAGE_RATE_PER_MIN} 张/分钟），"
+            f"本次跳过 {len(missing)} 张图片的预识别"
+        )
+        return None
+
+    descs: list[str] = []
+    for url in urls:
+        desc = _cache_get(url)
+        if desc is None:
+            print(f"[VLM] 上下文预识别: {url[:80]}...")
+            # describe_image 是同步阻塞调用，放线程池跑，别卡住事件循环
+            desc = await asyncio.to_thread(describe_image, url)
+            if not desc:
+                return None
+            _cache_put(url, desc)
+        descs.append(desc)
+    return descs
 
 
 def text_to_image(
