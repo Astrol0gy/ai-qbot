@@ -49,6 +49,11 @@ async def _run_onebot_channel() -> None:
 
 async def main() -> None:
     validate()  # 启动前检查配置
+    from pathlib import Path
+    from .user_profile import PROFILES_DIR
+    legacy_count = sum(1 for _ in Path(PROFILES_DIR).glob("*.md"))
+    if legacy_count:
+        print(f"[数据迁移] 保留了 {legacy_count} 份旧画像文件；新版只加载带身份标识的独立目录，旧画像采用显式归属迁移，见 README。")
 
     channel_names = []
     tasks = []
@@ -60,7 +65,22 @@ async def main() -> None:
         tasks.append(_run_onebot_channel())
 
     print(f"🚀 启动通道：{' + '.join(channel_names)}")
-    await asyncio.gather(*tasks)
+    running = [asyncio.create_task(task) for task in tasks]
+    try:
+        await asyncio.gather(*running)
+    finally:
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        from . import runtime, deepseek_client, vision_utils, stickers_utils
+        await runtime.shutdown()
+        await asyncio.to_thread(stickers_utils.shutdown, 3)
+        await deepseek_client.client.close()
+        if vision_utils._vision_client is not None:
+            vision_utils._vision_client.close()
+        from .tools import search_provider
+        if search_provider._search_client is not None:
+            search_provider._search_client.close()
 
 
 if __name__ == "__main__":

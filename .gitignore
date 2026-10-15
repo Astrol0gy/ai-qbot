@@ -25,3 +25,6 @@ Thumbs.db
 
 # 用户画像数据（不应提交到 git）
 data/
+
+# Rotated runtime logs
+/logs/

@@ -41,8 +41,9 @@ set -uo pipefail
 PROJECT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 cd "$PROJECT_DIR" || exit 1
 
-BOT_SESSION="qbot"
-NAPCAT_SESSION="napcat"
+INSTANCE_ID="$("$PYTHON_CMD" -c 'import hashlib,os; print(hashlib.sha256(os.path.realpath(".").encode()).hexdigest()[:10])')"
+BOT_SESSION="qbot-$INSTANCE_ID"
+NAPCAT_SESSION="napcat-$INSTANCE_ID"
 LOG_DIR="$PROJECT_DIR/logs"
 BOT_LOG="$LOG_DIR/qbot.log"
 
@@ -51,15 +52,12 @@ ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
 err()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
 
-# 从 .env 读出 OneBot 地址（以 src/config.py 为准，读不到就用默认值）
-WS_URL="$(
-    "$PYTHON_CMD" -c 'from src.config import ONEBOT_WS_URL; print(ONEBOT_WS_URL)' 2>/dev/null
-)"
-WS_URL="${WS_URL:-ws://127.0.0.1:3001}"
-WS_HOST="${WS_URL#*://}"
-WS_HOST="${WS_HOST%%:*}"
-WS_PORT="${WS_URL##*:}"
-WS_PORT="${WS_PORT%%/*}"
+# Use the same parser as Python; IPv6 and implicit ws/wss ports are supported.
+read -r WS_HOST WS_PORT ONEBOT_ACTIVE < <(
+    "$PYTHON_CMD" -c 'from urllib.parse import urlsplit; from src.config import ONEBOT_WS_URL,ONEBOT_ENABLE; p=urlsplit(ONEBOT_WS_URL); print(p.hostname or "127.0.0.1", p.port or (443 if p.scheme=="wss" else 80), int(ONEBOT_ENABLE))'
+)
+WS_URL="$("$PYTHON_CMD" -c 'from src.config import ONEBOT_WS_URL; print(ONEBOT_WS_URL)')"
+ONEBOT_ACTIVE="${ONEBOT_ACTIVE:-0}"
 
 # ------------------------------ 基础检查 ------------------------------
 require_screen() {
@@ -94,9 +92,11 @@ session_state() {
 port_open() {
     "$PYTHON_CMD" - "$WS_HOST" "$WS_PORT" <<'PY' 2>/dev/null
 import socket, sys
-s = socket.socket()
-s.settimeout(1.5)
-sys.exit(0 if s.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)
+try:
+    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1.5):
+        pass
+except OSError:
+    sys.exit(1)
 PY
 }
 
@@ -121,6 +121,9 @@ for pid in entries:
     if not pid.isdigit():
         continue
     try:
+        scope = os.environ.get("PROC_CWD")
+        if scope and os.path.realpath(os.path.join(root, pid, "cwd")) != os.path.realpath(scope):
+            continue
         with open(os.path.join(root, pid, "cmdline"), "rb") as f:
             cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
     except OSError:
@@ -139,7 +142,7 @@ PY
 # 会话里的程序退出后，如果那是个交互式 shell，会话照样活着，于是出现
 # 「显示在运行、其实早就挂了」—— NapCat 半夜挂掉、Termux 却看起来一切正常，
 # 就是这么来的。
-bot_running()    { proc_alive "src.main" "src/main"; }
+bot_running()    { PROC_CWD="$PROJECT_DIR" proc_alive "-m src.main" "-m src.runner" "src/main.py"; }
 napcat_running() { proc_alive "$NAPCAT_PROC" || port_open; }
 
 # 清掉只剩壳的残留会话，否则 screen -dmS 会因会话重名而起不来
@@ -167,7 +170,8 @@ do_start() {
         warn "找不到 termux-wake-lock，建议 pkg install termux-tools"
     fi
 
-    # 2) NapCat 协议端
+    # 2) NapCat is only needed when OneBot is enabled.
+    if [ "$ONEBOT_ACTIVE" = "1" ]; then
     if napcat_running; then
         info "NapCat 已在运行，跳过启动"
     else
@@ -211,6 +215,8 @@ do_start() {
         fi
     fi
 
+    fi
+
     # 3) 机器人（输出同时进日志文件，方便事后回看「它到底卡在哪」）
     if bot_running; then
         info "机器人已在运行，跳过启动"
@@ -224,7 +230,7 @@ do_start() {
             QBOT_DIR="$PROJECT_DIR" \
             QBOT_PY="$PYTHON_CMD" \
             QBOT_LOG="$BOT_LOG" \
-            bash -lc 'cd "$QBOT_DIR" && "$QBOT_PY" -u -m src.main 2>&1 | tee -a "$QBOT_LOG"'
+            bash -lc 'cd "$QBOT_DIR" && exec "$QBOT_PY" -u -m src.runner'
         sleep 2
         if bot_running; then
             ok "已启动机器人（日志：$BOT_LOG）"
@@ -251,6 +257,13 @@ do_stop() {
                 info "$name 未在运行"
                 ;;
             *)
+                if [ "$name" = "$BOT_SESSION" ]; then
+                    screen -S "$name" -p 0 -X stuff $'\003' >/dev/null 2>&1
+                    for ((i=0; i<15; i++)); do
+                        bot_running || break
+                        sleep 1
+                    done
+                fi
                 screen -S "$name" -X quit >/dev/null 2>&1
                 ok "已停止 $name"
                 ;;
@@ -360,7 +373,9 @@ do_status() {
         esac
     fi
 
-    if port_open; then
+    if [ "$ONEBOT_ACTIVE" != "1" ]; then
+        info "OneBot 未启用，无需 NapCat"
+    elif port_open; then
         ok "NapCat 运行中（$WS_URL 已就绪）"
     elif proc_alive "$NAPCAT_PROC"; then
         warn "NapCat 进程在，但 $WS_URL 没监听（多半是还没登录 QQ）"
@@ -375,7 +390,9 @@ do_status() {
     fi
 
     echo "── QQ 登录状态 ───────────────────────"
-    if port_open; then
+    if [ "$ONEBOT_ACTIVE" != "1" ]; then
+        info "官方通道模式，跳过 NapCat 检查"
+    elif port_open; then
         check_qq
     else
         warn "端口没开，跳过（先把 NapCat 跑起来）"
@@ -390,7 +407,7 @@ do_status() {
     fi
 
     echo
-    if ! bot_running || ! port_open; then
+    if ! bot_running || { [ "$ONEBOT_ACTIVE" = "1" ] && ! port_open; }; then
         info "要拉起它们：bash start.sh"
     fi
     info "唤醒锁：Termux 重启后会失效，重跑一次 bash start.sh 即可"
