@@ -5,6 +5,7 @@ DeepSeek V4 API 封装
 - 深度思考模式（thinking + reasoning_effort）
 - Tool Calling 联网搜索（模型自主决定调用搜索工具）
 """
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -21,6 +22,8 @@ from .config import (
     DEEPSEEK_REASONING_EFFORT,
     DEEPSEEK_ENABLE_SEARCH,
     DEEPSEEK_ROUND_TIMEOUT_SEC,
+    DEEPSEEK_API_FAIL_LIMIT,
+    DEEPSEEK_API_COOLDOWN_SEC,
     BOT_SYSTEM_PROMPT,
     MAX_HISTORY_LENGTH,
 )
@@ -53,6 +56,46 @@ client = AsyncOpenAI(
 
 # 按群维度存储对话历史（群内所有用户共享同一上下文，消息带说话者标识区分是谁说的）
 _conversations: dict[str, list[dict]] = defaultdict(list)
+
+
+# ============================================
+# 服务健康熔断
+#
+# 线上事故（2026-10-15 日志）：DeepSeek 服务端那段时间在挂（日志里有 503 Service is too
+# busy），而这里没有任何兜底 —— 每一轮都规规矩矩地硬等满 60 秒才放弃，群里连着几轮都
+# 等不到回复，用户看到的就是「bot 哑了」。连续失败到阈值就进冷却，冷却期内不再发请求、
+# 直接放弃本轮：不回话也比两分钟后才回话强，而且不占着会话锁。
+# ============================================
+_fail_streak = 0
+_cooldown_until = 0.0
+
+
+def api_cooldown_left() -> float:
+    """熔断剩余秒数（0 表示服务可用）"""
+    left = _cooldown_until - time.monotonic()
+    return left if left > 0 else 0.0
+
+
+def note_api_failure(reason: str) -> None:
+    """记一次失败：连续失败够阈值就熔断一段时间"""
+    global _fail_streak, _cooldown_until
+    _fail_streak += 1
+    if _fail_streak >= DEEPSEEK_API_FAIL_LIMIT:
+        _cooldown_until = time.monotonic() + DEEPSEEK_API_COOLDOWN_SEC
+        print(
+            f"[🩺 服务熔断] DeepSeek 连续失败 {_fail_streak} 次（最近：{reason}），"
+            f"接下来 {DEEPSEEK_API_COOLDOWN_SEC:.0f}s 不再发起请求（快速放弃本轮）"
+        )
+        _fail_streak = 0  # 冷却结束后重新计数，避免刷屏
+
+
+def note_api_success() -> None:
+    """记一次成功：清零失败计数，并用一条日志宣告服务恢复"""
+    global _fail_streak, _cooldown_until
+    if _cooldown_until:
+        print("[🩺 服务恢复] DeepSeek 已能正常返回，熔断解除")
+    _fail_streak = 0
+    _cooldown_until = 0.0
 
 
 def _make_key(group_id: str) -> str:
@@ -179,6 +222,15 @@ async def chat(
     for round_num in range(1, _MAX_GLOBAL_ROUNDS + 1):
         kwargs = _build_request_kwargs(messages, tools)
         response = await client.chat.completions.create(**kwargs)
+        # 「200 但没有 choices」的情况线上出现过（视觉那边就是这么炸的，只留下一句
+        # 'NoneType' object is not subscriptable）。这里也判一下并把原始响应打出来，
+        # 免得主链路出同样的错时还是查不动。
+        if not getattr(response, "choices", None):
+            try:
+                raw = str(response.model_dump())[:600]
+            except Exception:
+                raw = repr(response)[:600]
+            raise RuntimeError(f"DeepSeek 返回了没有 choices 的响应：{raw}")
         msg = response.choices[0].message
 
         # 调试：打印思考过程

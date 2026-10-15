@@ -7,6 +7,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from ..vision_utils import IMAGE_UNAVAILABLE
+
 # 单张图片的描述写入上下文时的截断长度：上下文要拼进 LLM 提示词，
 # 描述太长会把提示词撑大（每群最多 TRIGGER_CONTEXT_MESSAGES 条）
 IMAGE_NOTE_MAX = 100
@@ -81,7 +83,9 @@ class IncomingMessage:
             brief = (desc or "").strip().replace("\n", " ")
             if len(brief) > IMAGE_NOTE_MAX:
                 brief = brief[:IMAGE_NOTE_MAX] + "…"
-            parts.append(f"[图片{i + 1}：{brief or '无法识别'}]")
+            # 识别不出来的图留中性占位（别写「识别失败」：主模型会拿它去琢磨，
+            # 白烧思考预算，日志里实测把一轮拖过 60 秒超时）
+            parts.append(f"[图片{i + 1}：{brief or IMAGE_UNAVAILABLE}]")
         return " ".join(p for p in parts if p)
 
 

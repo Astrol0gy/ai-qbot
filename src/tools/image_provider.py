@@ -108,7 +108,13 @@ class ImageProvider(ToolProvider):
     def _describe_image(url: str, question: str = "") -> str:
         result = describe_image(url, question=question)
         if result is None:
-            return "视觉识别服务未配置或暂时不可用，无法分析图片。"
+            # 别让模型对着同一个 URL 反复重试（每试一次都要重新下载，还可能白等几十秒）；
+            # 失败已进退避，重试也是同样的结果
+            return (
+                "这张图没能读到（视觉服务暂时不可用，或这张图取不到）。"
+                "不要换 URL 反复重试，也不要猜图里的内容：按「没看到图」继续回应，"
+                "需要图才能答就直接说明没看清、请对方描述一下。"
+            )
         return result
 
     # --- search_images ---

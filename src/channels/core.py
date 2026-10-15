@@ -8,8 +8,14 @@ import asyncio
 import re
 
 from ..config import DEEPSEEK_ROUND_TIMEOUT_SEC
-from ..deepseek_client import chat, clear_history
-from ..vision_utils import describe_image, vision_available
+from ..deepseek_client import (
+    api_cooldown_left,
+    chat,
+    clear_history,
+    note_api_failure,
+    note_api_success,
+)
+from ..vision_utils import IMAGE_UNAVAILABLE, describe_image, vision_available
 from .base import IncomingMessage, Sender
 from .commands import HELP_TEXT, handle_dm_cmd, handle_profile_cmd
 
@@ -79,7 +85,12 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
             desc = await asyncio.to_thread(describe_image, url, question if i == 0 else "")
             descs.append(desc)
 
-    return "\n\n".join(f"图片{i + 1}：{d or '识别失败'}" for i, d in enumerate(descs))
+    # 识别不出来的图留中性占位（见 IMAGE_UNAVAILABLE）：主模型要知道「用户确实发过图」，
+    # 但不能拿到「识别失败」四个字去琢磨 —— 那会白烧思考预算，把一轮拖过 60 秒超时
+    # （线上日志实测：思考第一段就在纠结「图没识别出来，我该不该提一句」）。
+    return "\n\n".join(
+        f"图片{i + 1}：{d or IMAGE_UNAVAILABLE}" for i, d in enumerate(descs)
+    )
 
 
 async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
@@ -175,6 +186,19 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             )
 
     # ---------- 交给 DeepSeek ----------
+    # 服务端熔断中：不发请求、直接放弃本轮。与其让每一轮都硬等满 60 秒才放弃（用户看到的
+    # 是 bot 哑了两分钟才回话），不如立刻结束 —— 不回话也比晚回话强。
+    cooldown = api_cooldown_left()
+    if cooldown > 0:
+        print(f"[⏱️ 服务熔断中] DeepSeek 冷却还剩 {cooldown:.0f}s，放弃本轮：不发消息、退出互动")
+        if msg.ai_decides_reply:
+            from ..trigger import trigger as _trigger
+
+            _trigger.leave_session(msg.conv_id)
+        if msg.is_direct_address:
+            await sender.send("我这会儿连不上模型服务，过一会儿再叫我试试～")
+        return
+
     # 普通群聊唤醒：给 AI reply / skip 两个工具，由它决定这轮开不开口、回给谁
     outbox = None
     trigger = None
@@ -207,6 +231,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         # 收尾按「AI 主动结束这轮互动」办：退出互动窗口、回到空闲，要再开口得等下一次唤醒。
         # 片段留在缓冲里（和 skip 一致），下一条消息被叫醒时能看到完整的一段。
         thinking.cancel()
+        note_api_failure(f"单轮思考超过 {DEEPSEEK_ROUND_TIMEOUT_SEC:.0f}s")
         print(f"[⏱️ 思考超时 {DEEPSEEK_ROUND_TIMEOUT_SEC:.0f}s] 放弃本轮：不发消息、退出互动")
         if trigger is not None:
             trigger.leave_session(msg.conv_id)
@@ -215,8 +240,18 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     try:
         reply = thinking.result()
     except Exception as e:
-        print(f"[❌ DeepSeek 错误] {e}")
-        reply = "抱歉，我暂时无法回复，请稍后再试～"
+        print(f"[❌ DeepSeek 错误] {type(e).__name__}: {str(e)[:300]}")
+        note_api_failure(str(e)[:120])
+        # 失败要快速降级，别把「我连不上」这种话塞给正在等回话的人：
+        # 唤醒 / 接话本来就是 bot 自发的开口，这轮直接闭嘴（和 skip 一样留片段，等下次唤醒）；
+        # 只有直呼机器人（用户在等一个答复）才给一句短提示。
+        if msg.ai_decides_reply or msg.is_interjection:
+            if trigger is not None:
+                trigger.leave_session(msg.conv_id)
+            return
+        reply = "抱歉，我暂时连不上模型服务，稍后再叫我试试～"
+    else:
+        note_api_success()
 
     # ---------- AI 用它自己调的工具表了态 ----------
     if outbox is not None:

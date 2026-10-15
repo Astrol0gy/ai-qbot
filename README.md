@@ -154,10 +154,12 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 |---|---|
 | `TRIGGER_IMAGE_RATE_PER_MIN` | 每个群每分钟最多识别 N 张图（默认 10），超出则跳过；**不会**退化成回复时再识别 |
 | `TRIGGER_IMAGE_CACHE_SIZE` | 按图片 URL 缓存描述（默认 200 条），同一条消息重放或同一张图被反复引用时不重复计费 |
+| `VISION_FAIL_BACKOFF_SEC` | 一张图识别失败后的退避窗口（默认 600 秒），窗口内不再下载、不再调用 |
+| `ONEBOT_IMAGE_CONCURRENCY` | 图片预识别的并发额度（默认 2），**独立于**对话闸门，识别慢也不挡别的会话 |
 
 若发现费用或延迟偏高，可先把 `TRIGGER_RECOGNIZE_IMAGES=false` 关掉（回到「只在被 @ 时识别」），或把 `VISION_DETAIL` 设为 `low`（图片缩到 512×512，最快最省，代价是小字会糊）。
 
-> 识别在触发判定**之前**完成，且失败不会污染上下文：任一张识别失败就整体退回「未识别」，等真要回复时再走一次带提问的完整识别。
+> 识别在触发判定**之前**完成，且失败不会拖住对话：**逐张尽力**——认出几张算几张，认不出的那张在上下文里留中性占位 `[图片，未能读取]`（主模型据此知道"用户确实发过图"，但不会拿到"识别失败"去反复琢磨）。同一张图失败后 `VISION_FAIL_BACKOFF_SEC`（默认 600 秒）内不再下载、不再调用；识别请求本身读超时只有 `VISION_TIMEOUT_SEC`（默认 25 秒）且不重试。
 
 ### 关于发送可靠性（为什么超时不重发）
 
@@ -184,6 +186,22 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | 上下文片段 | **留着**（和 `skip` 一致），下一条消息来时连同新消息一起交给 AI |
 
 实现上不是 `asyncio.wait_for`（它取消之后会等对方真正结束，一个"吞掉取消"的请求照样能把流程拖住），而是 `asyncio.wait` + 到点直接 `cancel()` 走人——所以"晚到的回答"从机制上就没有发送的路径。`tests/sim_chat.py 4` 用打桩模型钉住了这条：模型拖到第 12 秒才返回、且取消没拦住，群里依然是 0 条。
+
+### 关于服务端不可用（熔断，快速失败）
+
+上面那条 60 秒总时限在**服务端整体挂掉**时反而成了负担：DeepSeek 返回 503 / 连不上时，每一轮都会规规矩矩地硬等满 60 秒才放弃，群里连着几轮等不到回复，看着就像"bot 哑了"（2026-10-15 的真实日志）。
+
+所以连续失败会熔断：超时、5xx、连接失败累计到 `DEEPSEEK_API_FAIL_LIMIT`（默认 3）次后，接下来 `DEEPSEEK_API_COOLDOWN_SEC`（默认 30 秒）内不再发起请求——**不回话也比两分钟后才回话强**：
+
+| 场景 | 行为 |
+|---|---|
+| 熔断期内收到群唤醒 | 立刻结束本轮（不发请求、不发消息、退出互动），片段留着等下次唤醒 |
+| 熔断期内被 @ / 私聊 | 同样不发请求，只回一句「我这会儿连不上模型服务，过一会儿再叫我试试～」 |
+| 一次成功 | 失败计数清零、熔断解除（日志打印「服务恢复」） |
+
+> 视觉侧是同一套思路但更保守：读超时 25 秒、不重试、失败退避，认不出就留占位继续答——看图只是配菜，不该拖住对话。
+
+`tests/_degrade_check.py` 把这一整条降级链钉住（全离线，不打桩模型就是假客户端）：QQ 域名跳过直传、失败退避不重复下载、一张好一张坏时逐张尽力、`choices` 为 None 时不再抛裸错、连续失败熔断后唤醒静默且不发请求、恢复后正常回话。
 
 ## 使用方法
 
@@ -212,6 +230,7 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | `ONEBOT_SELF_ID` | 机器人 QQ 号（留空自动获取） | 空 |
 | `ONEBOT_API_TIMEOUT` | 单次 API 调用超时（秒） | `15` |
 | `ONEBOT_MAX_CONCURRENCY` | 并发 LLM 调用上限 | `3` |
+| `ONEBOT_IMAGE_CONCURRENCY` | 并发图片预识别上限（独立额度，不占上面的对话闸门） | `2` |
 | `ONEBOT_HEARTBEAT` | WS 心跳间隔（秒） | `30` |
 | `ONEBOT_DEDUP_SIZE` | message_id 去重窗口 | `500` |
 | `ONEBOT_MAX_IMAGES` | 单条消息最多识别图片数 | `3` |
@@ -248,6 +267,8 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | `DEEPSEEK_REASONING_EFFORT` | 思考强度 (`high`/`max`) | `high` |
 | `DEEPSEEK_ENABLE_SEARCH` | 联网搜索 | `false` |
 | `DEEPSEEK_ROUND_TIMEOUT_SEC` | 单轮思考总时限（秒），到点放弃本轮、不发消息 | `60` |
+| `DEEPSEEK_API_FAIL_LIMIT` | 连续失败几次后熔断（不再发起请求，快速放弃本轮） | `3` |
+| `DEEPSEEK_API_COOLDOWN_SEC` | 熔断后冷却多少秒 | `30` |
 | `BOT_SYSTEM_PROMPT` | 系统提示词 | 友好群聊助手 |
 | `MAX_HISTORY_LENGTH` | 每群记住几轮对话 | `10` |
 
@@ -264,6 +285,8 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | `VISION_DETAIL` | 细节档位：`low`（缩到 512×512，最快最省）/ `high` / `original` / `auto` | `auto` |
 | `VISION_ENABLE_THINKING` | 看图是否走思考模式（推理与可见回答共用 `max_tokens`，开了会变慢且可能截断） | `false` |
 | `VISION_FILES_API` | 自己下载的图怎么送：`auto`（超过 32MiB 才上传 Files API）/ `always` / `off` | `auto` |
+| `VISION_TIMEOUT_SEC` | 单次看图请求的读超时（秒），失败不重试，认不出就留占位继续答 | `25` |
+| `VISION_FAIL_BACKOFF_SEC` | 一张图识别失败后的退避窗口（秒），窗口内不再下载、不再调用 | `600` |
 | `DASHSCOPE_API_KEY` | 阿里云百炼 API Key（**仅文生图**使用） | 空（未配置则跳过文生图） |
 | `IMAGE_GEN_MODEL` | 文生图模型 | `qwen-image-3.0-pro` |
 | `IMAGE_GEN_ENDPOINT` | 文生图端点（DashScope 原生接口） | 官方端点 |

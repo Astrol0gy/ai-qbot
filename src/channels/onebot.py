@@ -32,6 +32,7 @@ from ..config import (
     ONEBOT_DEDUP_SIZE,
     ONEBOT_DOWN_ALERT_SEC,
     ONEBOT_HEARTBEAT,
+    ONEBOT_IMAGE_CONCURRENCY,
     ONEBOT_MAX_CONCURRENCY,
     ONEBOT_MAX_IMAGES,
     ONEBOT_OFFLINE_ALERT_SEC,
@@ -253,6 +254,10 @@ class OneBotClient:
         # 某一轮还在思考时新到的消息（每会话只留最新一条作触发）：合并成一次交给 AI
         self._pending_wake: dict[str, IncomingMessage] = {}
         self._sem = asyncio.Semaphore(max(1, ONEBOT_MAX_CONCURRENCY))
+        # 图片预识别用**独立**额度：一张图最坏要走「下载 + 两次请求」（直传失败再自取），
+        # 跟整轮对话抢同一把闸门时，图片一慢，别的会话全在排队干等
+        # （日志里实测：图片预识别密集时其他会话的回复明显延后）
+        self._img_sem = asyncio.Semaphore(max(1, ONEBOT_IMAGE_CONCURRENCY))
         self._skip_sampled = 0
         # 健康自检状态（看门狗）
         self._probe_fails = 0
@@ -575,7 +580,8 @@ class OneBotClient:
         # 预识别的描述会被 core 复用，不会重复调用 VLM；失败则保持未识别状态，
         # 真要回复时再由 core 走完整识别（带用户提问，质量更好）。
         if trigger.needs_image_recognition(incoming):
-            async with self._sem:
+            # 用图片专用额度，不占对话闸门：识别慢也不挡别的会话说话
+            async with self._img_sem:
                 incoming.image_descs = await describe_for_context(
                     incoming.conv_id, incoming.image_urls
                 )

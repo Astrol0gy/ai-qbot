@@ -31,6 +31,11 @@ DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() ==
 # 单轮思考总时限（秒）：到点就放弃这一轮 —— 一条消息都不发、不写历史、退出互动窗口，
 # 之后即便 API 才返回也一律丢弃（超时才到的回答，在群里已经过时了）
 DEEPSEEK_ROUND_TIMEOUT_SEC = float(os.getenv("DEEPSEEK_ROUND_TIMEOUT_SEC", "60"))
+# 服务端不可用时的熔断：连续失败（超时 / 5xx / 连接失败）到 API_FAIL_LIMIT 次后，
+# 进入 API_COOLDOWN_SEC 秒冷却期，期间不再发起请求、直接放弃本轮 —— 与其让每轮都
+# 硬等 60 秒才放弃，不如快速失败（不回话也比两分钟后才回话强）。
+DEEPSEEK_API_FAIL_LIMIT = int(os.getenv("DEEPSEEK_API_FAIL_LIMIT", "3"))
+DEEPSEEK_API_COOLDOWN_SEC = float(os.getenv("DEEPSEEK_API_COOLDOWN_SEC", "30"))
 # DeepSeek 官方内置 web search（Anthropic 兼容端点）
 DEEPSEEK_ANTHROPIC_BASE_URL = os.getenv(
     "DEEPSEEK_ANTHROPIC_BASE_URL",
@@ -68,6 +73,12 @@ VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").lower() ==
 #   always = 一律上传 Files API 换 file_id（请求体小，同一张图可长期复用）
 #   off = 只用直传 URL / base64，超过 32MiB 直接放弃
 VISION_FILES_API = os.getenv("VISION_FILES_API", "auto").strip().lower()
+# 单次看图请求的读超时（秒）。看图是「给对话做配菜」的活，不能拖住整轮：默认的 600s
+# 会在服务端半死时把一轮挂到 60 秒超时放弃，所以这里给一个短上限。
+VISION_TIMEOUT_SEC = float(os.getenv("VISION_TIMEOUT_SEC", "25"))
+# 识别失败的退避窗口（秒）：同一张图在这个窗口内不再下载、不再调用。线上日志的教训是
+# 「失败不缓存 → 每次唤醒重新下载重试」，白白拖慢整轮。
+VISION_FAIL_BACKOFF_SEC = float(os.getenv("VISION_FAIL_BACKOFF_SEC", "600"))
 
 # ============================================
 # 文生图（Qwen-Image，DashScope 原生接口）
@@ -97,6 +108,9 @@ ONEBOT_ACCESS_TOKEN = os.getenv("ONEBOT_ACCESS_TOKEN", "")
 ONEBOT_SELF_ID = os.getenv("ONEBOT_SELF_ID", "")
 ONEBOT_API_TIMEOUT = float(os.getenv("ONEBOT_API_TIMEOUT", "15"))
 ONEBOT_MAX_CONCURRENCY = int(os.getenv("ONEBOT_MAX_CONCURRENCY", "3"))
+# 图片预识别的独立并发额度（不占上面那把对话闸门）：一张图最坏要走「下载 + 两次请求」，
+# 跟整轮对话抢额度会让其他会话干等（日志里实测过：图片识别慢，别的会话全在排队）
+ONEBOT_IMAGE_CONCURRENCY = int(os.getenv("ONEBOT_IMAGE_CONCURRENCY", "2"))
 ONEBOT_HEARTBEAT = float(os.getenv("ONEBOT_HEARTBEAT", "30"))
 ONEBOT_DEDUP_SIZE = int(os.getenv("ONEBOT_DEDUP_SIZE", "500"))
 ONEBOT_MAX_IMAGES = int(os.getenv("ONEBOT_MAX_IMAGES", "3"))
