@@ -44,7 +44,8 @@ from ..config import (
 )
 from ..trigger import Decision, trigger
 from ..vision_utils import describe_for_context
-from .base import IncomingMessage, QuoteInfo, Sender, truncate_text
+from .base import IncomingMessage, QuoteInfo, Sender, SendResult, truncate_text
+from .scheduler import ConversationQueue
 from .core import handle_message
 
 # ============================================
@@ -179,6 +180,10 @@ class OneBotSender(Sender):
         self._is_group = is_group
         self._group_id = group_id
         self._user_id = user_id
+        self._pending_result = SendResult("rejected", detail="尚未提交至平台")
+
+    def interrupted_result(self):
+        return self._pending_result
 
     async def send(
         self,
@@ -186,19 +191,34 @@ class OneBotSender(Sender):
         image_urls: list[str] | None = None,
         reply_to: str | None = None,
         sticker_paths: list[str] | None = None,
-    ) -> None:
+    ) -> SendResult:
+        self._pending_result = SendResult("rejected", detail="发送准备未完成，没有提交至平台")
         text = truncate_text(text or "", self.max_text_len)
         urls = [u for u in (image_urls or []) if u][:ONEBOT_MAX_IMAGES]
         stickers = [p for p in (sticker_paths or []) if p]
+        from .. import runtime, stickers_utils
+        from ..vision_utils import _download_image
+        import base64
+        safe_images, visible_urls = [], []
+        media_failed = False
+        for url in urls:
+            downloaded = await runtime.run_blocking(_download_image, url, 8 * 1024 * 1024)
+            if downloaded is None:
+                media_failed = True
+                continue
+            safe_images.append("base64://" + base64.b64encode(downloaded[0]).decode("ascii"))
+            visible_urls.append(url)
+        stickers = [resolved for p in stickers if (resolved := stickers_utils.resolve(p))]
+        urls = visible_urls
         if not text and not urls and not stickers:
-            return
+            return SendResult("dropped", detail="无可发送内容")
 
         # 用段数组发送：引用段必须排在最前（放后面引用不生效），图段其次，文字最后。
         # 表情包直接给本地绝对路径：协议端与我们同机，省掉一次转存（见 src/stickers_utils.py）。
         segments: list[dict] = []
         if reply_to:
             segments.append({"type": "reply", "data": {"id": str(reply_to)}})
-        segments += [{"type": "image", "data": {"file": url}} for url in urls]
+        segments += [{"type": "image", "data": {"file": encoded}} for encoded in safe_images]
         segments += [{"type": "image", "data": {"file": path}} for path in stickers]
         if text:
             segments.append({"type": "text", "data": {"text": text}})
@@ -210,26 +230,31 @@ class OneBotSender(Sender):
         params["message"] = segments
 
         for attempt in range(1, 4):
+            self._pending_result = SendResult(API_UNKNOWN, text, tuple(urls), tuple(stickers), "已尝试投递，回执未知")
             result, status = await self._client.call_api_ex(action, params)
             if result is not None:
                 if urls:
                     print(f"[🖼️ 图片] 已发送 {len(urls)} 张")
                 if stickers:
                     print(f"[😀 表情包] 已发送 {len(stickers)} 张：{[Path(p).name for p in stickers]}")
-                return
-            if status is API_UNKNOWN:
+                for path in stickers:
+                    stickers_utils.mark_used(path)
+                return SendResult("partial" if media_failed else API_OK, text, tuple(urls), tuple(stickers), "部分图片下载失败" if media_failed else "")
+            if status == API_UNKNOWN:
                 # 超时 / 回执超时：消息很可能已经进群了，再发一次就是刷屏
                 print("[⚠️ 发送结果未知] 消息可能已送达，不再重试以免群里出现重复")
-                return
-            if status is not API_OFFLINE:
+                return SendResult(API_UNKNOWN, text, tuple(urls), tuple(stickers))
+            if status != API_OFFLINE:
                 # 明确被拒（参数错、风控）：同一份内容再发还是被拒
                 print("[❌ 发送失败] 协议端拒绝了这条消息，不再重试")
-                return
+                return SendResult(API_REJECTED, detail="协议端拒绝")
             if attempt < 3:
+                self._pending_result = SendResult(API_OFFLINE)
                 wait = attempt * 2
                 print(f"[⚠️ 发送等待重试 {attempt}/3] 等 {wait}s...")
                 await asyncio.sleep(wait)
         print("[❌ 发送最终失败] OneBot 未连接，消息未送达")
+        return SendResult(API_OFFLINE)
 
 
 # ============================================
@@ -256,11 +281,8 @@ class OneBotClient:
         self._echo_seq = 0
         self._self_id = str(ONEBOT_SELF_ID or "")
         self._seen: OrderedDict[int, None] = OrderedDict()
-        # 每个会话一把锁，保证同会话消息串行（会话数天然受群/好友数限制，无需淘汰）
-        self._locks: dict[str, asyncio.Lock] = {}
-        # 某一轮还在思考时新到的消息（每会话只留最新一条作触发）：合并成一次交给 AI
-        self._pending_wake: dict[str, IncomingMessage] = {}
-        self._sem = asyncio.Semaphore(max(1, ONEBOT_MAX_CONCURRENCY))
+        self._queue = ConversationQueue()
+        self._tasks = set()
         # 图片预识别用**独立**额度：一张图最坏要走「下载 + 两次请求」（直传失败再自取），
         # 跟整轮对话抢同一把闸门时，图片一慢，别的会话全在排队干等
         # （日志里实测：图片预识别密集时其他会话的回复明显延后）
@@ -301,42 +323,45 @@ class OneBotClient:
         if ONEBOT_ACCESS_TOKEN:
             headers["Authorization"] = f"Bearer {ONEBOT_ACCESS_TOKEN}"
 
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=15)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.ws_connect(
-                ONEBOT_WS_URL,
-                heartbeat=ONEBOT_HEARTBEAT,
-                receive_timeout=None,
-                max_msg_size=0,
-            ) as ws:
-                self._ws = ws
-                print(f"[🔌 OneBot] 已连接 {ONEBOT_WS_URL}")
-                self._note_up()
-                # 看门狗是连接级的：断开/重连时随这条连接一起结束
-                watchdog = asyncio.create_task(self._watchdog(ws))
-                try:
-                    async for raw in ws:
-                        if raw.type == aiohttp.WSMsgType.TEXT:
-                            self._on_text(raw.data)
-                        elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                            break
-                finally:
-                    # 看门狗只是旁观者：它自己的异常不能影响连接，更不能盖掉这里的
-                    # 取消（否则 CancelledError 被替换成别的异常，通道就退不出去了）
-                    watchdog.cancel()
+        try:
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=15)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.ws_connect(
+                    ONEBOT_WS_URL,
+                    heartbeat=ONEBOT_HEARTBEAT,
+                    receive_timeout=None,
+                    max_msg_size=4 * 1024 * 1024,
+                ) as ws:
+                    self._ws = ws
+                    self._probe_online = True
+                    print(f"[🔌 OneBot] 已连接 {ONEBOT_WS_URL}")
+                    self._note_up()
+                    # 看门狗是连接级的：断开/重连时随这条连接一起结束
+                    watchdog = asyncio.create_task(self._watchdog(ws))
                     try:
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await watchdog
-                    except Exception as e:
-                        print(f"[🩺 OneBot] 看门狗异常退出：{type(e).__name__}: {e}")
-                self._ws = None
-                print("[🔌 OneBot] 连接已断开")
+                        async for raw in ws:
+                            if raw.type == aiohttp.WSMsgType.TEXT:
+                                self._on_text(raw.data)
+                            elif raw.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                    finally:
+                        # 看门狗只是旁观者：它自己的异常不能影响连接，更不能盖掉这里的
+                        # 取消（否则 CancelledError 被替换成别的异常，通道就退不出去了）
+                        watchdog.cancel()
+                        try:
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await watchdog
+                        except Exception as e:
+                            print(f"[🩺 OneBot] 看门狗异常退出：{type(e).__name__}: {e}")
+                    self._ws = None
+                    print("[🔌 OneBot] 连接已断开")
 
-        # 连接结束：清理所有未完成的 API 请求
-        for future in self._pending.values():
-            if not future.done():
-                future.set_exception(ConnectionError("OneBot 连接已断开"))
-        self._pending.clear()
+        finally:
+            self._ws = None
+            for future in list(self._pending.values()):
+                if not future.done():
+                    future.set_exception(ConnectionError("OneBot 连接已断开"))
+            self._pending.clear()
 
     # ------------------------------------------------------------------
     # 健康自检（看门狗）
@@ -395,11 +420,7 @@ class OneBotClient:
             # get_login_info 是 OneBot v11 必备接口，用它区分这两种情况。
             if not await self._alive():
                 return None, False
-            self._probe_online = False
-            print(
-                "[🩺 OneBot] 协议端不支持 get_status，已退化为仅检测连接存活"
-                "（无法自动发现 QQ 掉线）"
-            )
+            print("[🩺 OneBot] 本次 get_status 无结果，下次继续探测")
             return None, True
         return None, await self._alive()
 
@@ -513,7 +534,12 @@ class OneBotClient:
 
         post_type = payload.get("post_type")
         if post_type == "message":
-            asyncio.get_running_loop().create_task(self._safe_process(payload))
+            if len(self._tasks) >= 256:
+                print(f"[入站过载] 拒绝消息 id={payload.get('message_id')}，最多 256 个处理任务")
+                return
+            task = asyncio.create_task(self._safe_process(payload))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         elif post_type == "meta_event":
             self._learn_self_id(payload.get("self_id"))
 
@@ -551,15 +577,6 @@ class OneBotClient:
         text, images, at_bot, reply_id = extract_message(event.get("message"), self._self_id)
         text = text.strip()
 
-        quote: QuoteInfo | None = None
-        reply_ctx = ""
-        if reply_id:
-            quote, quoted_images = await self._quote_info(reply_id)
-            images = images + quoted_images
-            if quote and not text:
-                # 只引用不说话：把引用原文当作本轮提问
-                reply_ctx = quote.text
-
         raw_gid = event.get("group_id")
         if is_group:
             conv_id = f"onebot_group_{raw_gid}"
@@ -575,71 +592,64 @@ class OneBotClient:
             user_name=user_name,
             text=text,
             image_urls=images[:ONEBOT_MAX_IMAGES],
-            reply_ctx=reply_ctx,
+            reply_ctx="",
             message_id=str(event.get("message_id") or ""),
-            quote=quote,
+            quote=None,
             is_group=is_group,
             is_at_bot=at_bot,
-            raw={"group_id": raw_gid, "user_id": raw_uid, "message_id": event.get("message_id")},
+            raw={"group_id": raw_gid, "user_id": raw_uid, "message_id": event.get("message_id"), "reply_id": reply_id},
         )
 
-        # 未 @ 的群消息：先识别图片再判定，这样图片内容能随缓冲进入上下文。
-        # 预识别的描述会被 core 复用，不会重复调用 VLM；失败则保持未识别状态，
-        # 真要回复时再由 core 走完整识别（带用户提问，质量更好）。
-        if trigger.needs_image_recognition(incoming):
-            # 用图片专用额度，不占对话闸门：识别慢也不挡别的会话说话
-            async with self._img_sem:
-                incoming.image_descs = await describe_for_context(
-                    incoming.conv_id, incoming.image_urls
-                )
-
-        result = trigger.decide(incoming)
-
-        if result.decision is Decision.IGNORE:
-            self._log_ignore(conv_id, result.reason)
-            return
-
-        # 普通群聊：把 reply / skip 工具交给 AI，由它自己决定这轮开不开口。
-        # （私聊、跑团模式不注入这两个工具，行为与从前完全一致）
-        if is_group and not trigger.is_dm_mode(conv_id):
-            incoming.ai_decides_reply = True
-            incoming.is_interjection = not at_bot
-            incoming.extra_ctx = result.context
-            print(f"[🔔 唤醒] 会话={conv_id} 原因={result.reason}")
-
         sender = OneBotSender(self, is_group, raw_gid, raw_uid)
-        lock = self._locks.setdefault(conv_id, asyncio.Lock())
+        try:
+            await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch)
+        except asyncio.QueueFull as exc:
+            print(f"[入站过载] {exc}")
+            if incoming.is_direct_address:
+                await sender.send("当前排队消息较多，请稍后再试。")
 
-        # 上一轮还在思考：不排队、也不另起一次调用——否则一条消息一次调用会排长队，
-        # 而且每一轮看到的上下文都不一样（A 的话还没回完，B、C 的话各自成局）。
-        # 这里只记下「又有新消息了」，等这轮结束把期间攒下的一段合成一次交给 AI，
-        # 它就能同时看到 A、B、C 说了什么，再决定要回谁、回什么。
-        if lock.locked():
-            self._pending_wake[conv_id] = incoming
-            print(f"[⏳ 合并] 会话={conv_id} 上一轮仍在思考，本条并入下一轮")
+    async def _prepare_and_dispatch(self, item):
+        incoming, sender = item
+        reply_id = incoming.raw.get("reply_id")
+        if reply_id and not incoming.text.startswith("/"):
+            quote, images = await self._quote_info(reply_id)
+            incoming.quote = quote
+            incoming.image_urls = (incoming.image_urls + images)[:ONEBOT_MAX_IMAGES]
+            if quote and not incoming.text:
+                incoming.reply_ctx = quote.text
+        if trigger.needs_image_recognition(incoming):
+            async with self._img_sem:
+                try:
+                    incoming.image_descs = await asyncio.wait_for(describe_for_context(incoming.conv_id, incoming.image_urls), 30)
+                except asyncio.TimeoutError:
+                    from ..vision_utils import IMAGE_UNAVAILABLE
+                    incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
+        elif incoming.is_group and not incoming.is_at_bot and incoming.image_urls:
+            from ..vision_utils import IMAGE_UNAVAILABLE
+            incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
+        result = trigger.decide(incoming)
+        if result.decision is Decision.IGNORE:
+            self._log_ignore(incoming.conv_id, result.reason)
             return
-
-        async with lock:
-            while incoming is not None:
-                # 记下本轮"看到的是哪些消息"：回复后只清理这之前的，期间新到的留给下一轮
-                incoming.wake_started_at = time.monotonic()
-                await self._dispatch(incoming, sender)
-                incoming = self._pending_wake.pop(conv_id, None)
-                if incoming is None:
-                    break
-                if incoming.is_group and not trigger.is_dm_mode(conv_id):
-                    # 合并轮：上下文重取（此刻缓冲里就是思考期间攒下的那些）
-                    incoming.extra_ctx = trigger.buffer.peek(conv_id)
-                sender = OneBotSender(self, is_group, raw_gid, raw_uid)
-                print(f"[🔁 补一轮] 会话={conv_id} 原因=上一轮思考期间有新消息")
+        if incoming.is_group and not trigger.is_dm_mode(incoming.conv_id) and not incoming.text.startswith("/"):
+            incoming.ai_decides_reply = True
+            incoming.is_interjection = not incoming.is_at_bot
+            incoming.extra_ctx = result.context
+            incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
+        incoming.wake_started_at = time.monotonic()
+        await self._dispatch(incoming, sender)
 
     async def _dispatch(self, incoming: IncomingMessage, sender: Sender) -> None:
-        """
-        跑完一轮。同会话串行由调用方持有的会话锁保证——这里不能再加锁
-        （asyncio.Lock 不可重入），此处只负责全局并发上限。
-        """
-        async with self._sem:
-            await handle_message(incoming, sender)
+        await handle_message(incoming, sender)
+
+    async def close(self):
+        await self._queue.close()
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._ws is not None:
+            await self._ws.close()
 
     # ------------------------------------------------------------------
     # 辅助
@@ -729,14 +739,22 @@ class OneBotClient:
             await ws.send_str(
                 json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
             )
+        except asyncio.CancelledError:
+            self._pending.pop(echo, None)
+            future.cancel()
+            raise
         except Exception as e:
-            # 请求根本没发出去：确定没送达，重试安全
+            # A socket error can occur after the frame was written; do not retry.
             self._pending.pop(echo, None)
             print(f"[⚠️ OneBot API 发送失败] {action}: {type(e).__name__}: {e}")
-            return None, API_OFFLINE
+            return None, API_UNKNOWN
 
         try:
             resp = await asyncio.wait_for(future, timeout=timeout or ONEBOT_API_TIMEOUT)
+        except asyncio.CancelledError:
+            self._pending.pop(echo, None)
+            future.cancel()
+            raise
         except asyncio.TimeoutError:
             self._pending.pop(echo, None)
             print(f"[⚠️ OneBot API 超时] {action}（结果未知，可能已经生效）")
@@ -759,4 +777,8 @@ class OneBotClient:
 
 async def run_onebot() -> None:
     """启动 OneBot 通道；内部是无限重连循环，不会自行返回"""
-    await OneBotClient().run()
+    client = OneBotClient()
+    try:
+        await client.run()
+    finally:
+        await client.close()

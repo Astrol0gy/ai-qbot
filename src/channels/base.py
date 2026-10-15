@@ -6,6 +6,7 @@
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import time
 
 from ..vision_utils import IMAGE_UNAVAILABLE, strip_tag_line
 
@@ -54,6 +55,8 @@ class IncomingMessage:
     # 本轮唤醒开始时的时间戳（monotonic）：AI 回完只清理此刻之前就在上下文里的消息，
     # 它思考期间新到的消息要留给下一轮，不能一起丢掉
     wake_started_at: float = 0.0
+    received_at: float = field(default_factory=time.monotonic)
+    context_entries: tuple = ()
 
     is_group: bool = True          # 群聊 / 私聊
     is_at_bot: bool = False        # 是否 @ 了机器人
@@ -87,14 +90,47 @@ class IncomingMessage:
             # 识别不出来的图留中性占位（别写「识别失败」：主模型会拿它去琢磨，
             # 白烧思考预算，日志里实测把一轮拖过 60 秒超时）
             parts.append(f"[图片{i + 1}：{brief or IMAGE_UNAVAILABLE}]")
+        if self.image_urls and self.image_descs is None:
+            parts.append(f"[{len(self.image_urls)}张图片：{IMAGE_UNAVAILABLE}]")
         return " ".join(p for p in parts if p)
 
 
+#: 截断提示语。长度由它自己算，不靠调用方记住"30 够不够"
+TRUNCATE_SUFFIX = "\n\n……(内容过长，已截断)"
+
+
 def truncate_text(text: str, max_len: int = 2000) -> str:
-    """截断过长的回复文本"""
-    if len(text) > max_len:
-        return text[: max_len - 30] + "\n\n……(内容过长，已截断)"
-    return text
+    """
+    截断过长的回复文本，保证结果**不超过** max_len。
+
+    正文长度按 max_len 减去提示语算出来 —— 过去的写法是 text[: max_len - 30]，
+    只要 max_len 小于提示语长度（比如某个通道把上限设得很小），切片下标就成了负数，
+    于是变成"从尾巴上砍掉几个字"，返回的内容比原文还长、远超上限。
+    """
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len <= len(TRUNCATE_SUFFIX):
+        return text[:max_len]  # 上限小到放不下提示语：先保证不超长
+    return text[: max_len - len(TRUNCATE_SUFFIX)] + TRUNCATE_SUFFIX
+
+
+@dataclass(frozen=True)
+class SendResult:
+    status: str  # ok / unknown / rejected / offline / dropped / partial
+    text: str = ""
+    images: tuple[str, ...] = ()
+    stickers: tuple[str, ...] = ()
+    detail: str = ""
+
+    @property
+    def delivered(self):
+        return self.status == "ok"
+
+    def history_text(self):
+        content = self.text + "".join(f"[img]{x}[/img]" for x in (*self.images, *self.stickers))
+        return (f"【投递{self.status}：{self.detail}】" if self.status != "ok" else "") + content
 
 
 class Sender(ABC):
@@ -114,7 +150,7 @@ class Sender(ABC):
         image_urls: list[str] | None = None,
         reply_to: str | None = None,
         sticker_paths: list[str] | None = None,
-    ) -> None:
+    ) -> SendResult:
         """发送一条回复（先发图片，再发文字）。
 
         ``reply_to`` 是要引用的消息 id（AI 用 reply 工具的 reply_to 指定）。

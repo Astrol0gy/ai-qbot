@@ -27,6 +27,22 @@ from .commands import HELP_TEXT, handle_dm_cmd, handle_profile_cmd
 
 IMG_MARKER = re.compile(r"\[img\](.*?)\[/img\]")
 
+
+def _drain_abandoned_task(task: asyncio.Task) -> None:
+    """
+    取走「超时被放弃的那一轮」的最终结果。
+
+    cancel() 只是**请求**它停下：它真正结束前，局部变量已经随函数返回消失，也没人读过它的
+    结果 —— 于是任务被 GC 掉是 "Task was destroyed but it is pending"，抛了异常则是
+    "exception was never retrieved"，两种都只在日志里留一句看不出前因后果的警告。
+    这个回调挂在任务自己身上，结束时读一次，把话说完。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"[⚠️ 被放弃的一轮思考最后还是抛了异常] {type(exc).__name__}: {exc}")
+
 # 主动接话时，模型可用该标记表示「这次不插嘴」
 SKIP_TOKENS = {"[skip]", "__skip__", "[跳过]"}
 
@@ -71,21 +87,6 @@ def _split_image_payloads(payloads: list[str]) -> tuple[list[str], list[str]]:
     return urls, local
 
 
-async def _send_reply(sender: Sender, text: str, reply_to: str | None = None) -> None:
-    """发出一条回复：先摘出 [img]（网络图 / 本地表情包），再按「先图后文」发出（可带引用）"""
-    image_urls, sticker_paths = _split_image_payloads(IMG_MARKER.findall(text))
-    clean = IMG_MARKER.sub("", text).strip()
-    if image_urls or sticker_paths:
-        await sender.send(
-            clean or ("为你找到以下图片：" if image_urls else ""),
-            image_urls=image_urls or None,
-            reply_to=reply_to,
-            sticker_paths=sticker_paths or None,
-        )
-    elif clean:
-        await sender.send(clean, reply_to=reply_to)
-
-
 def _strip_speaker_tag(text: str, speaker: str) -> str:
     """
     去掉模型照抄上下文格式、在回复开头补的「【说话者】」标签。
@@ -121,7 +122,7 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
         descs = []
         for i, url in enumerate(msg.image_urls):
             print(f"[VLM] 图片 {i + 1}/{total}: {url[:80]}...")
-            desc = await asyncio.to_thread(describe_image, url, question if i == 0 else "")
+            desc = await runtime.run_blocking(describe_image, url, question if i == 0 else "")
             descs.append(desc)
 
     # 识别不出来的图留中性占位（见 IMAGE_UNAVAILABLE）：主模型要知道「用户确实发过图」，
@@ -133,219 +134,202 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
     )
 
 
+# Each event loop has one shared model gate for both channels.
+import weakref
+from .. import runtime
+from .. import deepseek_client as dc
+from ..config import ONEBOT_MAX_CONCURRENCY
+from .base import SendResult, truncate_text
+
+_MODEL_GATES = weakref.WeakKeyDictionary()
+_ABANDONED = set()
+
+
+def _abandon(task):
+    _ABANDONED.add(task)
+    def done(finished):
+        _ABANDONED.discard(finished)
+        _drain_abandoned_task(finished)
+    task.add_done_callback(done)
+    task.cancel()
+
+
+async def _deliver(sender, text, reply_to, budget):
+    urls, stickers = _split_image_payloads(IMG_MARKER.findall(text))
+    stickers = stickers[:budget[0]]
+    budget[0] -= len(stickers)
+    clean = _strip_speaker_tag(IMG_MARKER.sub("", text).strip(), budget[1])
+    if not clean and urls:
+        clean = "为你找到以下图片："
+    if not clean and not urls and not stickers:
+        return SendResult("dropped", detail="没有可发送内容")
+    try:
+        kwargs = {}
+        if urls:
+            kwargs["image_urls"] = urls
+        if stickers:
+            kwargs["sticker_paths"] = stickers
+        if reply_to:
+            kwargs["reply_to"] = reply_to
+        receipt = await asyncio.wait_for(sender.send(clean, **kwargs), timeout=45)
+    except asyncio.TimeoutError:
+        if hasattr(sender, "interrupted_result"):
+            return sender.interrupted_result()
+        return SendResult("unknown", clean, tuple(urls), tuple(stickers), "发送回执超时，不自动重试")
+    except Exception as exc:
+        if hasattr(sender, "interrupted_result"):
+            return sender.interrupted_result()
+        return SendResult("unknown", clean, tuple(urls), tuple(stickers), str(exc)[:120])
+    # Compatibility for trusted in-process senders. Production adapters always
+    # return SendResult; an adapter returning None is not an implicit success.
+    if receipt is None and not isinstance(sender, Sender):
+        receipt = SendResult("ok", truncate_text(clean, getattr(sender, "max_text_len", 4000)), tuple(urls), tuple(stickers))
+    return receipt if isinstance(receipt, SendResult) else SendResult("unknown", detail="发送器没有返回回执")
+
+
 async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
-    """处理一条已归一化的入站消息（所有通道共用）"""
+    """Local commands precede enrichment; only model work occupies the model gate."""
     user_msg = (msg.text or "").strip()
-
-    # ---------- 引用消息：正文为空时，用引用内容作为提问 ----------
-    if msg.reply_ctx and not user_msg:
-        user_msg = msg.reply_ctx
-
-    # ---------- 图片识别（VLM 预处理）----------
-    media_text = await _image_text(msg, user_msg) if msg.image_urls else ""
-    if media_text is None:
-        print("[图片消息] 视觉未配置，跳过")
-        if not msg.is_interjection:  # 接话是自发的，不该为此在群里报错
-            await sender.send(
-                "抱歉，视觉识别功能未配置，无法识别图片内容。\n"
-                "请在 .env 中填写 DEEPSEEK_API_KEY 后重试。"
-            )
-        return
-
-    # ---------- 群聊唤醒：把片段包成一次调用，开不开口交给 AI 自己决定 ----------
-    wake_context = ""
-    if msg.ai_decides_reply:
-        # 预识别过的描述已随消息进入 extra_ctx，不重复拼接；
-        # 其余情况（如引用的图片）补进上下文 —— 不能覆盖唤醒指令本身
-        extra = "" if msg.image_descs is not None else media_text
-        wake_context = "\n\n".join(p for p in (msg.extra_ctx, extra) if p) or user_msg
-        user_msg = WAKE_PROMPT.format(context=wake_context)
-    elif media_text:
-        if user_msg:
-            user_msg = (
-                f"用户发送了{len(msg.image_urls)}张图片：\n{media_text}\n\n"
-                f"用户的问题：{user_msg}"
-            )
-        else:
-            user_msg = (
-                f"用户发送了{len(msg.image_urls)}张图片，请根据以下描述回答：\n{media_text}"
-            )
-
-    tag = "OneBot" if msg.channel == "onebot" else "官方"
-    kind = "群唤醒" if msg.ai_decides_reply else "消息"
-    brief = user_msg[:120] + ("..." if len(user_msg) > 120 else "")
-    print(f"[📩 {tag} {kind}] 会话={msg.conv_id} 用户={msg.user_id}({msg.user_name})：{brief}")
-
-    # ---------- 空消息 ----------
-    if not user_msg:
-        if msg.is_interjection:
-            return
-        await sender.send("你好呀～请问有什么可以帮你的？\n发送 /help 查看我的全部功能～")
-        return
-
-    # ---------- 指令分支（只有直呼机器人才处理指令）----------
     if msg.is_direct_address:
-        cmd = user_msg.strip()
-
-        if cmd == "/help":
+        if user_msg == "/help":
             await sender.send(HELP_TEXT)
             return
-
-        if cmd == "/reset":
+        if user_msg == "/reset":
             clear_history(msg.conv_id)
             await sender.send("记忆已清除，让我们重新开始吧！")
             return
-
-        # --- 跑团（DM）指令 ---
-        dm_result = handle_dm_cmd(cmd, msg.conv_id, msg.user_id, msg.user_name)
-        if dm_result is not None:
-            await sender.send(dm_result)
+        result = handle_dm_cmd(user_msg, msg.conv_id, msg.user_id, msg.user_name)
+        if result is None:
+            result = handle_profile_cmd(user_msg, msg.conv_id, msg.user_id)
+        if result is not None:
+            await sender.send(result)
             return
-
-        # --- 用户画像指令 ---
-        profile_result = handle_profile_cmd(cmd, msg.conv_id, msg.user_id)
-        if profile_result is not None:
-            await sender.send(profile_result)
-            return
-
-        # --- /look：交给 LLM 总结提炼后自行调用工具存储 ---
-        if cmd.startswith("/look "):
-            raw_info = cmd[len("/look"):].strip()
+        if user_msg == "/look" or user_msg.startswith("/look "):
+            raw_info = user_msg[5:].strip()
             if not raw_info:
                 await sender.send("请提供要记住的信息，例如：/look 我喜欢简短的回答")
                 return
-            user_msg = (
-                f"用户要求记住关于ta的使用偏好或设定：「{raw_info}」\n\n"
-                "请按以下步骤处理：\n"
-                "1. 理解用户意图：是简单的风格偏好，还是引用了某个角色/人名/风格？\n"
-                "2. 如果是角色引用（如'像哆啦A梦一样'、'用鲁迅的风格'），且你对具体特点不够了解，"
-                "请先用 web_search 搜索相关信息，总结关键特征\n"
-                "3. 将信息提炼成简洁的要点后，使用 manage_user_profile 工具以 action=remember "
-                "记录下来（记录的是当前说话者自己的偏好，与其他用户独立）\n"
-                "4. 最后简短告知用户你已记住什么"
-            )
-
-    # ---------- 交给 DeepSeek ----------
-    # 服务端熔断中：不发请求、直接放弃本轮。与其让每一轮都硬等满 60 秒才放弃（用户看到的
-    # 是 bot 哑了两分钟才回话），不如立刻结束 —— 不回话也比晚回话强。
-    cooldown = api_cooldown_left()
-    if cooldown > 0:
-        print(f"[⏱️ 服务熔断中] DeepSeek 冷却还剩 {cooldown:.0f}s，放弃本轮：不发消息、退出互动")
-        if msg.ai_decides_reply:
-            from ..trigger import trigger as _trigger
-
-            _trigger.leave_session(msg.conv_id)
-        if msg.is_direct_address:
-            await sender.send("我这会儿连不上模型服务，过一会儿再叫我试试～")
-        return
-
-    # 普通群聊唤醒：给 AI reply / skip 两个工具，由它决定这轮开不开口、回给谁
-    outbox = None
-    trigger = None
-    if msg.ai_decides_reply:
-        # 局部导入：通道层不在模块级依赖工具层（触发层同理）
-        from ..tools.chat_provider import ReplyOutbox
-        from ..trigger import trigger as _trigger
-
-        trigger = _trigger
-        outbox = ReplyOutbox(known_ids=trigger.buffer.ids(msg.conv_id))
-
-    # 单轮思考的总时限：不设上限的话，SDK 默认 read=600s 还带重试，一轮能拖上几十分钟，
-    # 这期间整条群消息处理链（以及这条会话的锁）都堵着
-    thinking = asyncio.create_task(
-        chat(
-            msg.conv_id,
-            msg.user_id,
-            user_msg,
-            msg.user_name,
-            outbox=outbox,
-            history_text=wake_context or None,
-        )
-    )
-    done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_ROUND_TIMEOUT_SEC)
-    if not done:
-        # 到点就彻底放弃这一轮：不等它、也不看它后来返回了什么 ——
-        # 就算它在第 61 秒答完了，这句话也不该再冒进群里（已经过时了）。
-        # 不用 asyncio.wait_for：它取消之后会等对方真正结束，一个"吞掉取消"的请求照样
-        # 能把我们拖住；这里 cancel 完直接走人。
-        # 收尾按「AI 主动结束这轮互动」办：退出互动窗口、回到空闲，要再开口得等下一次唤醒。
-        # 片段留在缓冲里（和 skip 一致），下一条消息被叫醒时能看到完整的一段。
-        thinking.cancel()
-        note_api_failure(f"单轮思考超过 {DEEPSEEK_ROUND_TIMEOUT_SEC:.0f}s")
-        print(f"[⏱️ 思考超时 {DEEPSEEK_ROUND_TIMEOUT_SEC:.0f}s] 放弃本轮：不发消息、退出互动")
-        if trigger is not None:
-            trigger.leave_session(msg.conv_id)
-        return
-
+            user_msg = f"用户要求记住偏好：「{raw_info}」。加载用户偏好技能，提炼后记录当前用户的偏好并简短确认。"
+            msg.ai_decides_reply = False
+    user_msg = user_msg or msg.reply_ctx
     try:
-        reply = thinking.result()
-    except Exception as e:
-        print(f"[❌ DeepSeek 错误] {type(e).__name__}: {str(e)[:300]}")
-        note_api_failure(str(e)[:120])
-        # 失败要快速降级，别把「我连不上」这种话塞给正在等回话的人：
-        # 唤醒 / 接话本来就是 bot 自发的开口，这轮直接闭嘴（和 skip 一样留片段，等下次唤醒）；
-        # 只有直呼机器人（用户在等一个答复）才给一句短提示。
-        if msg.ai_decides_reply or msg.is_interjection:
-            if trigger is not None:
+        media = await asyncio.wait_for(_image_text(msg, user_msg), timeout=30) if msg.image_urls else ""
+    except asyncio.TimeoutError:
+        media = IMAGE_UNAVAILABLE
+    if media is None:
+        media = IMAGE_UNAVAILABLE
+    wake_context = ""
+    entries = ()
+    trigger = None
+    outbox = None
+    if msg.ai_decides_reply:
+        from ..trigger import trigger
+        from ..tools.chat_provider import ReplyOutbox
+        entries = msg.context_entries or trigger.buffer.snapshot(msg.conv_id)
+        wake_context = "\n".join(entry.line() for entry in entries) or msg.extra_ctx or user_msg
+        if media and msg.image_descs is None:
+            wake_context += "\n" + media
+        user_msg = WAKE_PROMPT.format(context=wake_context)
+        outbox = ReplyOutbox(known_ids={entry.message_id for entry in entries if entry.message_id})
+    elif media:
+        user_msg = f"{user_msg}\n图片描述：{media}"
+    if not user_msg:
+        if not msg.is_interjection:
+            await sender.send("你好呀～发送 /help 查看功能。")
+        return
+    if api_cooldown_left() > 0 or len(_ABANDONED) >= 16:
+        if trigger:
+            trigger.leave_session(msg.conv_id)
+        if msg.is_direct_address:
+            await sender.send("我暂时连不上模型服务，过一会儿再试～")
+        return
+    loop = asyncio.get_running_loop()
+    gate = _MODEL_GATES.setdefault(loop, asyncio.Semaphore(ONEBOT_MAX_CONCURRENCY))
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout=10)
+    except asyncio.TimeoutError:
+        if msg.is_direct_address:
+            await sender.send("当前请求较多，请稍后再试。")
+        return
+    if not dc.acquire_service_probe():
+        gate.release()
+        return
+    lease = runtime.RoundLease(msg.conv_id, DEEPSEEK_ROUND_TIMEOUT_SEC)
+    lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
+    if msg.message_id:
+        lease.actors.setdefault(msg.message_id, (msg.user_id, msg.user_name))
+    try:
+        with runtime.use(lease):
+            thinking = asyncio.create_task(chat(msg.conv_id, msg.user_id, user_msg,
+                msg.user_name, outbox=outbox, history_text=wake_context or None))
+        done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_ROUND_TIMEOUT_SEC)
+        if not done:
+            lease.revoke()
+            _abandon(thinking)
+            note_api_failure("单轮模型处理超时")
+            if trigger:
                 trigger.leave_session(msg.conv_id)
             return
-        reply = "抱歉，我暂时连不上模型服务，稍后再叫我试试～"
-    else:
+        reply = thinking.result()
+        lease.check()
+        # Durable state is committed before announcing success to the user.
+        with runtime.use(lease):
+            lease.commit()
         note_api_success()
-
-    # ---------- AI 用它自己调的工具表了态 ----------
-    if outbox is not None:
-        if outbox.has_items:
-            for item in outbox.items:
-                await _send_reply(sender, _strip_speaker_tag(item.text, msg.user_name), item.reply_to)
-            # 已经开口了：这一段到此为止。只清掉本轮开始时就已经看到的消息，
-            # 思考期间新到的留给紧接着的下一轮一起处理
-            trigger.buffer.clear(msg.conv_id, before=msg.wake_started_at or None)
-            # 回复完成，从现在起重新计时（超时没人说话就退出互动）
-            trigger.mark_answered(msg.conv_id)
-            return
-        if outbox.skipped:
-            print("[🤐 本轮不开口] AI 选择 skip（片段留在缓冲里，等下条消息继续）")
-            trigger.mark_answered(msg.conv_id)
-            return
-        # 没调工具：退回成一条普通文本（兼容模型直接说话的情况）
-
-    # 解析 [img]：网址是网络图，库里的本地路径是表情包（send_sticker 工具给的）
-    image_urls, sticker_paths = _split_image_payloads(IMG_MARKER.findall(reply))
-    clean_reply = IMG_MARKER.sub("", reply).strip()
-    # 别让它顶着别人的名字开口（模型会照抄上下文的【说话者】格式）
-    clean_reply = _strip_speaker_tag(clean_reply, msg.user_name)
-
-    # 模型用文字标记表示放弃（旧路径兼容：@ / 私聊 / 跑团行为不变）
-    if (
-        (msg.ai_decides_reply or msg.is_interjection)
-        and clean_reply.lower() in SKIP_TOKENS
-        and not image_urls
-        and not sticker_paths
-    ):
-        print("[🤐 本轮不开口] 模型回复了 skip 标记")
-        if trigger is not None:
-            trigger.mark_answered(msg.conv_id)
+    except asyncio.CancelledError:
+        lease.revoke()
+        if "thinking" in locals() and not thinking.done():
+            _abandon(thinking)
+        raise
+    except Exception as exc:
+        lease.revoke()
+        print(f"[本轮失败] {type(exc).__name__}: {exc}")
+        # Parameter/programming/persistence errors do not indicate model outage.
+        if dc.is_service_failure(exc):
+            note_api_failure(str(exc)[:120])
+        if trigger:
+            trigger.leave_session(msg.conv_id)
+        if msg.is_direct_address:
+            await sender.send("我暂时连不上模型服务，请稍后重试。" if dc.is_service_failure(exc) else "本次处理未完成，请稍后重试。")
         return
-
-    # 先发图片，再发文字（只发表情包、不配文字也是允许的：纯表情包回复）
-    spoke = False
-    if image_urls or sticker_paths:
-        await sender.send(
-            clean_reply or ("为你找到以下图片：" if image_urls else ""),
-            image_urls=image_urls or None,
-            sticker_paths=sticker_paths or None,
-        )
-        spoke = True
-    elif clean_reply:
-        await sender.send(clean_reply)
-        spoke = True
-
-    # 本轮结束，重新计时
-    if trigger is not None:
-        if outbox is not None and spoke:
-            # 模型没用工具、直接说了话：这同样是一次回答，收尾必须和上面的工具分支一致。
-            # 少了这一句，刚回过的消息还留在缓冲里，下一轮会被当成「还没回过」再答一遍
-            # （实测：张三的 @ 被回了两遍，第二遍还引用了同一条消息）
-            trigger.buffer.clear(msg.conv_id, before=msg.wake_started_at or None)
-        trigger.mark_answered(msg.conv_id)
+    finally:
+        gate.release()
+        dc.release_service_probe()
+    try:
+        if outbox is not None and outbox.skipped and not outbox.has_items:
+            if trigger:
+                trigger.mark_answered(msg.conv_id)
+            return
+        items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]
+        if len(items) == 1 and items[0][0].strip().lower() in SKIP_TOKENS and msg.ai_decides_reply:
+            return
+        receipts = []
+        budget = [STICKER_MAX_PER_REPLY, msg.user_name]
+        for text, reply_to in items:
+            budget[1] = lease.actors.get(reply_to, (msg.user_id, msg.user_name))[1]
+            receipt = await _deliver(sender, text, reply_to, budget)
+            receipts.append(receipt)
+            if receipt.status not in ("ok", "dropped"):
+                break  # No duplicate retries after ambiguous or partial delivery.
+        recorded = [r.history_text() for r in receipts if r.status in ("ok", "partial", "unknown")]
+        if recorded:
+            dc.commit_delivery(lease, "\n".join(recorded))
+        if trigger:
+            complete = len(receipts) == len(items) and all(r.delivered for r in receipts)
+            if complete:
+                trigger.buffer.consume(msg.conv_id, entries)
+            else:
+                covered = set()
+                for (_, target), receipt in zip(items, receipts):
+                    if receipt.status in ("ok", "partial", "unknown"):
+                        if target:
+                            covered.add(target)
+                        elif receipt.status in ("partial", "unknown"):
+                            covered.update(entry.message_id for entry in entries)
+                trigger.buffer.consume(msg.conv_id, [entry for entry in entries if entry.message_id in covered])
+            if complete:
+                trigger.mark_answered(msg.conv_id)
+            else:
+                trigger.leave_session(msg.conv_id)
+    finally:
+        lease.revoke()

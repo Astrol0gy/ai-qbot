@@ -58,6 +58,7 @@ class BufferEntry:
     """缓冲里的一条群消息：交给 AI 的关系信号全在这里"""
 
     speaker: str = ""
+    user_id: str = ""
     text: str = ""
     message_id: str = ""
     at_bot: bool = False
@@ -72,6 +73,8 @@ class BufferEntry:
             marks.append(self.quote)
         if self.message_id:
             marks.append(f"消息id={self.message_id}")
+        if self.user_id:
+            marks.append(f"用户id={self.user_id}")
         suffix = f"  [{'，'.join(marks)}]" if marks else ""
         return f"【{self.speaker or '某人'}】{self.text}{suffix}"
 
@@ -102,7 +105,7 @@ class MessageBuffer:
         else:
             self._buf.move_to_end(conv_id)
 
-        entry.ts = time.monotonic()
+        entry.ts = entry.ts or time.monotonic()
         entries.append(entry)
         if len(entries) > self._max_per_conv:
             del entries[: len(entries) - self._max_per_conv]
@@ -118,6 +121,17 @@ class MessageBuffer:
     def ids(self, conv_id: str) -> set[str]:
         """缓冲里出现过的消息 id：AI 只允许引用这些，防止它自己编一个 id"""
         return {e.message_id for e in (self._buf.get(conv_id) or []) if e.message_id}
+
+    def snapshot(self, conv_id):
+        return tuple(self._buf.get(conv_id, ()))
+
+    def consume(self, conv_id, entries):
+        identities = {id(entry) for entry in entries}
+        kept = [entry for entry in self._buf.get(conv_id, []) if id(entry) not in identities]
+        if kept:
+            self._buf[conv_id] = kept
+        else:
+            self._buf.pop(conv_id, None)
 
     def clear(self, conv_id: str, before: float | None = None) -> None:
         """
@@ -163,10 +177,12 @@ class TriggerController:
         ctx_text = msg.buffer_text() or msg.reply_ctx
         entry = BufferEntry(
             speaker=msg.user_name,
+            user_id=msg.user_id,
             text=ctx_text,
             message_id=msg.message_id,
             at_bot=msg.is_at_bot,
             quote=msg.quote.describe() if msg.quote else "",
+            ts=msg.received_at,
         )
 
         # 未被 @ 的指令：直接忽略，不执行、不唤醒、不入缓冲
@@ -180,6 +196,9 @@ class TriggerController:
         # 群黑白名单
         if not self._group_allowed(msg.raw.get("group_id")):
             return TriggerResult(Decision.IGNORE, reason="群名单过滤")
+
+        if msg.is_at_bot and text.startswith("/"):
+            return TriggerResult(Decision.WAKE, reason="本地命令")
 
         # 入缓冲：叫醒时它就是要交给 AI 的上下文
         self.buffer.add(msg.conv_id, entry)
@@ -251,6 +270,8 @@ class TriggerController:
             self._active_until = {
                 k: v for k, v in self._active_until.items() if v > current
             }
+            while len(self._active_until) > 1000:
+                self._active_until.pop(next(iter(self._active_until)))
 
     def is_dm_mode(self, conv_id: str) -> bool:
         """该会话当前是不是跑团（DM）模式：跑团不注入 reply/skip，行为与从前完全一致"""
