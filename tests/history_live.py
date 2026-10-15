@@ -172,7 +172,8 @@ async def main() -> None:
     recorder = _Recorder(dc.client)
     dc.client = recorder
     dc.MAX_HISTORY_LENGTH = 20          # 与线上 .env 一致：阈值 40 条、保留最近 4 轮
-    dc.DEEPSEEK_ENABLE_SEARCH = False   # 这轮评的是记忆，把工具关掉，别让模型去搜
+    dc.DEEPSEEK_ENABLE_SEARCH = False
+    dc.get_definitions = lambda whitelist=None: []  # 本测试只评记忆，显式禁用含技能加载在内的全部工具。
     dc._conversations[GROUP].clear()
     dc._conversations[GROUP].extend([dict(m) for m in HISTORY])
 

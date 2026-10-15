@@ -14,6 +14,8 @@ messages，history 原地不动 —— 于是从超阈值那轮起，每一轮�
 import asyncio
 import sys
 import time
+import atexit
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +26,12 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 import src.deepseek_client as dc  # noqa: E402
+
+# chat 会读取画像和跑团状态；离线检查只使用临时目录。
+_data = tempfile.TemporaryDirectory(prefix="qbot_history_check_")
+atexit.register(_data.cleanup)
+dc.user_profile.PROFILES_DIR = str(Path(_data.name) / "profiles")
+dc.campaign_state.CAMPAIGNS_DIR = str(Path(_data.name) / "campaigns")
 
 FAILS: list[str] = []
 
@@ -159,8 +167,8 @@ async def main() -> None:
           len(SUMMARIZER_INPUTS) == calls_before, f"实测 {len(SUMMARIZER_INPUTS)} 次")
     check("冷却期照常回答（退回硬截断，不是不干活）",
           dc._conversations[KEY][-1]["content"] == "收到")
-    check("冷却期不改动历史（下轮还能重试压缩）",
-          HISTORY_LENS[-1] > 14, f"实测 {HISTORY_LENS[-1]}")
+    check("冷却期历史仍受容量上限约束（下轮还能重试压缩）",
+          HISTORY_LENS[-1] == dc.MAX_HISTORY_LENGTH * 2 + 2, f"实测 {HISTORY_LENS[-1]}")
 
     # 冷却结束后能正常再压
     await turn(17)
@@ -184,6 +192,8 @@ async def counterfactual() -> None:
         history[:] = snapshot          # 老实现：历史不动，只影响本次请求
         return out
 
+    old_store = dc._store_history
+    dc._store_history = lambda key, history: dc._conversations.__setitem__(key, history)
     dc._compress_history = old_style
     dc._conversations[KEY].clear()
     SUMMARIZER_INPUTS.clear()
@@ -193,6 +203,7 @@ async def counterfactual() -> None:
             await real_turn(i, lengths)
     finally:
         dc._compress_history = real
+        dc._store_history = old_store
 
     print(f"  老行为 轮次 → 历史条数：{lengths}")
     print(f"  老行为 摘要调用次数：{len(SUMMARIZER_INPUTS)}")

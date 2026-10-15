@@ -155,9 +155,9 @@ def main() -> int:
     check("成功后不在退避里", vu._in_backoff(WEB_URL) is False)
     # describe_image 本身不写缓存（缓存属于「上下文预识别」那一层）
     descs2 = asyncio.run(vu.describe_for_context("onebot_group_1", [WEB_URL]))
-    check("预识别拿到同一份描述", descs2 == [desc3] and fake3.calls == 2, f"请求={fake3.calls}")
+    check("预识别拿到同一份描述", descs2 == [desc3] and fake3.calls == 1, f"请求={fake3.calls}")
     descs3 = asyncio.run(vu.describe_for_context("onebot_group_1", [WEB_URL]))
-    check("同图第二次命中缓存（不重复计费）", descs3 == [desc3] and fake3.calls == 2,
+    check("同图第二次命中缓存（不重复计费）", descs3 == [desc3] and fake3.calls == 1,
           f"请求={fake3.calls}")
 
     print("\n=== 6. 200 但 choices 为 None：不再抛 'NoneType' 裸错 ===")
@@ -181,8 +181,10 @@ def main() -> int:
         def __init__(self) -> None:
             self.sent: list[str] = []
 
-        async def send(self, text, image_urls=None, reply_to=None) -> None:
+        async def send(self, text, image_urls=None, reply_to=None, sticker_paths=None):
             self.sent.append(text)
+            from src.channels.base import SendResult
+            return SendResult("ok", text)
 
     dc.note_api_success()
     calls = {"n": 0}

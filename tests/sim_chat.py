@@ -101,6 +101,7 @@ from src.channels import core                            # noqa: E402
 from src.channels import onebot as ob                    # noqa: E402
 from src.channels.onebot import OneBotClient             # noqa: E402
 from src.tools import execute as execute_tool            # noqa: E402
+from src.tools import ChatContext                        # noqa: E402
 from src.tools.chat_provider import ReplyItem            # noqa: E402
 from src.trigger import trigger                          # noqa: E402
 
@@ -216,6 +217,8 @@ async def _stub_send(self, text, image_urls=None, reply_to=None, sticker_paths=N
     say(f"  {rec['t']:>6}s  {head}{clean}")
     for path in stickers:
         say(f"  {'':>6}   [表情包] {Path(path).name}")
+    from src.channels.base import SendResult
+    return SendResult("ok", clean, tuple(image_urls or ()), tuple(stickers))
 
 
 async def _stub_get_msg(self, action, params, timeout=None):  # noqa: ANN001
@@ -441,15 +444,16 @@ async def scene_5() -> Sim:
             FLIP["no_outbox"] = True
             return ""
         ids = sorted(outbox.known_ids)
+        context = ChatContext(conv_id=conv_id, user_id=user_id, user_name=user_name, outbox=outbox)
         FLIP["r1"] = execute_tool(
             "reply",
             json.dumps({"text": "先回一条：在的", "reply_to": ids[0] if ids else ""}),
-            context=outbox,
+            context=context,
         )
         FLIP["r2"] = execute_tool(
-            "reply", json.dumps({"text": "第二条：刚翻了下记录"}), context=outbox
+            "reply", json.dumps({"text": "第二条：刚翻了下记录"}), context=context
         )
-        FLIP["skip"] = execute_tool("skip", "{}", context=outbox)
+        FLIP["skip"] = execute_tool("skip", "{}", context=context)
         FLIP["items_after_skip"] = len(outbox.items)
         FLIP["skipped_flag"] = outbox.skipped
         return ""
@@ -664,7 +668,12 @@ def main() -> None:
         sys.exit(2)
 
     try:
-        asyncio.run(run(ids))
+        import tempfile
+        from unittest.mock import patch
+        from src import campaign_state, user_profile
+        with tempfile.TemporaryDirectory(prefix="qbot_sim_") as directory:
+            with patch.object(campaign_state, "CAMPAIGNS_DIR", str(Path(directory)/"campaigns")), patch.object(user_profile, "PROFILES_DIR", str(Path(directory)/"profiles")):
+                asyncio.run(run(ids))
     finally:
         LOG.close()
 

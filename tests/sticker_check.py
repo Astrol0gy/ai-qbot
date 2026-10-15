@@ -113,6 +113,7 @@ async def main() -> int:
     from src import vision_utils as vu
     from src.config import STICKER_MAX_PER_REPLY
     from src.channels import core
+    from unittest.mock import patch
     from src.channels import official
     from src.channels.base import IncomingMessage
     from src.channels.onebot import API_OK, OneBotSender
@@ -152,6 +153,14 @@ async def main() -> int:
     # ---------- 3. 采集链路（真下载真落盘） ----------
     print("\n3. 采集链路（真下载）")
     server, url = start_image_server()
+
+    # 测试用的图床跑在本机（127.0.0.1），而 src/net_safety.py 的 SSRF 防护按设计拒掉内网地址。
+    # 这里只为本机地址开一个口子，其余校验照旧（协议、域名解析、重定向逐跳），
+    # 生产代码不做任何放宽 —— 线上那个地址来自模型，正是要被拦住的东西。
+    import src.net_safety as net_safety
+
+    _real_public = net_safety._is_public_ip
+    net_safety._is_public_ip = lambda ip: ip.is_loopback or _real_public(ip)
     _Handler.body = PNG_D  # 换张没见过的图，才能证明是"新下载入库"而不是被去重挡回
 
     real_describe = vu._describe_media
@@ -179,6 +188,7 @@ async def main() -> int:
     await asyncio.to_thread(stickers_utils.wait_idle, 15)
     check("内容图片不入库", stickers_utils.stats()["total"] == before_photo, str(before_photo))
     server.shutdown()
+    net_safety._is_public_ip = _real_public
 
     # ---------- 4. 检索 ----------
     print("\n4. 检索")
@@ -270,7 +280,20 @@ async def main() -> int:
           and Path(routed[0]["stickers"][0]).is_file(), str(routed))
 
     # reply 工具那条路（有 outbox 的普通群聊唤醒）也走同一个出口
-    await core._send_reply(_Sender(), f"行吧 [img]{payload}[/img]", reply_to="42")  # type: ignore[arg-type]
+    from src.tools.chat_provider import ReplyItem
+    from src.trigger import BufferEntry
+    async def _fake_reply_chat(*args, outbox=None, **kwargs):
+        outbox.items.append(ReplyItem(f"行吧 [img]{payload}[/img]", "42"))
+        return ""
+    core.chat = _fake_reply_chat
+    try:
+        await core.handle_message(IncomingMessage(
+            channel="onebot", conv_id="8888", user_id="9999", user_name="张三",
+            text="再说一句", is_at_bot=True, ai_decides_reply=True,
+            context_entries=(BufferEntry(text="再说一句", message_id="42", user_id="9999"),),
+        ), _Sender())
+    finally:
+        core.chat = real_chat
     check("reply 工具路径同样能带表情包",
           routed[-1]["stickers"] and routed[-1]["text"] == "行吧", str(routed[-1]))
 
@@ -284,9 +307,13 @@ async def main() -> int:
 
     async def _fake_safe_reply(message, content):
         official_sent.append(content)
+        from src.channels.base import SendResult
+        return SendResult("ok", content)
 
     async def _fake_safe_group(api, group_openid, msg_id, content, msg_seq=1):
         official_sent.append(content)
+        from src.channels.base import SendResult
+        return SendResult("ok", content)
 
     real_reply, real_group = official._safe_reply, official._safe_send_group
     official._safe_reply, official._safe_send_group = _fake_safe_reply, _fake_safe_group

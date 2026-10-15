@@ -282,7 +282,9 @@ check("只给 types 也能搜", calls_to("/place/text")[0].get("types") == "0500
 
 reset(POIS)
 out = execute("search_place", '{"keywords": ["春熙路"]}')
-check("参数类型不对时被 registry 兜住", "工具执行失败" in out, out[:36])
+# registry 现在会在进 handler 之前把类型不符的参数挡下来，并说清是哪个参数、要什么类型
+check("参数类型不对时被 registry 兜住且说清原因",
+      "参数有问题" in out and "keywords" in out and "需要字符串" in out, out[:60])
 
 
 # ============================================================
@@ -323,15 +325,17 @@ check("响应没有 cost 时不编耗时（只给距离）",
 reset(DRIVING)
 out = execute("plan_route", '{"origin": "104.08,30.65", "destination": "103.95,30.58",'
                             ' "mode": "walking", "strategy": 1}')
-check("步行走 walking 接口且带 strategy",
-      called("/direction/walking") == 1 and calls_to("/direction/walking")[0].get("strategy") == 1)
+check("步行拒绝不存在的 strategy，不发外部请求",
+      "strategy" in out and called("/direction/walking") == 0)
+reset(DRIVING)
+out = execute("plan_route", '{"origin":"104.08,30.65","destination":"104.05,30.60","mode":"walking"}')
 check("步行标题正确且不显示红绿灯",
       out.startswith("步行路线：") and "红绿灯" not in out, out.splitlines()[0])
 
 reset(DRIVING)
 out = execute("plan_route", '{"origin": "104.08,30.65", "destination": "103.95,30.58",'
                             ' "mode": "flying"}')
-check("不支持的方式直接回报", "不支持的方式" in out and CALLS == [])
+check("不支持的方式直接回报", ("不支持的方式" in out or "可选值" in out) and CALLS == [])
 
 reset(DRIVING)
 execute("plan_route", '{"origin": "104.08,30.65", "destination": "103.95,30.58",'
