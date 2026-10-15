@@ -195,7 +195,9 @@ async def chat(
     messages = [{"role": "system", "content": system_prompt}]
 
     # --- 滑动窗口对话压缩（全局启用）---
-    # 当历史接近上限时，把最旧的若干轮压缩成摘要，保留最近 K 轮原文，避免硬截断丢信息
+    # 当历史接近上限时，把最旧的若干轮压缩成摘要，保留最近 K 轮原文，避免硬截断丢信息。
+    # 压缩结果由 _compress_history **写回** history（不写回的话历史永不缩短，从超阈值那轮
+    # 起每一轮都会把全部旧历史重压一遍 —— 不是增量，白烧一次调用加延迟，且越滚越贵）
     _KEEP_RECENT_ROUNDS = 4  # 保留最近 4 轮原文
     _COMPRESS_THRESHOLD = MAX_HISTORY_LENGTH * 2
     if len(history) > _COMPRESS_THRESHOLD:
@@ -308,6 +310,10 @@ async def chat(
     return reply
 
 
+# 摘要消息的标记：历史里靠它认出「这已经是压过的部分」，下次压缩时把旧摘要一起合并
+_SUMMARY_MARKER = "【更早的对话摘要】"
+
+
 async def _compress_history(
     history: list[dict],
     messages: list[dict],
@@ -317,14 +323,25 @@ async def _compress_history(
     """
     滑动窗口对话压缩：把最旧的轮次用 LLM 压缩成摘要，保留最近 keep_recent_rounds 轮原文。
 
+    **成功时会把 history 就地改写成「摘要 + 最近若干轮」**，这样历史真的变短了，下一轮不会
+    再压一遍（老实现只改本次请求的 messages，history 原地不动 —— 于是从超阈值那轮起，每轮
+    都要把不断变长的全部旧历史重新摘要一次）。改写是增量的：下次触发压缩时，待压部分已经
+    以【更早的对话摘要】开头，模型把旧摘要和新对话合并即可。
+
     返回新的 messages 列表（system + 摘要 + 最近若干轮）。
-    压缩失败时退回硬截断（与旧行为一致）。
+    压缩失败（或正在熔断冷却）时退回硬截断，且不动 history（下轮还能重试）。
     """
     keep_msgs = keep_recent_rounds * 2  # 每轮 = user + assistant 两条
     old_part = history[:-keep_msgs] if keep_msgs > 0 else history
     recent_part = history[-keep_msgs:] if keep_msgs > 0 else []
 
     if not old_part:
+        messages.extend(history[-threshold:])
+        return messages
+
+    if api_cooldown_left() > 0:
+        # 熔断冷却期里连摘要都不要试：否则每轮都会先白等一次超时，比不压还慢
+        print("[🗜️ 压缩跳过] DeepSeek 正在冷却期，本轮退回硬截断")
         messages.extend(history[-threshold:])
         return messages
 
@@ -337,6 +354,8 @@ async def _compress_history(
             "role": "user",
             "content": (
                 "请把以上对话内容压缩成一段简洁的摘要，保留关键信息、事实、决定、人物和上下文。"
+                f"如果开头已有{_SUMMARY_MARKER}，把它和后面的新对话合并成这一段摘要，"
+                "不要丢掉旧摘要里的关键信息。"
                 "用纯文本、中文分点叙述，不要使用 Markdown。只输出摘要本身。"
             ),
         })
@@ -350,10 +369,18 @@ async def _compress_history(
             return messages
 
         # 摘要作为历史开头（system 之后第一条 user 消息，标记为压缩历史）
-        messages.append({"role": "user", "content": f"【更早的对话摘要】\n{summary}"})
-        messages.append({"role": "assistant", "content": "（已了解以上历史，继续对话）"})
+        summary_pair = [
+            {"role": "user", "content": f"{_SUMMARY_MARKER}\n{summary}"},
+            {"role": "assistant", "content": "（已了解以上历史，继续对话）"},
+        ]
+        before = len(history)
+        # 关键一步：写回历史本体。只改 messages 的话，下一轮 len(history) 依旧超阈值，
+        # 于是每轮都把这段旧历史重压一遍（且越压越长）——摘要等于白做
+        history[:] = summary_pair + recent_part
+        messages.extend(summary_pair)
         messages.extend(recent_part)
-        print(f"[🗜️ 压缩] 将 {len(old_part)} 条旧消息压缩为摘要，保留最近 {len(recent_part)} 条")
+        print(f"[🗜️ 压缩] 将 {len(old_part)} 条旧消息压缩为摘要，保留最近 {len(recent_part)} 条"
+              f"（历史 {before} → {len(history)} 条）")
         return messages
     except Exception as e:
         print(f"[⚠️ 压缩失败，退回硬截断] {e}")
