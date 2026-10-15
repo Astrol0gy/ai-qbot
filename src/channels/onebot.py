@@ -23,6 +23,7 @@ import random
 import re
 import time
 from collections import OrderedDict
+from pathlib import Path
 
 import aiohttp
 
@@ -184,17 +185,21 @@ class OneBotSender(Sender):
         text: str,
         image_urls: list[str] | None = None,
         reply_to: str | None = None,
+        sticker_paths: list[str] | None = None,
     ) -> None:
         text = truncate_text(text or "", self.max_text_len)
         urls = [u for u in (image_urls or []) if u][:ONEBOT_MAX_IMAGES]
-        if not text and not urls:
+        stickers = [p for p in (sticker_paths or []) if p]
+        if not text and not urls and not stickers:
             return
 
-        # 用段数组发送：引用段必须排在最前（放后面引用不生效），图段其次，文字最后
+        # 用段数组发送：引用段必须排在最前（放后面引用不生效），图段其次，文字最后。
+        # 表情包直接给本地绝对路径：协议端与我们同机，省掉一次转存（见 src/stickers_utils.py）。
         segments: list[dict] = []
         if reply_to:
             segments.append({"type": "reply", "data": {"id": str(reply_to)}})
         segments += [{"type": "image", "data": {"file": url}} for url in urls]
+        segments += [{"type": "image", "data": {"file": path}} for path in stickers]
         if text:
             segments.append({"type": "text", "data": {"text": text}})
 
@@ -209,6 +214,8 @@ class OneBotSender(Sender):
             if result is not None:
                 if urls:
                     print(f"[🖼️ 图片] 已发送 {len(urls)} 张")
+                if stickers:
+                    print(f"[😀 表情包] 已发送 {len(stickers)} 张：{[Path(p).name for p in stickers]}")
                 return
             if status is API_UNKNOWN:
                 # 超时 / 回执超时：消息很可能已经进群了，再发一次就是刷屏

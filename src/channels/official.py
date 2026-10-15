@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+from pathlib import Path
 
 import botpy
 from botpy import connection as botpy_connection
@@ -269,11 +270,22 @@ class OfficialSender(Sender):
         text: str,
         image_urls: list[str] | None = None,
         reply_to: str | None = None,
+        sticker_paths: list[str] | None = None,
     ) -> None:
         # 官方通道的回复都是"被动回复当前这条"，没法指定引用哪一条；
         # 这里接口对齐后忽略 reply_to（OneBot 通道会真的发引用段）
         urls = [u for u in (image_urls or []) if u][:_MAX_IMAGES]
         text = truncate_text(text or "")
+
+        # 本地表情包发不了：官方富媒体必须先把文件上传换 file_id（见 README）。
+        # 与其为一条情绪丢一轮好话，不如降级 —— 有文字就发文字，没文字就什么都不发。
+        stickers = [p for p in (sticker_paths or []) if p]
+        if stickers:
+            print(
+                f"[😀 表情包] 官方通道不支持本地表情包（需先上传换 file_id），"
+                f"本轮降级为纯文字，丢弃 {len(stickers)} 张："
+                f"{[Path(p).name for p in stickers]}"
+            )
 
         if urls:
             await _send_group_images(

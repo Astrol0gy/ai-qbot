@@ -4,9 +4,9 @@
 支持语法：XdY、XdY+Z、XdY-Z（如 1d20、3d6、2d10+3、1d6-2）
 默认表达式：1d6（无参数时）
 
-供两处复用：
-- /roll 指令（玩家主动掷骰，main.py 本地确定性执行）
-- roll_dice 工具（DM 主动判定，campaign_provider.py）
+只服务一处：/roll 指令（channels/commands.py，本地确定性执行）。
+骰子一律由玩家自己掷 —— DM 不代投，没有 roll_dice 工具（见 skills/dm.md）；
+所以这里是纯逻辑，不依赖跑团状态，别的玩法要随机数也能直接复用。
 """
 import random
 import re

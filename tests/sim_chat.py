@@ -190,15 +190,23 @@ class Sim:
         self._snapped = len(self.rounds)
 
 
-async def _stub_send(self, text, image_urls=None, reply_to=None) -> None:  # noqa: ANN001
+async def _stub_send(self, text, image_urls=None, reply_to=None, sticker_paths=None) -> None:  # noqa: ANN001
     """替换 OneBotSender.send：真实链路的最后一步，只记录不发送"""
     sim = SIMS.get(int(getattr(self, "_group_id", 0) or 0))
     clean = (text or "").strip()
+    stickers = [str(p) for p in (sticker_paths or ())]
     if sim is None:
         say(f"  [!!] 有条消息发往了未注册的会话：{clean}")
         return
     mid = sim.next_id()
-    rec = {"id": mid, "text": clean, "images": list(image_urls or ()), "reply_to": reply_to, "t": elapsed()}
+    rec = {
+        "id": mid,
+        "text": clean,
+        "images": list(image_urls or ()),
+        "stickers": stickers,
+        "reply_to": reply_to,
+        "t": elapsed(),
+    }
     sim.sent.append(rec)
     sim.bot_db[str(mid)] = {
         "message": [{"type": "text", "data": {"text": clean}}],
@@ -206,6 +214,8 @@ async def _stub_send(self, text, image_urls=None, reply_to=None) -> None:  # noq
     }
     head = f"[BOT→群] 引用#{reply_to} " if reply_to else "[BOT→群] "
     say(f"  {rec['t']:>6}s  {head}{clean}")
+    for path in stickers:
+        say(f"  {'':>6}   [表情包] {Path(path).name}")
 
 
 async def _stub_get_msg(self, action, params, timeout=None):  # noqa: ANN001

@@ -7,7 +7,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from ..vision_utils import IMAGE_UNAVAILABLE
+from ..vision_utils import IMAGE_UNAVAILABLE, strip_tag_line
 
 # 单张图片的描述写入上下文时的截断长度：上下文要拼进 LLM 提示词，
 # 描述太长会把提示词撑大（每群最多 TRIGGER_CONTEXT_MESSAGES 条）
@@ -80,7 +80,8 @@ class IncomingMessage:
         """
         parts = [(self.text or "").strip()]
         for i, desc in enumerate(self.image_descs or []):
-            brief = (desc or "").strip().replace("\n", " ")
+            # 去掉「标签：…」行：那是表情包库的归档信息，不是一个词条里该背的负担
+            brief = strip_tag_line(desc).replace("\n", " ")
             if len(brief) > IMAGE_NOTE_MAX:
                 brief = brief[:IMAGE_NOTE_MAX] + "…"
             # 识别不出来的图留中性占位（别写「识别失败」：主模型会拿它去琢磨，
@@ -112,10 +113,17 @@ class Sender(ABC):
         text: str,
         image_urls: list[str] | None = None,
         reply_to: str | None = None,
+        sticker_paths: list[str] | None = None,
     ) -> None:
         """发送一条回复（先发图片，再发文字）。
 
         ``reply_to`` 是要引用的消息 id（AI 用 reply 工具的 reply_to 指定）。
         通道不支持引用时忽略即可，不影响正文发送。
+
+        ``sticker_paths`` 是本地表情包文件路径（AI 用 ``send_sticker`` 工具挑中，
+        工具把它包进回复里的 ``[img]``，core 再用 ``stickers_utils.resolve`` 认出来 ——
+        见 src/stickers_utils.py）。只有 OneBot 通道发得出去 —— 官方通道的富媒体必须先把
+        本地文件上传换 file_id，那里就降级成纯文字（见 official.py）。``text`` 可以为空，
+        就是「一个表情胜过千言万语」的纯表情包回复。
         """
         raise NotImplementedError

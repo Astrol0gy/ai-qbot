@@ -7,7 +7,7 @@
 import asyncio
 import re
 
-from ..config import DEEPSEEK_ROUND_TIMEOUT_SEC
+from ..config import DEEPSEEK_ROUND_TIMEOUT_SEC, STICKER_MAX_PER_REPLY
 from ..deepseek_client import (
     api_cooldown_left,
     chat,
@@ -15,7 +15,13 @@ from ..deepseek_client import (
     note_api_failure,
     note_api_success,
 )
-from ..vision_utils import IMAGE_UNAVAILABLE, describe_image, vision_available
+from .. import stickers_utils
+from ..vision_utils import (
+    IMAGE_UNAVAILABLE,
+    describe_image,
+    strip_tag_line,
+    vision_available,
+)
 from .base import IncomingMessage, Sender
 from .commands import HELP_TEXT, handle_dm_cmd, handle_profile_cmd
 
@@ -37,12 +43,45 @@ WAKE_PROMPT = (
 )
 
 
+def _split_image_payloads(payloads: list[str]) -> tuple[list[str], list[str]]:
+    """
+    把回复里所有 ``[img]`` 的内容分成两类 -> (网络图片地址, 本地表情包路径)。
+
+    网址交给通道去拉；不是 http(s) 的交给表情包库解析 —— AI 用 ``send_sticker`` 工具
+    拿到的就是库里的本地路径（见 src/stickers_utils.py），它把那一行原样放进回复，
+    这里负责认出来。库外的路径一律丢掉：模型抄错、编出来的路径不该进发送环节。
+    """
+    urls: list[str] = []
+    local: list[str] = []
+    for raw in payloads:
+        item = (raw or "").strip()
+        if not item:
+            continue
+        if item.startswith(("http://", "https://")):
+            urls.append(item)
+            continue
+        path = stickers_utils.resolve(item)
+        if path is None:
+            print(f"[表情包] 这段 [img] 既不是网址、也不在库里，忽略：{item[:80]}")
+            continue
+        if len(local) >= STICKER_MAX_PER_REPLY:
+            print(f"[表情包] 一轮最多发 {STICKER_MAX_PER_REPLY} 张，多余的丢掉")
+            continue
+        local.append(path)
+    return urls, local
+
+
 async def _send_reply(sender: Sender, text: str, reply_to: str | None = None) -> None:
-    """发出一条回复：先摘出 [img] 标记的图片，再按「先图后文」发出（可带引用）"""
-    image_urls = IMG_MARKER.findall(text)
+    """发出一条回复：先摘出 [img]（网络图 / 本地表情包），再按「先图后文」发出（可带引用）"""
+    image_urls, sticker_paths = _split_image_payloads(IMG_MARKER.findall(text))
     clean = IMG_MARKER.sub("", text).strip()
-    if image_urls:
-        await sender.send(clean or "为你找到以下图片：", image_urls, reply_to=reply_to)
+    if image_urls or sticker_paths:
+        await sender.send(
+            clean or ("为你找到以下图片：" if image_urls else ""),
+            image_urls=image_urls or None,
+            reply_to=reply_to,
+            sticker_paths=sticker_paths or None,
+        )
     elif clean:
         await sender.send(clean, reply_to=reply_to)
 
@@ -88,8 +127,9 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
     # 识别不出来的图留中性占位（见 IMAGE_UNAVAILABLE）：主模型要知道「用户确实发过图」，
     # 但不能拿到「识别失败」四个字去琢磨 —— 那会白烧思考预算，把一轮拖过 60 秒超时
     # （线上日志实测：思考第一段就在纠结「图没识别出来，我该不该提一句」）。
+    # 描述里的「标签：…」行是给表情包库归档用的，不进上下文（见 stickers_utils.py）。
     return "\n\n".join(
-        f"图片{i + 1}：{d or IMAGE_UNAVAILABLE}" for i, d in enumerate(descs)
+        f"图片{i + 1}：{strip_tag_line(d) or IMAGE_UNAVAILABLE}" for i, d in enumerate(descs)
     )
 
 
@@ -270,8 +310,8 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             return
         # 没调工具：退回成一条普通文本（兼容模型直接说话的情况）
 
-    # 解析 [img]URL[/img] 标记，提取图片链接
-    image_urls = IMG_MARKER.findall(reply)
+    # 解析 [img]：网址是网络图，库里的本地路径是表情包（send_sticker 工具给的）
+    image_urls, sticker_paths = _split_image_payloads(IMG_MARKER.findall(reply))
     clean_reply = IMG_MARKER.sub("", reply).strip()
     # 别让它顶着别人的名字开口（模型会照抄上下文的【说话者】格式）
     clean_reply = _strip_speaker_tag(clean_reply, msg.user_name)
@@ -281,16 +321,21 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         (msg.ai_decides_reply or msg.is_interjection)
         and clean_reply.lower() in SKIP_TOKENS
         and not image_urls
+        and not sticker_paths
     ):
         print("[🤐 本轮不开口] 模型回复了 skip 标记")
         if trigger is not None:
             trigger.mark_answered(msg.conv_id)
         return
 
-    # 先发图片，再发文字
+    # 先发图片，再发文字（只发表情包、不配文字也是允许的：纯表情包回复）
     spoke = False
-    if image_urls:
-        await sender.send(clean_reply or "为你找到以下图片：", image_urls)
+    if image_urls or sticker_paths:
+        await sender.send(
+            clean_reply or ("为你找到以下图片：" if image_urls else ""),
+            image_urls=image_urls or None,
+            sticker_paths=sticker_paths or None,
+        )
         spoke = True
     elif clean_reply:
         await sender.send(clean_reply)

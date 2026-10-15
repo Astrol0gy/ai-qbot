@@ -33,6 +33,7 @@ purpose 只接受 user_data；每张图计费上限 1024 tokens。
 """
 import asyncio
 import base64
+import re
 import time
 from collections import OrderedDict, deque
 from urllib.parse import urlsplit
@@ -419,8 +420,45 @@ _TYPE_GUIDE = (
     "2. 若是表情包／梗图：写清它表达的情绪或态度（困惑、无语、震惊、赞同、卖萌……）、"
     "图上的文字，再用一句话说清画面即可，**不要**逐项罗列场景、物体、氛围；\n"
     "3. 若是内容图片：详细描述场景、主体、动作、关键文字（原文照录）、数据要点；\n"
-    "4. 若为动图（GIF），补一句画面里的动作变化。用中文，简洁准确。"
+    "4. 若为动图（GIF），补一句画面里的动作变化。用中文，简洁准确。\n"
+    "5. **仅当判定为表情包／梗图时**，最后单独起一行给这张图打五个标签，格式固定为：\n"
+    "   标签：<情绪>｜<动作>｜<主体>｜<风格>｜<文字>\n"
+    "   · 情绪：它表达的情绪或态度（无语、赞同、震惊、开心、疑惑、难过、愤怒、害羞、委屈、得意……）\n"
+    "   · 动作：画面主体的动作或神态（捂脸、点赞、流泪、趴地、盯着看、招手、扭头……）\n"
+    "   · 主体：画面里是谁或什么（猫、狗、熊猫、人类、卡通人物、表情脸、手绘小人……）\n"
+    "   · 风格：画风或来源（实拍、动漫、拼贴配字、低清网图、截图配字、手绘、像素……）\n"
+    "   · 文字：图上最显眼的几个字（取最短的特征词；图上没有字就写「无文字」）\n"
+    "   每个标签 2~6 个字，用全角竖线分隔，标签内不要出现下划线和竖线；"
+    "某一维说不准就写「无」。内容图片不要输出这一行。"
 )
+
+# 「标签：无语｜捂脸｜熊猫｜拼贴｜无文字」（模型偶尔会带上编号或项目符号）
+_TAG_LINE = re.compile(r"^\s*(?:[-·•*]\s*|\d+[.、)）]\s*)?标\s*签\s*[：:]")
+
+
+def strip_tag_line(desc: str | None) -> str:
+    """
+    去掉描述末尾的「标签：…」行。
+
+    那五个标签是给表情包库归档用的（见 stickers_utils.py），主模型不需要看：它靠第一行的
+    「类型 ｜ 意图」判断怎么接话，多出来的标签只是白占 IMAGE_NOTE_MAX 的字符预算。
+    """
+    if not desc:
+        return desc or ""
+    lines = [ln for ln in desc.splitlines() if not _TAG_LINE.match(ln)]
+    return "\n".join(lines).strip()
+
+
+def _harvest_sticker(ref: str, desc: str) -> None:
+    """
+    认出表情包就顺手交给表情包库（见 stickers_utils.py）。
+
+    延迟导入：那边复用本模块的下载函数，模块级互导会成环。harvest 只负责入队，
+    下载在它自己的后台线程里做，所以这里不会拖慢当前这一轮。
+    """
+    from . import stickers_utils
+
+    stickers_utils.harvest(ref, desc)
 
 
 def describe_image(image_url: str, question: str = "", detail: str | None = None) -> str | None:
@@ -475,6 +513,7 @@ def describe_image(image_url: str, question: str = "", detail: str | None = None
     if result is not None:
         _clear_failed(ref)
         print(f"[VLM] 图片描述完成，{len(result)} 字符")
+        _harvest_sticker(ref, result)
         return result
 
     if direct:
@@ -486,6 +525,7 @@ def describe_image(image_url: str, question: str = "", detail: str | None = None
             if result is not None:
                 _clear_failed(ref)
                 print(f"[VLM] 图片描述完成（自己取图），{len(result)} 字符")
+                _harvest_sticker(ref, result)
                 return result
 
     # 两条路都没成：记下失败，退避窗口内不再重试（否则每次唤醒都重新下载 + 重新调用）

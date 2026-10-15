@@ -1,8 +1,17 @@
 """
 图片类 Tool Provider
 提供 describe_image（DeepSeek 视觉图片描述）、search_images（官方搜索+页面提取图片）、
-text_to_image（Qwen-Image 文生图）三个工具。
+text_to_image（Qwen-Image 文生图）、list_stickers / send_sticker（本地表情包库）五个工具。
+
+这里只做工具的定义与包装：算图逻辑在 ``vision_utils``，表情包库（采集/入库/检索）在 ``stickers_utils``。
+``send_sticker`` 挑中后返回一行 ``[img]<库内路径>[/img]``，模型把它原样放进回复，
+core 解析 ``[img]`` 时用 ``stickers_utils.resolve`` 认出这是库里的文件，随那句话一起发出去
+（用法见 ``src/skills/image.md``）。
 """
+from __future__ import annotations
+
+from .. import stickers_utils
+from ..config import STICKER_ENABLE
 from ..vision_utils import describe_image, text_to_image
 
 from . import ToolProvider
@@ -11,7 +20,10 @@ from .search_provider import extract_page_images, official_search_results
 
 class ImageProvider(ToolProvider):
     name = "image"
-    description = "图片相关工具：describe_image（看图）、search_images（图片搜索）、text_to_image（文生图）"
+    description = (
+        "图片相关工具：describe_image（看图）、search_images（图片搜索）、text_to_image（文生图）、"
+        "list_stickers / send_sticker（本地表情包库）"
+    )
 
     def get_tools(self) -> list[dict]:
         return [
@@ -101,6 +113,45 @@ class ImageProvider(ToolProvider):
                 "handler": self._text_to_image,
                 "max_calls": 2,
             },
+            {
+                "name": "list_stickers",
+                "description": (
+                    "看本地表情包库里有什么：现有多少张、常用情绪标签有哪些。"
+                    "想发表情包之前先看这里，拿返回的标签词去调 send_sticker 命中率最高。"
+                    "库是空的就别调了（群里有人发梗图会自动攒进去）。"
+                ),
+                "parameters": {"type": "object", "properties": {}},
+                "handler": self._list_stickers,
+                "max_calls": 2,
+            },
+            {
+                "name": "send_sticker",
+                "description": (
+                    "从本地表情包库里挑一张，随本条回复发出去 —— 用图片表达情绪"
+                    "（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"
+                    "挑中后会返回一行 [img]库里的文件路径[/img]：把它**原样**放进你的回复里，"
+                    "图片就会随这条消息一起发出，也可以只发图、不配文字。"
+                    "挑不到贴切的就不给路径，这时用文字说就行，别反复换关键词硬凑。"
+                    "正经问答题（别人在问报错、要代码、查数据）和对方情绪明显认真时不要用；"
+                    "一轮最多发一张，别刷屏。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "想表达的情绪或场景，如 无语、震惊、点赞、求安慰；"
+                                "用 list_stickers 返回的标签词最准"
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "handler": self._send_sticker,
+                "max_calls": 2,
+            },
         ]
 
     # --- describe_image ---
@@ -160,3 +211,32 @@ class ImageProvider(ToolProvider):
         lines = [f"[img]{u}[/img]" for u in urls]
         lines.append(f"已生成 {len(urls)} 张图片。")
         return "\n".join(lines)
+
+    # --- list_stickers / send_sticker（库里那套东西在 stickers_utils） ---
+    @staticmethod
+    def _list_stickers() -> str:
+        if not STICKER_ENABLE:
+            return "表情包功能当前是关闭的，别再用这个工具了。"
+        summary = stickers_utils.tag_summary(limit=20)
+        if not summary:
+            return "表情包库现在是空的（群里有人发梗图时会自动攒进去），暂时没有图可发。"
+        return summary + "想发的时候调 send_sticker，query 用上面这些标签词最准。"
+
+    @staticmethod
+    def _send_sticker(query: str) -> str:
+        if not STICKER_ENABLE:
+            return "表情包功能当前是关闭的，别再用这个工具了。"
+        picked = stickers_utils.pick(query)
+        if picked is None:
+            # 宁可这一轮不发，也不糊一张不相关的图上去；同时掐死"换个词再试一次"的循环
+            return (
+                f"库里没有和「{query}」贴切的表情包，这张就不发了。"
+                "用文字说就行，别为了发表情包反复换关键词硬凑。"
+            )
+        print(f"[表情包] 挑中 {picked.name}（{query}）")
+        return (
+            f"[img]{picked.path}[/img]\n"
+            f"挑中「{'、'.join(picked.tags)}」（{picked.name}）。"
+            "把上面那一行 [img]…[/img] 原样放进你的回复里，图片会随这条消息一起发出去"
+            "（可以只发图不配字）。"
+        )

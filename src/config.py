@@ -81,6 +81,22 @@ VISION_TIMEOUT_SEC = float(os.getenv("VISION_TIMEOUT_SEC", "25"))
 VISION_FAIL_BACKOFF_SEC = float(os.getenv("VISION_FAIL_BACKOFF_SEC", "600"))
 
 # ============================================
+# 表情包库（src/stickers_utils.py）
+# 识别时若判定为表情包，就顺手把原图存到本地；AI 想表达情绪时调 send_sticker 工具挑一张发出去
+# 注意：群里和私聊里被识别为表情包的图都会进同一个库，也就是说私聊收到的一张图
+# 有可能被发到群聊里 —— 介意的话把 STICKER_ENABLE 关掉
+# ============================================
+STICKER_ENABLE = os.getenv("STICKER_ENABLE", "true").lower() == "true"
+# 库目录，留空 = <项目根>/data/stickers（相对路径按项目根解析）
+STICKER_DIR = os.getenv("STICKER_DIR", "").strip()
+# 库容量上限，超出后淘汰最久未使用的那张
+STICKER_MAX_FILES = int(os.getenv("STICKER_MAX_FILES", "500"))
+# 单张表情包大小上限（字节），默认 5MB；超了不收（动图尤其容易超标）
+STICKER_MAX_BYTES = int(os.getenv("STICKER_MAX_BYTES", str(5 * 1024 * 1024)))
+# 一轮回复里最多发几张表情包（防止刷屏）
+STICKER_MAX_PER_REPLY = int(os.getenv("STICKER_MAX_PER_REPLY", "1"))
+
+# ============================================
 # 文生图（Qwen-Image，DashScope 原生接口）
 # ============================================
 # 注意：文生图模型不支持 OpenAI 兼容接口，需走 DashScope 原生 HTTP 端点
