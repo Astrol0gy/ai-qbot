@@ -39,7 +39,7 @@ ai-qbot/
     ├── vision_utils.py     # 图片理解（DeepSeek 视觉）/ 文生图
     ├── stickers_utils.py   # 表情包库（采集入库 / 按情绪检索）
     ├── skills/             # Skill（Markdown 定义）
-    └── tools/              # Tool Calling 工具（Provider：search/image/video/profile/campaign/chat）
+    └── tools/              # Tool Calling 工具（Provider：search/image/video/profile/campaign/navi/chat）
 ```
 
 ## 快速开始
@@ -257,6 +257,7 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | 清除记忆 | `@机器人 /reset` |
 | 图片识别 | 发送图片并 `@机器人`，可附带问题（群里未 @ 的图片机器人也看得见） |
 | 表情包 | 发一张梗图就算投喂，机器人自己会收；它想发时会自己挑一张发出来 |
+| 地图导航 | 直接问「春熙路在哪」「XX 附近有什么吃的」「从 A 到 B 怎么走」，需要 `AMAP_KEY` |
 | 跑团（DM） | `@机器人 我们来玩跑团` |
 
 > 群聊中所有指令都需要 @机器人 才会生效。
@@ -349,6 +350,53 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 | `STICKER_MAX_FILES` | 库容量上限，超出淘汰最久未使用的那张 | `500` |
 | `STICKER_MAX_BYTES` | 单张大小上限（字节），超了不收（动图尤其容易超标） | `5242880`（5MB） |
 | `STICKER_MAX_PER_REPLY` | 一轮回复最多发几张 | `1` |
+
+### 地图导航（navi）
+
+**查地点与算路线走高德地图 Web 服务 2.0**（[搜索 POI 2.0](https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch) / [路径规划 2.0](https://lbs.amap.com/api/webservice/guide/api/newroute)），
+工具实现在 `src/tools/navi_provider.py`，用法规则见 `src/skills/navi.md`。
+
+| 工具 | 干什么 | 调用上限 |
+|------|--------|:---:|
+| `search_place` | 搜地点/商家：坐标、地址、评分、人均、营业时间、电话。`near` 给了坐标就是「找这附近」 | 4 |
+| `plan_route` | 算路线：距离、耗时、过路费、红绿灯、换乘方案（驾车/步行/骑行/电动车/公交） | 3 |
+
+**Key 要自己去申请**：去 [高德开放平台](https://console.amap.com) 建应用 → 添加 Key（类型选 **Web 服务**）→
+在 Key 上开通「搜索POI 2.0」和「路径规划 2.0」，填进 `.env` 的 `AMAP_KEY`。绑了 IP 白名单的话记得加服务器出口 IP。
+**没配 Key 时工具不会静默失败**：它会明确回报「缺少 AMAP_KEY」，让模型直接告诉用户查不了，而不是硬试。
+
+几个改工具时容易踩的点，都写在 `src/tools/navi_provider.py` 的模块说明里：
+
+- 坐标一律**「经度,纬度」**（先经后纬，跟 GPS 常见的反着来），坐标系是 GCJ-02。
+- **算耗时/过路费必须 `show_fields=cost`**：高德基础返回里只有距离，没有耗时 —— 代码里已强制带上，改参数时别丢掉。
+- `keywords` 只支持**一个**关键词、≤80 字符；要「XX 附近」得先搜到 XX 的坐标再走周边搜索。
+- **公交的城市只认 `citycode`/`adcode`，中文城市名一律被拒**：实测（2026-10-15）「成都」「成都市」都返回
+  `INVALID_PARAMS`，换 `028`/`510100` 才通。所以 `city`/`city2` 对外仍收中文名，内部 `_city_code` 换一次码
+  （纯数字原样用；中文名走一次 POI 搜索取返回里的 `citycode`，不用额外开通「行政区划查询」）。
+- **公交返回的字段形状跟驾车不一样**（同样真跑核对过）：耗时只在 `cost.duration`（`transits[0]` 上**没有** `duration`）、
+  票价是 `cost.transit_fee`（形如 `'3.0'`）、总步行在 `walking_distance`、步行段里**没有** `destination_stop`。
+- 地名当起终点时内部会先搜一次 POI 换坐标，搜不到就明说没找到，不猜坐标。
+- 驾车结果里的「打车约 X 元」来自 `route.taxi_cost`（高德出租车估价）；限行只在真有限行时才提示，
+  **不替高德说「已规避」**（`restriction="0"` 就是没有限行信息）。
+
+**失败怎么降级**：Key 无效 / 无权限 / 配额用尽这类重试没意义，工具会直接说明原因并让模型别再试；限流（QPS 超限）单独说「稍等一下再试」，
+不会被误判成 Key 报废。单次请求读超时 `AMAP_TIMEOUT_SEC`（默认 8 秒），超了就这一轮说查不到，不拖住对话。
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `AMAP_KEY` | 高德 Web 服务 Key（需开通「搜索POI 2.0」「路径规划 2.0」） | 空（未配置则两个工具都回报没配置） |
+| `AMAP_TIMEOUT_SEC` | 单次请求读超时（秒） | `8` |
+| `AMAP_POI_LIMIT` | 每次搜索默认返回几条（1~25） | `5` |
+
+`tests/navi_check.py` 把这条链路钉住（全离线，只打桩高德的 HTTP 请求，走真 registry）：
+工具注册与 schema、搜不到/关键词超长/near 传地名等参数校验、`city_limit` 与 `show_fields=cost` 真的发出去了、
+空数组地址不显示成 `[]`、类型末级重复会合并、响应里没有 `cost` 时不编耗时、不限行时不乱下结论、
+地名换坐标、公交的中文城市名换 citycode（同城只解析一次）、公交缺 `city` 的劝停、各类错误码的降级措辞。
+
+`tests/navi_live.py` 打真接口（要 `AMAP_KEY`，约 10 次配额），核对**高德返回的字段形状**跟我们解析的假设一致：
+`business` 与 `cost` 的字段名、`paths[0].cost.duration` 是否真存在、`departure_stop` 是对象还是字符串、
+公交 `transits[0]` 有没有 `duration`、中文城市名是不是真被拒 —— 并把工具实际输出打印出来。没配 Key 时以退出码 2 报错，
+不会假装通过。**改了字段解析就两个都跑**：离线版只证明我们发得对，证明不了返回长这样。
 
 ## 在小米平板上运行（Termux 单机部署）
 

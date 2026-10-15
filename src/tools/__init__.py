@@ -140,6 +140,7 @@ from .image_provider import ImageProvider  # noqa: E402
 from .video_provider import VideoProvider  # noqa: E402
 from .profile_provider import ProfileProvider  # noqa: E402
 from .campaign_provider import CampaignProvider  # noqa: E402
+from .navi_provider import NaviProvider  # noqa: E402
 from .chat_provider import ChatProvider  # noqa: E402
 
 _registry.register_provider(SearchProvider())
@@ -147,6 +148,7 @@ _registry.register_provider(ImageProvider())
 _registry.register_provider(VideoProvider())
 _registry.register_provider(ProfileProvider())
 _registry.register_provider(CampaignProvider())
+_registry.register_provider(NaviProvider())
 _registry.register_provider(ChatProvider())
 
 
