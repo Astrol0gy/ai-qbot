@@ -70,7 +70,9 @@ def _resolve(url: str):
         except ValueError:  # 解析出的东西不是 IP（理论上不会发生）
             raise UnsafeURLError(f"{host} 解析出无法识别的地址 {info[4][0]!r}") from None
         if not _is_public_ip(ip) and not (os.getenv("TRUST_PROXY_URL", "").strip() and _is_proxy_fake_ip(ip)):
-            raise UnsafeURLError(f"{host} 指向非公网地址 {ip}，拒绝访问")
+            hint = ("；检测到可能的代理 fake-IP，请配置 TRUST_PROXY_URL 为受信 HTTP/Mixed 代理地址，"
+                    "或让该域名的 DNS 返回真实公网 IP") if _is_proxy_fake_ip(ip) else ""
+            raise UnsafeURLError(f"{host} 指向非公网地址 {ip}，拒绝访问{hint}")
         ips.append(str(ip))
     if not ips:
         raise UnsafeURLError("域名没有可用地址")
@@ -197,5 +199,8 @@ def safe_get(
         finally:
             if response is not None:
                 response.close()
-            pool.close()
+            if proxy:
+                pool.clear()
+            else:
+                pool.close()
     raise UnsafeURLError(f"重定向次数超过 {max_redirects} 次，放弃")

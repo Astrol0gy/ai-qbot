@@ -82,6 +82,8 @@ python -m src.migrate_data data/campaigns/旧文件.json --group-id 完整会话
 
 默认不继承 `HTTP_PROXY`/`HTTPS_PROXY`，拒绝 fake-IP 和非公网地址。确需代理时显式设置 `TRUST_PROXY_URL`：该代理须负责目标 DNS 和路由限制；仅在此模式允许 fake-IP。它是受信配置，不代表能在客户端固定代理背后的实际目标。配置启动时检查数字范围、有限值、布尔及枚举；主模型和视觉关闭思考均显式发送 disabled，参见 [DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。代码默认 reasoning effort 为 high，现有 `.env.example` 模板设为 max，以实际配置为准。
 
+若下载日志提示 QQ 图片域名指向 `198.18.x.x`，可能是代理 DNS 返回了 fake-IP。可将 `.env` 的 `TRUST_PROXY_URL` 设为机器人运行设备实际可达的 HTTP/Mixed 代理地址（如 `http://127.0.0.1:7890`，端口以代理配置为准，不使用 SOCKS 端口），或调整代理 DNS，让图片域名返回真实公网 IP；Mihomo 的配置参见 [fake-ip-filter](https://wiki.metacubex.one/config/dns/#fake-ip-filter)。修改后重启机器人，重新发图验证，也会清除进程中的图片失败退避缓存。不会自动放行 fake-IP 或其他内网目标。
+
 退出时取消通道拥有的任务、撤销轮次、有限等待后台 I/O 与采集，再关闭模型客户端；不可强杀的底层阻塞 I/O 可能使进程等待到其网络超时。`start.sh` 使用项目目录区分 screen 会话和进程，按通道开关启动 NapCat，正确解析 IPv6 WS 地址；`src.runner` 将日志按 10 MiB 轮换、最多保留三个备份。当前已做 Bash 语法与离线行为检查，真实 QQ、付费模型/高德和 Termux 设备仍需部署环境联调。
 
 ## 快速开始
@@ -648,11 +650,12 @@ HyperOS 的省电策略很激进，必须手动放行，否则会被杀后台：
 
 ## 离线回归验收
 
-以下检查使用假模型、假平台 API 和临时数据；表情包检查只启动本机测试图床，不调用付费服务。
+以下检查使用假模型、假平台 API 和临时数据；表情包和代理检查只启动本机测试服务，不调用付费服务。
 
 ```bash
 python tests/review_regressions.py
 python tests/architecture_check.py
+python tests/net_proxy_check.py
 python tests/skill_loading_check.py
 python tests/_degrade_check.py
 python tests/state_isolation_check.py
