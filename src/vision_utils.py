@@ -1,39 +1,14 @@
-"""
-图片理解 —— DeepSeek 官方视觉接口（模型 deepseek-flash）
+"""图片理解与文生图。
 
-与旧实现（Qwen3-VL / 百炼）的不同：
-
-1. 一个 Key：看图用 DEEPSEEK_API_KEY，不再依赖百炼（文生图仍在本文件末尾用 DASHSCOPE）。
-2. 取图三条路，按代价从低到高：直传 URL → 下载后内联 base64（≤32MiB）→ 下载后上传
-   Files API 换 file_id（≤64MiB，同一张图可长期复用，请求体里只有一个短 id）。
-   QQ CDN 的图服务端常常拉不到，就得走后两条。
-3. 格式按**文件内容**嗅探（JPEG/PNG/GIF/WebP），不信 CDN 的 Content-Type ——
-   NapCat 常回 application/octet-stream；GIF 动图也因此能直接送进去。
-4. 看图默认**关**思考（`VISION_ENABLE_THINKING`）：deepseek-flash 默认开着，而推理 token
-   与可见回答共用 max_tokens，实测会把稍大图片的描述挤成空回答。
-5. 描述首行固定是「类型：表情包/内容图片 ｜ 意图：…」（见 `_TYPE_GUIDE`），并且**排在最前**：
-   主模型对图片的全部认知就是这段文字，分不清梗图与照片就会答错（把猫头顶问号当成猫咪
-   照片来夸）；而描述进接话上下文时按 `IMAGE_NOTE_MAX` 截断，写在后面会被截掉。
-   「这张图在当前对话里什么意思」仍由有上下文的主模型判断（见 skills/image.md）。
-6. 看图失败**不许拖住对话**：客户端读超时短（`VISION_TIMEOUT_SEC`）、不重试，失败即
-   返回，由调用方留占位（`IMAGE_UNAVAILABLE`）继续答；失败还进退避
-   （`VISION_FAIL_BACKOFF_SEC`），窗口内同一张图不再下载、不再调用。
-   线上日志的教训：看图失败既不降级也不退避，主模型还拿到「识别失败」四个字去琢磨，
-   最后整轮思考被拖过 60 秒、超时放弃，群里连着几轮都等不到回复。
-7. QQ 系 CDN（`_SERVER_UNREACHABLE_HOSTS`）跳过直传直接自己取图：服务端拉不到这些
-   带签名的链接，直传只会白跑一次往返。
-
-官方限制（见文档）：图片只能放在 user 消息里（system/assistant 会 400）；内联单图
-≤32MiB、URL ≤8192 字符、请求体 ≤48MiB、单请求 ≤600 张；Files API 单图 ≤64MiB，
-purpose 只接受 user_data；每张图计费上限 1024 tokens。
-
-文档：
-  图像理解 https://api-docs.deepseek.com/zh-cn/guides/vision/
-  Files API https://api-docs.deepseek.com/zh-cn/guides/files_api/
+HTTP 图片由本机受限下载，再以内联 base64 或 Files API 引用送往视觉模型。
+同一图片/问题/细节档位共享缓存与并发合并；每次识别最多一次视觉请求，
+失败退避、预识别频控与中性占位独立于主模型。表情包标签交给后台采集。
+本地内联限制 32 MiB、下载限制 64 MiB；上传、识别和生图均有独立超时。
 """
 import asyncio
 import base64
 import re
+import threading
 import time
 from collections import OrderedDict, deque
 from urllib.parse import urlsplit
@@ -41,6 +16,8 @@ from urllib.parse import urlsplit
 import requests
 from openai import OpenAI, Timeout
 
+from .net_safety import safe_get
+from . import runtime
 from .config import (
     DEEPSEEK_API_KEY,
     DASHSCOPE_API_KEY,
@@ -63,7 +40,7 @@ _INLINE_MAX_BYTES = 32 * 1024 * 1024  # 单张内联图片（URL / base64）上�
 _FILE_MAX_BYTES = 64 * 1024 * 1024    # 单张 Files API（file_id）上限，同时也是下载上限
 _URL_MAX_CHARS = 8192                 # 直传 URL 长度上限，超了只能自己取图
 _REQUEST_TIMEOUT = 30                 # 下载超时
-_UPLOAD_TIMEOUT = 120                 # 上传超时
+_UPLOAD_TIMEOUT = 25                  # 上传超时
 _FILE_ID_CACHE_SIZE = 64              # 已上传图片的 file_id 缓存条数（同一张图不重复上传）
 
 # 识别失败后的退避：同一张图在 VISION_FAIL_BACKOFF_SEC 内不再重试。
@@ -71,6 +48,13 @@ _FILE_ID_CACHE_SIZE = 64              # 已上传图片的 file_id 缓存条数�
 # 每轮都白跑一次下载和一次必失败的直传），既拖慢整轮也白烧调用。
 _FAILED: "OrderedDict[str, float]" = OrderedDict()
 _FAIL_CACHE_SIZE = 256  # 记住多少张失败图（防止内存无限增长）
+
+#: 本模块的几个缓存（失败退避 _FAILED、已上传的 file_id _FILE_IDS、图片描述 _IMG_CACHE、
+#: 频控 _IMG_RATE）是跨线程共享的：图片识别既跑在事件循环的线程池里（工具调用），
+#: 也跑在上下文预识别的线程里。OrderedDict 的 move_to_end / popitem 在多线程下交错
+#: 执行会直接抛 RuntimeError（"OrderedDict mutated during iteration"）或悄悄丢条目，
+#: 而这些读写都是纯内存操作（无 await/IO），加锁不会带来任何等待。
+_CACHE_LOCK = threading.RLock()
 
 # 识别不出来的图在上下文里的占位。必须留占位：主模型得知道「用户确实发过一张图」，
 # 否则会答非所问（用户在问图里的东西，它当没这回事）；但也**不能**写「识别失败」——
@@ -98,26 +82,27 @@ def vision_available() -> bool:
 
 
 def _get_client() -> OpenAI | None:
-    """延迟初始化视觉客户端"""
+    """延迟初始化视觉客户端（多线程调用，加锁避免同时建出两个客户端）"""
     global _vision_client
     if not vision_available():
         return None
-    if _vision_client is None:
-        # 看图是「给对话做配菜」的活，不能拖住整轮：读超时短（默认 25s），重试关掉。
-        # 默认的 600s / 重试 2 次会在服务端半死时把一轮挂到 60 秒超时才放弃；
-        # 这里失败就立刻失败，交给占位与退避处理，对话照常进行。
-        _vision_client = OpenAI(
-            api_key=DEEPSEEK_API_KEY,
-            base_url=VISION_BASE_URL,
-            timeout=Timeout(
-                connect=5.0,
-                read=VISION_TIMEOUT_SEC,
-                write=VISION_TIMEOUT_SEC,
-                pool=VISION_TIMEOUT_SEC,
-            ),
-            max_retries=0,
-        )
-    return _vision_client
+    with _CACHE_LOCK:
+        if _vision_client is None:
+            # 看图是「给对话做配菜」的活，不能拖住整轮：读超时短（默认 25s），重试关掉。
+            # 默认的 600s / 重试 2 次会在服务端半死时把一轮挂到 60 秒超时才放弃；
+            # 这里失败就立刻失败，交给占位与退避处理，对话照常进行。
+            _vision_client = OpenAI(
+                api_key=DEEPSEEK_API_KEY,
+                base_url=VISION_BASE_URL,
+                timeout=Timeout(
+                    connect=5.0,
+                    read=VISION_TIMEOUT_SEC,
+                    write=VISION_TIMEOUT_SEC,
+                    pool=VISION_TIMEOUT_SEC,
+                ),
+                max_retries=0,
+            )
+        return _vision_client
 
 
 def _detail(explicit: str | None = None) -> str:
@@ -134,26 +119,29 @@ def _skip_direct(url: str) -> bool:
 
 def _in_backoff(ref: str) -> bool:
     """这张图是否还在失败退避窗口内"""
-    ts = _FAILED.get(ref)
-    if ts is None:
-        return False
-    if time.monotonic() - ts > VISION_FAIL_BACKOFF_SEC:
-        _FAILED.pop(ref, None)
-        return False
-    _FAILED.move_to_end(ref)
-    return True
+    with _CACHE_LOCK:
+        ts = _FAILED.get(ref)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > VISION_FAIL_BACKOFF_SEC:
+            _FAILED.pop(ref, None)
+            return False
+        _FAILED.move_to_end(ref)
+        return True
 
 
 def _mark_failed(ref: str) -> None:
     """记下失败时刻，窗口内不再重试（成功一次就会清掉）"""
-    _FAILED[ref] = time.monotonic()
-    _FAILED.move_to_end(ref)
-    while len(_FAILED) > _FAIL_CACHE_SIZE:
-        _FAILED.popitem(last=False)
+    with _CACHE_LOCK:
+        _FAILED[ref] = time.monotonic()
+        _FAILED.move_to_end(ref)
+        while len(_FAILED) > _FAIL_CACHE_SIZE:
+            _FAILED.popitem(last=False)
 
 
 def _clear_failed(ref: str) -> None:
-    _FAILED.pop(ref, None)
+    with _CACHE_LOCK:
+        _FAILED.pop(ref, None)
 
 
 def _sniff_mime(data: bytes) -> str | None:
@@ -174,17 +162,20 @@ def _sniff_mime(data: bytes) -> str | None:
     return None
 
 
-def _download_image(url: str) -> tuple[bytes, str] | None:
+def _download_image(url: str, max_bytes: int = _FILE_MAX_BYTES) -> tuple[bytes, str] | None:
     """
     下载远程图片 -> (原始字节, mime)。只收 JPEG/PNG/GIF/WebP，超过 64MB 放弃。
     用于 QQ CDN 等视觉服务端拉不到的链接。
+
+    url 可能来自模型（describe_image 的 image_url 参数）→ 走 safe_get 只允许公网地址，
+    否则一句"看看 http://169.254.169.254/..."就能让本机去读内网服务。
     """
     try:
-        resp = requests.get(url, timeout=_REQUEST_TIMEOUT, stream=True)
+        resp = safe_get(None, url, timeout=min(_REQUEST_TIMEOUT, 20), max_bytes=max_bytes)
         resp.raise_for_status()
 
         declared = resp.headers.get("Content-Length")
-        if declared and int(declared) > _FILE_MAX_BYTES:
+        if declared and int(declared) > max_bytes:
             print(f"[图片] 文件过大（{int(declared) / 1048576:.1f}MB > 64MB），跳过")
             return None
 
@@ -194,7 +185,7 @@ def _download_image(url: str) -> tuple[bytes, str] | None:
         for chunk in resp.iter_content(chunk_size=65536):
             chunks.append(chunk)
             total += len(chunk)
-            if total > _FILE_MAX_BYTES:
+            if total > max_bytes:
                 print("[图片] 文件超过 64MB 上限，停止下载")
                 return None
 
@@ -227,7 +218,7 @@ def _upload_to_files(data: bytes, mime: str) -> str | None:
             headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
             files={"file": (filename, data, mime)},
             data={"purpose": "user_data"},
-            timeout=_UPLOAD_TIMEOUT,
+            timeout=runtime.remaining(_UPLOAD_TIMEOUT),
         )
         resp.raise_for_status()
         file_id = str(resp.json().get("id") or "")
@@ -246,17 +237,19 @@ _FILE_IDS: "OrderedDict[str, str]" = OrderedDict()
 
 
 def _remember_file_id(url: str, file_id: str) -> None:
-    _FILE_IDS[url] = file_id
-    _FILE_IDS.move_to_end(url)
-    while len(_FILE_IDS) > max(1, _FILE_ID_CACHE_SIZE):
-        _FILE_IDS.popitem(last=False)
+    with _CACHE_LOCK:
+        _FILE_IDS[url] = file_id
+        _FILE_IDS.move_to_end(url)
+        while len(_FILE_IDS) > max(1, _FILE_ID_CACHE_SIZE):
+            _FILE_IDS.popitem(last=False)
 
 
 def _cached_file_id(url: str) -> str | None:
-    file_id = _FILE_IDS.get(url)
-    if file_id is not None:
-        _FILE_IDS.move_to_end(url)
-    return file_id
+    with _CACHE_LOCK:
+        file_id = _FILE_IDS.get(url)
+        if file_id is not None:
+            _FILE_IDS.move_to_end(url)
+        return file_id
 
 
 def _inline_block(ref: str, level: str) -> dict:
@@ -458,10 +451,11 @@ def _harvest_sticker(ref: str, desc: str) -> None:
     """
     from . import stickers_utils
 
+    runtime.check()
     stickers_utils.harvest(ref, desc)
 
 
-def describe_image(image_url: str, question: str = "", detail: str | None = None) -> str | None:
+def _describe_image_uncached(image_url: str, question: str = "", detail: str | None = None) -> str | None:
     """
     用 DeepSeek 视觉模型（deepseek-flash）看图。
 
@@ -491,46 +485,41 @@ def describe_image(image_url: str, question: str = "", detail: str | None = None
               f"跳过重试: {ref[:80]}...")
         return None
 
-    is_http = ref.startswith(("http://", "https://"))
-    # 只有"直传 URL"这条路失败才值得自己下载（其余路径已经是我们自己取的图）；
-    # QQ 系 CDN 的图服务端一律拉不到，跳过直传直接自己取，省掉一次必失败的往返
-    direct = is_http and len(ref) <= _URL_MAX_CHARS and not _skip_direct(ref)
-
-    if is_http and not direct:
-        if len(ref) > _URL_MAX_CHARS:
-            print(f"[图片] URL 过长（{len(ref)} > {_URL_MAX_CHARS} 字符），改为自己取图")
-        else:
-            print(f"[图片] 该域名服务端拉不到，跳过直传直接自己取图: {ref[:80]}...")
+    if ref.startswith(("http://", "https://")):
         block = _downloaded_block(ref, level)
     else:
         block = _image_block(ref, level)
-
     if block is None:
         _mark_failed(ref)
         return None
-
+    runtime.check()
     result = _describe_media(block, prompt, max_tokens=600)
+    runtime.check()
     if result is not None:
         _clear_failed(ref)
-        print(f"[VLM] 图片描述完成，{len(result)} 字符")
         _harvest_sticker(ref, result)
         return result
-
-    if direct:
-        print("[图片] 直传 URL 失败，改为自己取图...")
-        block2 = _downloaded_block(ref, level)
-        if block2 is not None:
-            result = _describe_media(block2, prompt, max_tokens=600)
-            del block2  # 释放内联的 base64
-            if result is not None:
-                _clear_failed(ref)
-                print(f"[VLM] 图片描述完成（自己取图），{len(result)} 字符")
-                _harvest_sticker(ref, result)
-                return result
-
-    # 两条路都没成：记下失败，退避窗口内不再重试（否则每次唤醒都重新下载 + 重新调用）
     _mark_failed(ref)
     return None
+
+
+_DESCRIBE_LOCKS = [threading.Lock() for _ in range(64)]
+
+
+def describe_image(image_url, question="", detail=None):
+    key = (image_url, question.strip(), _detail(detail))
+    with _DESCRIBE_LOCKS[hash(key) % len(_DESCRIBE_LOCKS)]:
+        runtime.check()
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
+        result = _describe_image_uncached(image_url, question, detail)
+        runtime.check()
+        if result:
+            _cache_put(key, result)
+            if not question:
+                _cache_put(image_url, result)
+        return result
 
 
 # ============================================
@@ -545,17 +534,19 @@ _IMG_RATE_WINDOW = 60.0
 
 
 def _cache_get(url: str) -> str | None:
-    desc = _IMG_CACHE.get(url)
-    if desc is not None:
-        _IMG_CACHE.move_to_end(url)
-    return desc
+    with _CACHE_LOCK:
+        desc = _IMG_CACHE.get(url)
+        if desc is not None:
+            _IMG_CACHE.move_to_end(url)
+        return desc
 
 
 def _cache_put(url: str, desc: str) -> None:
-    _IMG_CACHE[url] = desc
-    _IMG_CACHE.move_to_end(url)
-    while len(_IMG_CACHE) > max(1, TRIGGER_IMAGE_CACHE_SIZE):
-        _IMG_CACHE.popitem(last=False)
+    with _CACHE_LOCK:
+        _IMG_CACHE[url] = desc
+        _IMG_CACHE.move_to_end(url)
+        while len(_IMG_CACHE) > max(1, TRIGGER_IMAGE_CACHE_SIZE):
+            _IMG_CACHE.popitem(last=False)
 
 
 def _take_rate(conv_id: str, n: int) -> bool:
@@ -564,20 +555,28 @@ def _take_rate(conv_id: str, n: int) -> bool:
     if limit <= 0:
         return True
 
-    now = time.monotonic()
-    stamps = _IMG_RATE.setdefault(conv_id, deque())
-    while stamps and now - stamps[0] > _IMG_RATE_WINDOW:
-        stamps.popleft()
+    # 频控必须整段加锁：现在是「读计数 → 判断 → 记账」，两个线程交错时两边都会看到
+    # 还有余额，实际放过去的图翻倍（频控形同虚设）
+    with _CACHE_LOCK:
+        now = time.monotonic()
+        if len(_IMG_RATE) >= 200:
+            for key in [k for k, v in _IMG_RATE.items() if not v or now - v[-1] > _IMG_RATE_WINDOW]:
+                _IMG_RATE.pop(key, None)
+        if conv_id not in _IMG_RATE and len(_IMG_RATE) >= 500:
+            return False
+        stamps = _IMG_RATE.setdefault(conv_id, deque())
+        while stamps and now - stamps[0] > _IMG_RATE_WINDOW:
+            stamps.popleft()
 
-    if len(stamps) + n > limit:
-        return False
-    stamps.extend([now] * n)
+        if len(stamps) + n > limit:
+            return False
+        stamps.extend([now] * n)
 
-    # 窗口滑空后顺手清掉无活动的会话，避免 _IMG_RATE 无界增长
-    if len(_IMG_RATE) > 200:
-        for key in [k for k, v in _IMG_RATE.items() if not v]:
-            _IMG_RATE.pop(key, None)
-    return True
+        # 窗口滑空后顺手清掉无活动的会话，避免 _IMG_RATE 无界增长
+        if len(_IMG_RATE) > 200:
+            for key in [k for k, v in _IMG_RATE.items() if not v or now - v[-1] > _IMG_RATE_WINDOW]:
+                _IMG_RATE.pop(key, None)
+        return True
 
 
 async def describe_for_context(conv_id: str, urls: list[str]) -> list[str] | None:
@@ -595,7 +594,7 @@ async def describe_for_context(conv_id: str, urls: list[str]) -> list[str] | Non
 
     Returns:
         与 urls 等长的描述列表（识别不出来的位置是 IMAGE_UNAVAILABLE 占位）；
-        未配置视觉 / 超频时返回 None
+        未配置视觉时返回 None；超频时返回占位，禁止退化为重复识别
     """
     if not urls or not vision_available():
         return None
@@ -607,7 +606,7 @@ async def describe_for_context(conv_id: str, urls: list[str]) -> list[str] | Non
             f"[VLM] 已达频控上限（{TRIGGER_IMAGE_RATE_PER_MIN} 张/分钟），"
             f"本次跳过 {len(missing)} 张图片的预识别"
         )
-        return None
+        return [_cache_get(url) or IMAGE_UNAVAILABLE for url in urls]
 
     descs: list[str] = []
     for url in urls:
@@ -615,7 +614,7 @@ async def describe_for_context(conv_id: str, urls: list[str]) -> list[str] | Non
         if desc is None:
             print(f"[VLM] 上下文预识别: {url[:80]}...")
             # describe_image 是同步阻塞调用，放线程池跑，别卡住事件循环
-            desc = await asyncio.to_thread(describe_image, url)
+            desc = await runtime.run_blocking(describe_image, url)
             if desc:
                 _cache_put(url, desc)
         descs.append(desc or IMAGE_UNAVAILABLE)
@@ -635,7 +634,7 @@ def text_to_image(
     Args:
         prompt: 文生图提示词（中英文均可）
         size: 输出分辨率，如 "1024*1024"（总像素需在 512*512 ~ 2048*2048 之间）
-        n: 生成图片数量（1~6）
+        n: 生成图片数量（1~3）
 
     Returns:
         图片 URL 列表；失败时返回 None
@@ -643,7 +642,7 @@ def text_to_image(
     if not DASHSCOPE_API_KEY:
         return None
 
-    n = min(max(int(n), 1), 6)
+    n = min(max(int(n), 1), 3)
     try:
         body = {
             "model": IMAGE_GEN_MODEL,
@@ -669,7 +668,7 @@ def text_to_image(
             IMAGE_GEN_ENDPOINT,
             headers=headers,
             json=body,
-            timeout=180,
+            timeout=runtime.remaining(30),
         )
         resp.raise_for_status()
         data = resp.json()

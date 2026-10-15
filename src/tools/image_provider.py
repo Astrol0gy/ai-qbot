@@ -178,18 +178,25 @@ class ImageProvider(ToolProvider):
         try:
             # 附加"图片"让官方搜索优先命中图片类页面；多取一些页面提高提取成功率
             pages = official_search_results(f"{query} 图片", max_results=count * 2)
+            if pages is None:
+                # 搜索本身失败 ≠ 没有图片：说清楚，模型才知道该重试而不是换个说法再搜一遍
+                return f"图片搜索失败：搜索服务这次没有返回结果（可能是网络或鉴权问题），不是「没有图片」。可以稍后重试。"
             if not pages:
                 return f"未找到「{query}」的相关图片。"
 
             lines = []
+            failed_pages = 0
             for page in pages:
                 if len(lines) >= count:
                     break
                 title = (page.get("title") or "图片").strip()
                 page_url = page.get("url", "")
                 imgs = extract_page_images(page_url, max_images=1)
+                if imgs is None:
+                    failed_pages += 1
+                    continue  # 这一页抓取失败，试下一个
                 if not imgs:
-                    continue  # 该页提取不到图就跳过，试下一个
+                    continue  # 这一页确实没有可用的图
                 lines.append(
                     f"- {title}\n"
                     f"   图片直链: {imgs[0]}\n"
@@ -197,6 +204,9 @@ class ImageProvider(ToolProvider):
                 )
 
             if not lines:
+                if failed_pages and failed_pages == len(pages):
+                    return (f"图片搜索失败：{len(pages)} 个结果页都抓取失败（网络问题？），"
+                            f"不是「没有图片」，可以稍后重试。")
                 return f"未找到「{query}」的相关图片。"
             return "\n\n".join(lines)
         except Exception as e:

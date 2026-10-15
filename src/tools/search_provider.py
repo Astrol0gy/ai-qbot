@@ -13,6 +13,8 @@ from ..config import (
     DEEPSEEK_MODEL,
     DEEPSEEK_ANTHROPIC_BASE_URL,
 )
+# url 来自模型：抓取前先过公网地址校验（内网/本机/云元数据地址一律拒掉）
+from ..net_safety import safe_get
 
 from . import ToolProvider
 
@@ -36,6 +38,8 @@ def _get_search_client() -> anthropic.Anthropic:
         _search_client = anthropic.Anthropic(
             base_url=DEEPSEEK_ANTHROPIC_BASE_URL,
             api_key=DEEPSEEK_API_KEY,
+            timeout=25,
+            max_retries=0,
         )
     return _search_client
 
@@ -93,21 +97,25 @@ def official_search_results(query: str, max_results: int = 5) -> list[dict]:
                     results.append({"title": title, "url": url})
         return results[:max_results]
     except Exception as e:
+        # 返回 None（而不是空列表）表示"这次搜索本身失败了"。过去一律返回 []，
+        # 调用方只能把它说成"未找到相关图片"，网络/鉴权问题被伪装成"没有结果"，
+        # 排查时完全看不出该重试还是该换关键词。
         print(f"[official_search_results] 官方搜索失败: {e}")
-        return []
+        return None
 
 
-def extract_page_images(page_url: str, max_images: int = 3) -> list[str]:
+def extract_page_images(page_url: str, max_images: int = 3) -> list[str] | None:
     """
     抓取网页并提取可用的图片直链（og:image 优先，其次 img 标签兜底）。
     用于官方搜索只返回来源页 URL、需要从页面里拿图片的场景。
 
-    返回绝对 URL 列表（去重），提取失败或无可展示图片时返回空列表。
+    返回绝对 URL 列表（去重）；页面抓取失败返回 **None**（和"页面里没有图"返回 [] 区分开），
+    否则网络问题会一路伪装成"未找到相关图片"。
     """
     import urllib.parse
 
     try:
-        resp = requests.get(page_url, headers=_HEADERS, timeout=8)
+        resp = safe_get(None, page_url, headers=_HEADERS, timeout=8)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -185,8 +193,10 @@ def extract_page_images(page_url: str, max_images: int = 3) -> list[str]:
             if len(urls) >= max_images:
                 break
         return urls
-    except Exception:
-        return []
+    except Exception as e:
+        # 抓不到就是抓不到：返回 None 让调用方能说"抓取失败"，而不是"没有图片"
+        print(f"[extract_page_images] 抓取失败 {page_url}: {e}")
+        return None
 
 
 class SearchProvider(ToolProvider):
@@ -278,9 +288,9 @@ class SearchProvider(ToolProvider):
 
     @staticmethod
     def _fetch_url(url: str) -> str:
-        """抓取网页并提取文字内容"""
+        """抓取网页并提取文字内容（url 来自模型 → 必须先过公网地址校验）"""
         try:
-            resp = requests.get(url, headers=_HEADERS, timeout=10)
+            resp = safe_get(None, url, headers=_HEADERS, timeout=10)
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             soup = BeautifulSoup(resp.text, "html.parser")

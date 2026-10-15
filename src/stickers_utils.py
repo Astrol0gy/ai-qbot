@@ -133,6 +133,7 @@ _LOCK = threading.RLock()
 _FILES: dict[str, dict] = {}   # 文件名 -> {tags, hash, added, used, last_used}
 _loaded = False
 _worker: threading.Thread | None = None
+_stopping = threading.Event()
 _QUEUE: "queue.Queue[tuple[str, str]]" = queue.Queue(maxsize=_MAX_QUEUE)
 
 
@@ -157,14 +158,16 @@ def _load() -> None:
 
     if isinstance(raw, dict) and raw.get("version") == _INDEX_VERSION:
         for name, info in (raw.get("files") or {}).items():
-            if not (_DIR / name).exists():
+            path = _DIR / name
+            if (Path(name).name != name or path.suffix.lower() not in _EXT_BY_MIME.values()
+                    or not path.is_file() or path.is_symlink()):
                 continue
             tags = info.get("tags") or _tags_from_name(name)
             if not tags:
                 continue
             _FILES[name] = {
                 "tags": list(tags)[:5],
-                "hash": info.get("hash") or "",
+                "hash": info.get("hash") or hashlib.sha1(path.read_bytes()).hexdigest()[:16],
                 "added": int(info.get("added") or 0),
                 "used": int(info.get("used") or 0),
                 "last_used": int(info.get("last_used") or info.get("added") or 0),
@@ -172,11 +175,11 @@ def _load() -> None:
 
     # 索引与目录对不上的部分（手工丢进去的图、索引丢了）：按文件名补回来
     for path in _DIR.iterdir():
-        if not path.is_file() or path.name in _FILES:
+        if not path.is_file() or path.is_symlink() or path.name in _FILES or path.suffix.lower() not in _EXT_BY_MIME.values():
             continue
         tags = _tags_from_name(path.name)
         if tags:
-            _FILES[path.name] = {"tags": tags, "hash": "", "added": int(path.stat().st_mtime),
+            _FILES[path.name] = {"tags": tags, "hash": hashlib.sha1(path.read_bytes()).hexdigest()[:16], "added": int(path.stat().st_mtime),
                                  "used": 0, "last_used": int(path.stat().st_mtime)}
     if _FILES:
         _flush()
@@ -276,7 +279,7 @@ def harvest(url: str, desc: str) -> None:
     url 只认 http(s) 直链：file-api-xxx 与 data: 开头的是我们喂给模型的引用，
     不是能重新下载的地址。
     """
-    if not STICKER_ENABLE or not url or not url.startswith(("http://", "https://")):
+    if _stopping.is_set() or not STICKER_ENABLE or not url or not url.startswith(("http://", "https://")):
         return
     if parse_tags(desc) is None:
         return
@@ -292,7 +295,7 @@ def collect(url: str, desc: str) -> str | None:
     tags = parse_tags(desc)
     if tags is None:
         return None
-    got = _download_image(url)
+    got = _download_image(url, STICKER_MAX_BYTES)
     if got is None:
         return None
     data, mime = got
@@ -312,14 +315,29 @@ def _ensure_worker() -> None:
 
 
 def _loop() -> None:
-    while True:
-        url, desc = _QUEUE.get()
+    while not _stopping.is_set():
+        try:
+            url, desc = _QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            continue
         try:
             collect(url, desc)
         except Exception as e:  # 采集是顺手活，出错绝不能让线程死掉
             print(f"[表情包] 采集异常：{type(e).__name__}: {e}")
         finally:
             _QUEUE.task_done()
+
+
+def shutdown(timeout=3):
+    _stopping.set()
+    while True:
+        try:
+            _QUEUE.get_nowait()
+            _QUEUE.task_done()
+        except queue.Empty:
+            break
+    if _worker is not None:
+        _worker.join(timeout)
 
 
 def wait_idle(timeout: float = 30.0) -> bool:
@@ -355,10 +373,16 @@ def pick(query: str) -> Sticker | None:
         top = max(score for score, _ in scored)
         name = random.choice([n for score, n in scored if score == top])
         info = _FILES[name]
-        info["used"] = int(info.get("used") or 0) + 1
-        info["last_used"] = int(time.time())
-        _flush()
         return Sticker(name=name, tags=list(info["tags"]), path=str(_DIR / name))
+
+
+def mark_used(path):
+    with _LOCK:
+        info = _FILES.get(Path(path).name)
+        if info:
+            info["used"] = int(info.get("used") or 0) + 1
+            info["last_used"] = int(time.time())
+            _flush()
 
 
 def _score(tags: list[str], tokens: list[str]) -> int:
@@ -399,12 +423,14 @@ def resolve(payload: str) -> str | None:
                 base = _DIR.resolve()
             except (OSError, ValueError):
                 return None
-            if (real == base or base in real.parents) and real.is_file():
+            if real.parent == base and real.name in _FILES and real.is_file() and real.suffix.lower() in _EXT_BY_MIME.values() and not path.is_symlink():
                 return str(real)
             return None
         # 模型可能只留了文件名（把 send_sticker 给的路径截短了）
-        if text in _FILES and (_DIR / text).is_file():
-            return str(_DIR / text)
+        if text in _FILES and (_DIR / text).is_file() and not (_DIR / text).is_symlink():
+            path = (_DIR / text).resolve()
+            if path.parent == _DIR.resolve():
+                return str(path)
     return None
 
 

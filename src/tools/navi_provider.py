@@ -21,6 +21,7 @@
    步行段里**没有** destination_stop，只有 distance 与 cost.duration。
 """
 import requests
+from .. import runtime
 
 from ..config import AMAP_KEY, AMAP_POI_LIMIT, AMAP_TIMEOUT_SEC
 from . import ToolProvider
@@ -97,7 +98,7 @@ def _fmt_duration(seconds: int) -> str:
 def _fetch(url: str, params: dict) -> tuple[dict, str]:
     """发一次高德请求。返回 (响应 JSON, 错误文案)；成功时错误文案是空字符串"""
     try:
-        resp = requests.get(url, params=params, timeout=AMAP_TIMEOUT_SEC)
+        resp = requests.get(url, params=params, timeout=runtime.remaining(AMAP_TIMEOUT_SEC))
         resp.raise_for_status()
         data = resp.json()
     except requests.Timeout:
@@ -583,7 +584,7 @@ class NaviProvider(ToolProvider):
 
     @staticmethod
     def _plan_route(origin: str, destination: str, mode: str = "driving", city: str = "",
-                    city2: str = "", strategy: int = 0, waypoints: str = "",
+                    city2: str = "", strategy: int | None = None, waypoints: str = "",
                     plate: str = "") -> str:
         if not AMAP_KEY:
             return _NO_KEY_MSG
@@ -591,6 +592,22 @@ class NaviProvider(ToolProvider):
         mode = (mode or "driving").strip().lower()
         if mode not in _ROUTE_URLS:
             return f"不支持的方式「{mode}」：可选 driving / walking / bicycling / electrobike / transit。"
+
+        # https://lbs.amap.com/api/webservice/guide/api/newroute
+        if strategy is None:
+            strategy = 32 if mode == "driving" else 0
+        try:
+            if isinstance(strategy, bool) or isinstance(strategy, float) and not strategy.is_integer():
+                raise ValueError()
+            strategy = int(strategy)
+        except (TypeError, ValueError):
+            return "strategy 必须是整数。"
+        allowed = ({0, 1, 2, *range(32, 46)} if mode == "driving"
+                   else set(range(9)) if mode == "transit" else {0})
+        if strategy not in allowed:
+            return f"strategy 取值不合理：{mode} 可选 {sorted(allowed)}。"
+        if mode == "transit" and strategy == 6:
+            return "地铁图策略 6 需要起终点 POI id，本工具暂不支持，请选择其他策略。"
 
         city = (city or "").strip()
         city2 = (city2 or "").strip() or city
@@ -609,6 +626,7 @@ class NaviProvider(ToolProvider):
             # cost 才给 duration（耗时）和 tolls（过路费）：高德基础返回里没有耗时
             "show_fields": "cost",
         }
+
         if mode == "transit":
             if not city:
                 return ("公交换乘需要 city：起终点所在城市（中文名如「成都」，"
@@ -626,10 +644,9 @@ class NaviProvider(ToolProvider):
             params["city1"] = city_code
             params["city2"] = city2_code
             params["AlternativeRoute"] = 1  # 只取最推荐的一条方案，省上下文
-            if strategy:
-                params["strategy"] = strategy
+            params["strategy"] = strategy
         else:
-            if strategy:
+            if mode == "driving":
                 params["strategy"] = strategy
             if waypoints:
                 params["waypoints"] = waypoints.strip().replace("，", ",").replace(" ", "")
