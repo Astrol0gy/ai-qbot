@@ -1,171 +1,161 @@
+﻿"""渐进式技能加载：目录元数据 → 按需正文 → 按需附加文本。
+
+启动只索引 Markdown frontmatter，不缓存正文。每轮创建独立 SkillSession，
+load_skill 成功后才开放该技能声明的工具；多个已加载技能取工具并集。
+平铺 foo.md 的资源放在 foo/references 或 foo/scripts；目录形式使用 foo/SKILL.md。
+附加脚本只允许读文本，不执行。
 """
-Skill 模块
+from __future__ import annotations
 
-设计遵循 Claude Agent Skills 三层渐进式加载：
-  Level 1: skill 元数据（name + description）→ 始终注入 system prompt
-  Level 2: SKILL.md body → LLM 判定 skill 相关后完整加载
-  Level 3: 附加文件（未来: references/, scripts/）→ LLM 按需打开
-
-Skill 文件格式（.md）：
-  ---
-  name: weather
-  description: 查询天气
-  tools: web_search, fetch_url   # 可选: 该 skill 可用的工具白名单
-  ---
-
-  # 天气查询指引
-  ...具体操作流程...
-"""
-import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 SKILLS_DIR = Path(__file__).parent
-
-# 已加载的 skill
+LOAD_SKILL = "load_skill"
+READ_RESOURCE = "read_skill_resource"
+SKILL_TOOL_NAMES = frozenset({LOAD_SKILL, READ_RESOURCE})
+MAX_SKILL_BYTES = 128 * 1024
+MAX_RESOURCE_BYTES = 64 * 1024
 _SKILLS: list[dict] = []
 
 
 def _parse_frontmatter(content: str) -> tuple[dict, str]:
-    """
-    解析 Markdown 文件的 YAML frontmatter。
-    返回 (元数据字典, body 内容)。
-    简单实现，不依赖 pyyaml。
-    """
-    meta: dict = {}
-    body = content
-
-    # 检查是否以 --- 开头
-    stripped = content.lstrip()
-    if not stripped.startswith("---"):
-        return meta, content
-
-    # 找到第一个 --- 和第二个 --- 之间的内容
-    match = re.match(r"^\s*---\s*\n(.*?)\n\s*---\s*\n?(.*)$", stripped, re.DOTALL)
+    match = re.match(r"^\s*---\s*\n(.*?)\n\s*---\s*\n?(.*)$", content, re.DOTALL)
     if not match:
-        return meta, content
-
-    frontmatter_str = match.group(1)
-    body = match.group(2).strip()
-
-    # 解析 key: value
-    for line in frontmatter_str.split("\n"):
-        line = line.strip()
-        if ":" in line:
-            key, _, value = line.partition(":")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            # 解析 tools 字段为 list
-            if key == "tools" and value:
-                value = [t.strip() for t in value.split(",") if t.strip()]
-            meta[key] = value
-
-    return meta, body
+        raise ValueError("技能必须包含完整的 --- frontmatter")
+    meta = {}
+    for line in match.group(1).splitlines():
+        if line.lstrip().startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        value = value.strip().strip("\"'")
+        meta[key.strip()] = (
+            [t.strip() for t in value.split(",") if t.strip()]
+            if key.strip() == "tools" else value
+        )
+    return meta, match.group(2).strip()
 
 
-def _load_skills():
-    """扫描 skills/ 目录，加载所有 .md 文件"""
-    global _SKILLS
-    _SKILLS = []
+def _read_metadata(path: Path) -> dict:
+    """只读 frontmatter；遇到结束分隔符立即停止，不读取正文。"""
+    with path.open("rb") as stream:
+        first = stream.readline(8193).decode("utf-8-sig")
+        if first.strip() != "---":
+            raise ValueError(f"技能 {path.name} 缺少 frontmatter")
+        header = first
+        while len(header) <= 8192:
+            raw = stream.readline(8193)
+            if not raw:
+                break
+            line = raw.decode("utf-8")
+            header += line
+            if line.strip() == "---":
+                return _parse_frontmatter(header)[0]
+    raise ValueError(f"技能 {path.name} 的 frontmatter 未闭合或过长")
 
-    for filepath in SKILLS_DIR.glob("*.md"):
-        content = filepath.read_text(encoding="utf-8")
-        meta, body = _parse_frontmatter(content)
 
-        name = meta.get("name", filepath.stem)
-        description = meta.get("description", "")
-        tool_whitelist = meta.get("tools", None)  # list of tool names or None
-
-        _SKILLS.append({
+def _load_skills() -> None:
+    """原子替换目录索引；缺 tools 表示不授予业务工具，不表示全部开放。"""
+    catalog = []
+    names = set()
+    root = SKILLS_DIR.resolve()
+    for path in sorted([*SKILLS_DIR.glob("*.md"), *SKILLS_DIR.glob("*/SKILL.md")]):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError("技能文件不能指向技能目录之外")
+        meta = _read_metadata(resolved)
+        name = meta.get("name", "").strip()
+        description = meta.get("description", "").strip()
+        if not name or not description or name in names:
+            raise ValueError(f"技能 {path.name} 缺少名称/简介，或名称重复")
+        names.add(name)
+        catalog.append({
             "name": name,
             "description": description,
-            "tools": tool_whitelist,
-            "body": body,
-            "file": filepath.name,
+            "tools": tuple(meta.get("tools", ())),
+            "path": resolved,
+            "resource_dir": resolved.parent if path.name == "SKILL.md" else resolved.with_suffix(""),
         })
-        tool_info = f" [tools: {tool_whitelist}]" if tool_whitelist else ""
-        print(f"[Skill] 加载 {filepath.name} -> 「{name}」{tool_info}")
-
-
-def get_metadata_section() -> str:
-    """
-    Level 1 输出：所有 skill 的元数据摘要（仅 name + description）。
-    注入 system prompt，让 LLM 知道有哪些 skill 可用。
-    """
-    if not _SKILLS:
-        return ""
-
-    lines = []
-    for s in _SKILLS:
-        lines.append(f"- **{s['name']}**：{s['description']}")
-    descriptions = "\n".join(lines)
-
-    return (
-        "\n\n---\n"
-        "## 可用技能\n"
-        f"{descriptions}\n\n"
-        "当用户请求匹配某个技能时，严格按照该技能的指引逐步操作，不要跳过任何步骤。\n"
-        "---"
-    )
-
-
-def get_full_prompt_for_skill(skill_name: str) -> str:
-    """
-    获取指定 skill 的完整指引内容（body）。
-    目前所有 skill body 都预先注入 system prompt，此方法预留用于按需加载（Level 2）。
-    """
-    for s in _SKILLS:
-        if s["name"] == skill_name:
-            return s["body"]
-    return ""
-
-
-def get_all_skill_bodies() -> str:
-    """
-    将所有 skill 的完整 body 拼接为 system prompt 段落。
-    当前策略：全部预注入（简单直接，skill 数量少时无性能问题）。
-    未来 skill 多时可改为按需加载（Level 2）。
-    """
-    if not _SKILLS:
-        return ""
-
-    parts = []
-    for s in _SKILLS:
-        tools_note = ""
-        if s["tools"]:
-            tools_note = f"\n**该技能可用工具：** {', '.join(s['tools'])}。只能使用列出的工具。"
-        parts.append(f"### {s['name']}\n{s['body']}{tools_note}")
-
-    return "\n\n" + "\n\n".join(parts)
+    _SKILLS[:] = catalog
 
 
 def get_skill(name: str) -> dict | None:
-    """按名称查找 skill"""
-    for s in _SKILLS:
-        if s["name"] == name:
-            return s
-    return None
+    return next((s for s in _SKILLS if s["name"] == name), None)
 
 
-def get_tool_whitelist_for_prompt(user_message: str) -> set[str] | None:
-    """
-    根据用户消息匹配 skill，返回该 skill 的工具白名单。
-    目前简化实现：遍历所有 skill，如果用户消息包含 skill 名称关键词则返回其白名单。
-    未来可改为让 LLM 先选择 skill 再应用白名单。
-    """
-    for s in _SKILLS:
-        if s["tools"] and s["name"] in user_message:
-            return set(s["tools"])
-
-    # 没有匹配到 skill 或 skill 没有限制工具 → 返回 None（允许全部工具）
-    for s in _SKILLS:
-        if s["tools"]:
-            return None  # 有 skill 但没匹配到 → 先不做限制
-
-    return None
+def get_metadata_section() -> str:
+    """Level 1：只暴露名称和简介，正文由模型按需请求。"""
+    catalog = "\n".join(f"· {s['name']}：{s['description']}" for s in _SKILLS)
+    return (
+        "\n\n【技能目录：仅名称与简介】\n" + catalog + "\n"
+        "涉及某个技能的任务，先用 load_skill(name) 加载该技能，再按返回的正文执行。"
+        "不需要技能的日常聊天可直接回答。需要额外能力时继续加载对应技能，"
+        "不能仅凭旧对话或目录简介假定技能已加载。\n"
+        "业务工具只开放已加载技能声明且配置允许的范围；多个已加载技能取并集，"
+        "不是互相排斥的限制。load_skill/read_skill_resource 及适用的 reply/skip 是系统控制工具。\n"
+        "正文提到附加文件时，按需用 read_skill_resource(name, path) 读取；不要猜文件内容。\n"
+    )
 
 
-# ============================================
-# 启动时自动加载所有 .md skill
-# ============================================
+def _read_text(path: Path, limit: int) -> str:
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"文件超过 {limit} 字节读取上限")
+    return data.decode("utf-8-sig")
+
+
+class SkillSession:
+    """每轮独占：已加载技能及其工具范围，不跨群、跨轮共享权限。"""
+
+    def __init__(self, enabled_tools: set[str], registered_tools: set[str]):
+        self.enabled_tools = frozenset(enabled_tools)
+        self.registered_tools = frozenset(registered_tools)
+        self.loaded: dict[str, dict] = {}
+
+    def allowed_tools(self, controls: set[str]) -> set[str]:
+        names = set(controls)
+        for skill in self.loaded.values():
+            names.update(skill["tools"])
+        return names & self.enabled_tools
+
+    def load(self, name: str) -> str:
+        if name in self.loaded:
+            return f"技能「{name}」本轮已经加载，继续使用已有指引。"
+        skill = get_skill(name)
+        if skill is None:
+            return f"没有技能「{name}」，请使用目录中的完整名称。本次没有开放任何工具。"
+        unknown = set(skill["tools"]) - self.registered_tools
+        if unknown:
+            return f"技能「{name}」声明了未注册工具：{', '.join(sorted(unknown))}；加载失败，未开放工具。"
+        meta, body = _parse_frontmatter(_read_text(skill["path"], MAX_SKILL_BYTES))
+        if meta.get("name") != name or tuple(meta.get("tools", ())) != skill["tools"]:
+            raise ValueError("技能元数据已变化，请重启以刷新技能目录")
+        if not body:
+            raise ValueError("技能正文为空，未开放工具")
+        enabled = set(skill["tools"]) & self.enabled_tools
+        disabled = set(skill["tools"]) - self.enabled_tools
+        # 正文完整读出、校验通过才更新本轮权限，失败不会残留授权。
+        self.loaded[name] = skill
+        note = f"本技能当前开放工具：{', '.join(sorted(enabled)) or '无'}。"
+        if disabled:
+            note += f" 配置或当前通道未开放：{', '.join(sorted(disabled))}，不要调用或编造其结果。"
+        return f"【已加载技能：{name}】\n{note}\n多个已加载技能的工具可组合使用；新增工具从下一次模型请求起生效。\n\n{body}"
+
+    def read_resource(self, name: str, path: str) -> str:
+        skill = self.loaded.get(name)
+        if skill is None:
+            return f"请先 load_skill 加载「{name}」，再读取其附加文件。"
+        relative = PurePosixPath(path.replace("\\", "/"))
+        if (relative.is_absolute() or ".." in relative.parts or not relative.parts
+                or relative.parts[0] not in {"references", "scripts"}):
+            return "只允许读取本技能 references/ 或 scripts/ 内的相对路径，禁止路径越界。"
+        root = skill["resource_dir"].resolve()
+        target = (root / relative).resolve()
+        if not root.is_relative_to(SKILLS_DIR.resolve()) or not target.is_relative_to(root):
+            return "附加文件路径越界，拒绝读取。"
+        content = _read_text(target, MAX_RESOURCE_BYTES)
+        return f"【技能附加文本：{name}/{relative}】\n以下只作为文本读取，脚本不会执行。\n\n{content}"
+
+
 _load_skills()

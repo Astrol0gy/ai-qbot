@@ -27,6 +27,7 @@ DEEPSEEK_MAX_TOKENS = int(os.getenv("DEEPSEEK_MAX_TOKENS", "2048"))
 DEEPSEEK_TOP_P = float(os.getenv("DEEPSEEK_TOP_P", "1.0"))
 DEEPSEEK_ENABLE_THINKING = os.getenv("DEEPSEEK_ENABLE_THINKING", "false").lower() == "true"
 DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
+# 仅控制 web_search / fetch_url / search_images，不是所有业务工具的总开关。
 DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() == "true"
 # 单轮思考总时限（秒）：到点就放弃这一轮 —— 一条消息都不发、不写历史、退出互动窗口，
 # 之后即便 API 才返回也一律丢弃（超时才到的回答，在群里已经过时了）
@@ -123,6 +124,9 @@ AMAP_POI_LIMIT = int(os.getenv("AMAP_POI_LIMIT", "5"))
 # ============================================
 # 官方通道：QQ 开放平台机器人，只能收到 @ 消息
 OFFICIAL_ENABLE = os.getenv("OFFICIAL_ENABLE", "true").lower() == "true"
+# 打印官方通道推送的原始事件（排查字段结构用）。默认关：每条群消息都会把完整推送
+# 打进 stdout，含发送者 openid 与消息原文，线上既刷屏又泄露隐私。
+OFFICIAL_DEBUG_RAW_EVENTS = os.getenv("OFFICIAL_DEBUG_RAW_EVENTS", "false").lower() == "true"
 # OneBot 通道：对接 NapCatQQ 等协议端，可收到群内全部消息
 ONEBOT_ENABLE = os.getenv("ONEBOT_ENABLE", "false").lower() == "true"
 
@@ -189,6 +193,51 @@ TRIGGER_IMAGE_CACHE_SIZE = int(os.getenv("TRIGGER_IMAGE_CACHE_SIZE", "200"))
 
 def validate():
     """按启用的通道检查必要配置是否已填写"""
+    import math
+    from urllib.parse import urlsplit
+    bounds = {
+        "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
+        "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
+        "DEEPSEEK_ROUND_TIMEOUT_SEC": (0.01, 600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
+        "DEEPSEEK_API_COOLDOWN_SEC": (0, 3600), "VISION_TIMEOUT_SEC": (0.01, 120),
+        "VISION_FAIL_BACKOFF_SEC": (0, 86400), "STICKER_MAX_FILES": (1, 100000),
+        "STICKER_MAX_BYTES": (1, 64 * 1024 * 1024), "STICKER_MAX_PER_REPLY": (0, 10),
+        "AMAP_TIMEOUT_SEC": (0.01, 60), "AMAP_POI_LIMIT": (1, 25),
+        "ONEBOT_API_TIMEOUT": (0.01, 120), "ONEBOT_MAX_CONCURRENCY": (1, 32),
+        "ONEBOT_IMAGE_CONCURRENCY": (1, 8), "ONEBOT_HEARTBEAT": (1, 600),
+        "ONEBOT_DEDUP_SIZE": (1, 100000), "ONEBOT_MAX_IMAGES": (1, 10),
+        "ONEBOT_PROBE_SEC": (0, 86400), "ONEBOT_PROBE_FAILS": (1, 100),
+        "ONEBOT_OFFLINE_ALERT_SEC": (1, 86400), "ONEBOT_DOWN_ALERT_SEC": (0, 86400),
+        "TRIGGER_PROBABILITY": (0, 1), "TRIGGER_ACTIVE_TIMEOUT_SEC": (1, 86400),
+        "TRIGGER_MIN_LEN": (0, 10000), "TRIGGER_CONTEXT_MESSAGES": (1, 128),
+        "TRIGGER_IMAGE_RATE_PER_MIN": (0, 10000), "TRIGGER_IMAGE_CACHE_SIZE": (1, 10000),
+    }
+    for name, (low, high) in bounds.items():
+        value = globals()[name]
+        if not math.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{name} 必须在 {low}..{high} 范围内，收到 {value!r}")
+    for name in ("OFFICIAL_ENABLE", "ONEBOT_ENABLE", "OFFICIAL_DEBUG_RAW_EVENTS", "DEEPSEEK_ENABLE_THINKING", "DEEPSEEK_ENABLE_SEARCH", "VISION_ENABLE_THINKING", "STICKER_ENABLE", "TRIGGER_RECOGNIZE_IMAGES"):
+        if os.getenv(name, "true").lower() not in ("true", "false"):
+            raise ValueError(f"{name} 只能填写 true 或 false")
+    if VISION_FILES_API not in ("auto", "always", "off"):
+        raise ValueError("VISION_FILES_API 只能填写 auto/always/off")
+    if VISION_DETAIL not in ("auto", "low", "high", "original"):
+        raise ValueError("VISION_DETAIL 只能填写 auto/low/high/original")
+    if DEEPSEEK_REASONING_EFFORT not in ("high", "max"):
+        raise ValueError("DEEPSEEK_REASONING_EFFORT 只能填写 high 或 max")
+    if os.getenv("TRUST_PROXY_URL", "").strip():
+        proxy = urlsplit(os.environ["TRUST_PROXY_URL"])
+        if proxy.scheme not in ("http", "https") or not proxy.hostname:
+            raise ValueError("TRUST_PROXY_URL 必须是有效的 http/https 代理地址")
+    for name in ("DEEPSEEK_BASE_URL", "VISION_BASE_URL", "DEEPSEEK_ANTHROPIC_BASE_URL", "IMAGE_GEN_ENDPOINT"):
+        parsed = urlsplit(globals()[name])
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"{name} 必须是有效的 http/https 地址")
+    if ONEBOT_ENABLE:
+        parsed = urlsplit(ONEBOT_WS_URL)
+        if parsed.scheme not in ("ws", "wss") or not parsed.hostname:
+            raise ValueError("ONEBOT_WS_URL 必须是有效的 ws/wss 地址")
+        _ = parsed.port  # Validate port syntax, including IPv6 authorities.
     missing = []
     enabled = []
 

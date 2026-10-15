@@ -3,12 +3,14 @@
 提供 manage_user_profile 工具，LLM 自主决定记住/删除用户的使用偏好和习惯。
 """
 from .. import user_profile
-from . import ToolProvider
+from . import ChatContext, ToolProvider
 
 
 class ProfileProvider(ToolProvider):
     name = "profile"
     description = "用户画像管理工具：manage_user_profile（记住/删除/查看用户的使用偏好和习惯）"
+    # 画像按 (群, 用户) 分档，必须知道当前是谁在说话 → 走显式会话上下文，不读全局变量
+    needs_context = True
 
     def get_tools(self) -> list[dict]:
         return [
@@ -41,6 +43,7 @@ class ProfileProvider(ToolProvider):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "source_message_id": {"type": "string", "description": "要管理画像的用户发出的消息 id；多人上下文必须指定，服务端校验作者"},
                         "action": {
                             "type": "string",
                             "enum": ["remember", "forget", "list"],
@@ -60,19 +63,21 @@ class ProfileProvider(ToolProvider):
         ]
 
     @staticmethod
-    def _manage_profile(action: str, info: str = "") -> str:
+    def _manage_profile(context: ChatContext, action: str, info: str = "", source_message_id: str = "") -> str:
+        user_id, user_name = context.actor(source_message_id)
+        group_id = context.conv_id
         if action == "remember":
             if not info:
                 return "请提供要记住的信息内容。"
-            return user_profile.remember_info(info)
+            return user_profile.remember_info(info, group_id, user_id, user_name)
 
         elif action == "forget":
             if not info:
                 return "请提供要忘记的信息关键词，或使用 'all' 清除所有。"
-            return user_profile.forget_info(info)
+            return user_profile.forget_info(info, group_id, user_id)
 
         elif action == "list":
-            return user_profile.list_profile()
+            return user_profile.list_profile(group_id, user_id)
 
         else:
             return f"未知操作：{action}，支持 remember / forget / list"

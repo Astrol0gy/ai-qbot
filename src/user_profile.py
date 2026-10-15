@@ -8,21 +8,14 @@
 import os
 import re
 from datetime import datetime
+from . import runtime
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "user_profiles")
 
-# 当前对话上下文（每次 LLM 调用前由 deepseek_client 设置）
-_current_group_id: str = ""
-_current_user_id: str = ""
-_current_user_name: str = ""
-
-
-def set_current_context(group_id: str, user_id: str, user_name: str = ""):
-    """设置当前对话的群、用户 ID 和昵称，供 profile 工具使用"""
-    global _current_group_id, _current_user_id, _current_user_name
-    _current_group_id = group_id
-    _current_user_id = user_id
-    _current_user_name = user_name or ""
+# 这里曾经有 _current_group_id / _current_user_id / _current_user_name 三个模块级全局变量，
+# 由 deepseek_client 在每轮对话前用 set_current_context() 覆盖。不同群是可以并发跑同一轮
+# chat 的，于是"设置全局 → await → 工具读全局"之间会被别的群插进来改写，画像/记忆就写错人。
+# 现在改为所有接口都从调用链上显式接收 (group_id, user_id, user_name)，不再有全局状态。
 
 
 # ============================================
@@ -50,177 +43,100 @@ def _detect_personal_data(info: str) -> str | None:
 # ============================================
 # 文件读写
 # ============================================
+def _safe_component(raw_id: str) -> str:
+    return "id-" + str(raw_id).encode("utf-8").hex()
+
+
 def _get_profile_path(group_id: str, user_id: str) -> str:
-    os.makedirs(PROFILES_DIR, exist_ok=True)
-    safe_id = re.sub(r'[<>:"/\\|?*]', "_", user_id)
-    return os.path.join(PROFILES_DIR, f"{group_id}_{safe_id}.md")
+    return os.path.join(PROFILES_DIR, _safe_component(group_id), _safe_component(user_id) + ".md")
 
 
-def _ensure_header(path: str, user_name: str = ""):
-    """确保文件有头部标题、时间和用户名（如已知）"""
-    if not os.path.exists(path):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        header = f"# 用户画像\n创建时间: {timestamp}\n"
-        if user_name:
-            header += f"用户名: {user_name}\n"
-        header += "\n"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(header)
+def _header(gid, uid, name):
+    import json
+    name = str(name).replace("\r", " ").replace("\n", " ")[:100]
+    return ("# 用户画像\n标识: " + json.dumps([gid, uid], ensure_ascii=False)
+            + f"\n用户名: {name}\n创建时间: {datetime.now():%Y-%m-%d %H:%M}\n\n")
 
 
-# ============================================
-# 对外接口
-# ============================================
-def remember_info(info: str, group_id: str = "", user_id: str = "") -> str:
-    """
-    记住用户的一条信息。
-    如果 group_id/user_id 为空，使用当前上下文。
-    返回操作结果描述。
-    """
-    gid = group_id or _current_group_id
-    uid = user_id or _current_user_id
-    if not gid or not uid:
+@runtime.serialized
+def remember_info(info: str, group_id: str, user_id: str, user_name: str = "") -> str:
+    if not group_id or not user_id:
         return "无法确定当前用户，请稍后重试。"
-
-    # 隐私检查
     personal_type = _detect_personal_data(info)
     if personal_type:
-        return (
-            f"【隐私保护】检测到{personal_type}信息，我不会记录。\n"
-            "我只记录使用偏好（如回答风格、语气、关注话题），不存储任何个人隐私数据。"
-        )
-
-    path = _get_profile_path(gid, uid)
-    _ensure_header(path, _current_user_name)
-
-    # 去重
-    stripped = info.strip()
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    if stripped in content:
-        return f"这条信息已经记录过了。"
-
-    # 追加
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"- [{timestamp}] {stripped}\n")
-
-    return f"已记住：{stripped}"
+        return f"【隐私保护】检测到{personal_type}信息，我不会记录。只记录使用偏好。"
+    info = info.strip().replace("\n", " ")
+    if not info:
+        return "请提供要记住的信息。"
+    if len(info) > 1000:
+        return "单条偏好最多 1000 字。"
+    path = _get_profile_path(group_id, user_id)
+    content = runtime.read_text(path) or _header(group_id, user_id, user_name)
+    records = [line for line in content.splitlines() if line.startswith("- [")]
+    if any(line.split("] ", 1)[-1] == info for line in records):
+        return "这条信息已经记录过了。"
+    if len(records) >= 100:
+        return "已达 100 条偏好上限，请先删除旧记录。"
+    runtime.write_text(path, content + f"- [{datetime.now():%Y-%m-%d %H:%M}] {info}\n")
+    return f"已记住：{info}"
 
 
-def forget_info(info: str, group_id: str = "", user_id: str = "") -> str:
-    """
-    忘记用户的一条信息（模糊关键词匹配）。
-    返回操作结果。
-    """
-    gid = group_id or _current_group_id
-    uid = user_id or _current_user_id
-    if not gid or not uid:
-        return "无法确定当前用户。"
-
-    # 特殊指令：清除所有
+@runtime.serialized
+def forget_info(info: str, group_id: str, user_id: str) -> str:
     if info.strip().lower() in ("all", "全部", "所有", "清空", "清除"):
-        return forget_all(gid, uid)
-
-    path = _get_profile_path(gid, uid)
-    if not os.path.exists(path):
+        return forget_all(group_id, user_id)
+    path = _get_profile_path(group_id, user_id)
+    content = runtime.read_text(path)
+    if content is None:
         return "你还没有任何已记录的信息。"
-
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    new_lines = []
-    removed = []
-    for line in lines:
-        if line.strip().startswith("- [") and info in line:
-            removed.append(line.strip())
-        else:
-            new_lines.append(line)
-
-    if not removed:
+    lines = content.splitlines(keepends=True)
+    kept = [line for line in lines if not (line.startswith("- [") and info in line)]
+    count = len(lines) - len(kept)
+    if not count:
         return f"没有找到包含「{info}」的记录。"
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-
-    count = len(removed)
+    runtime.write_text(path, "".join(kept))
     return f"已删除 {count} 条匹配的记录。"
 
 
+@runtime.serialized
 def forget_all(group_id: str, user_id: str) -> str:
-    """清除用户全部画像"""
     path = _get_profile_path(group_id, user_id)
-    if os.path.exists(path):
-        os.remove(path)
-        return "已清除所有记录。"
-    return "你还没有任何已记录的信息。"
+    if runtime.read_text(path) is None:
+        return "你还没有任何已记录的信息。"
+    runtime.write_text(path, None)
+    return "已清除所有记录。"
 
 
-def list_profile(group_id: str = "", user_id: str = "") -> str:
-    """列出当前用户的全部画像记录"""
-    gid = group_id or _current_group_id
-    uid = user_id or _current_user_id
-    if not gid or not uid:
-        return "无法确定当前用户。"
-
-    path = _get_profile_path(gid, uid)
-    if not os.path.exists(path):
-        return "暂无任何记录。"
-
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    lines = [l.strip() for l in content.splitlines() if l.strip().startswith("- [")]
-    if not lines:
-        return "暂无记录。"
-
-    return "\n".join(lines)
+def list_profile(group_id: str, user_id: str) -> str:
+    content = runtime.read_text(_get_profile_path(group_id, user_id)) or ""
+    return "\n".join(line.strip() for line in content.splitlines() if line.startswith("- [")) or "暂无记录。"
 
 
-def get_profile_for_prompt(group_id: str = "", user_id: str = "") -> str:
-    """
-    获取当前群所有用户的画像文本，用于注入 LLM system prompt。
-    对话按群共享，因此注入群内每位用户的偏好（带用户名），供模型区分说话者。
-    如果没有记录，返回空字符串。
-    """
-    gid = group_id or _current_group_id
-    if not gid:
+def get_profile_for_prompt(group_id: str) -> str:
+    import json
+    directory = os.path.join(PROFILES_DIR, _safe_component(group_id))
+    if not os.path.isdir(directory):
         return ""
-
-    prefix = f"{gid}_"
-    try:
-        os.makedirs(PROFILES_DIR, exist_ok=True)
-        files = sorted(f for f in os.listdir(PROFILES_DIR) if f.startswith(prefix) and f.endswith(".md"))
-    except Exception:
-        return ""
-
-    sections = []
-    for fname in files:
-        path = os.path.join(PROFILES_DIR, fname)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception:
+    sections, remaining = [], 6000
+    for filename in sorted(os.listdir(directory))[:100]:
+        if not filename.endswith(".md"):
             continue
-        records = [l.strip() for l in content.splitlines() if l.strip().startswith("- [")]
+        content = runtime.read_text(os.path.join(directory, filename)) or ""
+        lines = content.splitlines()
+        identity = next((line[4:] for line in lines if line.startswith("标识: ")), "")
+        try:
+            gid, uid = json.loads(identity)
+        except (ValueError, TypeError):
+            continue
+        if gid != group_id:
+            continue
+        records = [line for line in lines if line.startswith("- [")]
         if not records:
             continue
-        # 提取文件头部的用户名，缺失时用 user_id 尾号
-        user_name = ""
-        for line in content.splitlines():
-            if line.strip().startswith("用户名:"):
-                user_name = line.split(":", 1)[1].strip()
-                break
-        if not user_name:
-            uid = fname[len(prefix):-3]
-            user_name = f"用户{uid[-4:]}"
-        sections.append(f"【{user_name} 的偏好】\n" + "\n".join(records))
-
-    if not sections:
-        return ""
-
-    return (
-        "\n\n【群内用户的画像 — 已记录的偏好和习惯】\n"
-        + "\n\n".join(sections)
-        + "\n请根据这些信息，结合当前说话者调整回答风格和内容。"
-    )
+        name = next((line[5:] for line in lines if line.startswith("用户名: ")), "") or f"用户{uid[-4:]}"
+        section = f"【{name} 用户id={uid} 的偏好】\n" + "\n".join(records)
+        sections.append(section[:remaining])
+        remaining -= len(section)
+        if remaining <= 0:
+            break
+    return "\n\n【群内用户的画像】\n" + "\n\n".join(sections) if sections else ""

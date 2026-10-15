@@ -9,9 +9,9 @@
   已经 reply 过的回复：队列里有回复时，skip 只表示"不再补充"，那些回复照常发出。
 
 它们**不发消息**，只是攒下这一轮"要说什么、引用谁"，等模型思考结束由
-``channels/core.py`` 用 sender 逐条发出。因此 handler 需要一份**每轮新建的会话上下文**
-（:class:`ReplyOutbox`），在工具元信息里声明 ``needs_context=True``，由
-``tools.execute(name, args, context=outbox)`` 显式传入。
+``channels/core.py`` 用 sender 逐条发出。因此 handler 需要一个**每轮新建的会话上下文**
+（:class:`ChatContext`，待发消息箱在它的 ``outbox`` 字段里），在工具元信息里声明
+``needs_context=True``，由 ``tools.execute(name, args, context=ctx)`` 显式传入。
 
 上下文**绝不存进 Provider 或注册表**：注册表是全局单例，把"待发消息"存进去，两个群
 同时说话就会串台（A 群的话发到 B 群）。所以状态跟着调用走，不跟着对象走。
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import ToolProvider
+from . import ChatContext, ToolProvider
 
 REPLY_TOOL = "reply"
 SKIP_TOOL = "skip"
@@ -30,9 +30,14 @@ SKIP_TOOL = "skip"
 #: 本 Provider 的工具名（普通群聊唤醒路径按它显式注入；私聊、跑团不要注入）
 CHAT_TOOL_NAMES = frozenset({REPLY_TOOL, SKIP_TOOL})
 
-#: 单轮最多表态几次：一批里可能好几个人同时说话，要给"各回一条"留足额度，
+#: 单轮最多 reply 几次：一批里可能好几个人同时说话，要给"各回一条"留足额度，
 #: 同时防止模型没完没了地"补一句"烧钱
 MAX_CHAT_CALLS = 6
+
+#: skip 单独给一个小额度。它只是"本轮不开口"的一个标记，调一次就够了；
+#: 过去跟 reply 一样给 6 次，于是一轮理论上能花 12 次工具调用（reply 6 + skip 6），
+#: 全是白烧的往返。给 2 是留一点余量（同一批回复里重复表态不至于报错），不再给足额。
+MAX_SKIP_CALLS = 2
 
 
 @dataclass
@@ -61,7 +66,7 @@ class ReplyOutbox:
 
 
 class ChatProvider(ToolProvider):
-    """控制类工具：reply / skip（需要调用方传入本轮的会话上下文）"""
+    """控制类工具：reply / skip（hidden：只在群聊唤醒路径按白名单注入；需要会话上下文）"""
 
     name = "chat"
     description = "回答与表态：开不开口、说什么、引用谁"
@@ -95,6 +100,7 @@ class ChatProvider(ToolProvider):
                 "handler": self._reply,
                 "max_calls": MAX_CHAT_CALLS,
                 "needs_context": True,
+                "hidden": True,   # 只在普通群聊唤醒路径按白名单注入，不进默认工具列表
             },
             {
                 "name": SKIP_TOOL,
@@ -106,15 +112,25 @@ class ChatProvider(ToolProvider):
                 ),
                 "parameters": {"type": "object", "properties": {}},
                 "handler": self._skip,
-                "max_calls": MAX_CHAT_CALLS,
+                "max_calls": MAX_SKIP_CALLS,
                 "needs_context": True,
+                "hidden": True,
             },
         ]
 
     # ------------------------------------------------------------------
     # handler：第一个参数是本轮的会话上下文（注册表按 needs_context 传入）
     @staticmethod
-    def _reply(outbox: ReplyOutbox, text: str = "", reply_to: str = "") -> str:
+    def _outbox_of(context: ChatContext) -> ReplyOutbox | None:
+        """表态箱在 ChatContext 里；私聊/跑团等路径不注入这两个工具，也不该走到这里"""
+        outbox = getattr(context, "outbox", None)
+        return outbox if isinstance(outbox, ReplyOutbox) else None
+
+    @classmethod
+    def _reply(cls, context: ChatContext, text: str = "", reply_to: str = "") -> str:
+        outbox = cls._outbox_of(context)
+        if outbox is None:
+            return "本轮没有可用的表态通道（reply 只在群聊唤醒路径注入），本次调用没有生效。"
         if not str(text).strip():
             return "reply 缺少 text，没有记录任何内容。"
         content = str(text).strip()
@@ -133,8 +149,11 @@ class ChatProvider(ToolProvider):
             "（不用再调 skip 收尾：不再调用工具，本轮就结束了）"
         )
 
-    @staticmethod
-    def _skip(outbox: ReplyOutbox) -> str:
+    @classmethod
+    def _skip(cls, context: ChatContext) -> str:
+        outbox = cls._outbox_of(context)
+        if outbox is None:
+            return "本轮没有可用的表态通道（skip 只在群聊唤醒路径注入），本次调用没有生效。"
         # skip = 本轮不开口，但它**不撤销**已经攒下的回复。
         # 模型常把 skip 当"这轮我说完了"用；撤销会让它撤了又重发（真机上出现过
         # reply×2 → skip → 又 reply×2：群里结果没错，却白烧一次调用、多拖十几秒，
@@ -151,6 +170,7 @@ class ChatProvider(ToolProvider):
 __all__ = [
     "CHAT_TOOL_NAMES",
     "MAX_CHAT_CALLS",
+    "MAX_SKIP_CALLS",
     "REPLY_TOOL",
     "SKIP_TOOL",
     "ChatProvider",
