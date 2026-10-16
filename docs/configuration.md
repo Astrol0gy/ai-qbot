@@ -54,6 +54,7 @@
 | `DEEPSEEK_ENABLE_THINKING` | V4 深度思考模式 | `false` |
 | `DEEPSEEK_REASONING_EFFORT` | 思考强度 (`high`/`max`) | `high` |
 | `DEEPSEEK_ENABLE_SEARCH` | 网页搜索/抓取与搜图；不控制画像、跑团、导航、生图等其他能力 | `false` |
+| `TOOL_CALL_NOTICE_SEC` | 每次工具执行的提示阈值（秒），提示对应中文技能名并继续等待 | `30` |
 | `DEEPSEEK_THINKING_NOTICE_SEC` | 长考提示阈值（秒），提示一次后继续等待；兼容旧 `DEEPSEEK_ROUND_TIMEOUT_SEC` | `60` |
 | `DEEPSEEK_API_FAIL_LIMIT` | 连续失败几次后熔断（不再发起请求，快速放弃本轮） | `3` |
 | `DEEPSEEK_API_COOLDOWN_SEC` | 熔断后冷却多少秒 | `30` |
@@ -121,12 +122,12 @@
   **不替高德说「已规避」**（`restriction="0"` 就是没有限行信息）。
 
 **失败怎么降级**：Key 无效 / 无权限 / 配额用尽这类重试没意义，工具会直接说明原因并让模型别再试；限流（QPS 超限）单独说「稍等一下再试」，
-不会被误判成 Key 报废。单次请求读超时 `AMAP_TIMEOUT_SEC`（默认 8 秒），超了就这一轮说查不到，不拖住对话。
+不会被误判成 Key 报废。`AMAP_TIMEOUT_SEC`（默认 8 秒）限制建立连接的等待；连接成功后继续等待响应，工具提示阈值由 `TOOL_CALL_NOTICE_SEC` 控制。
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `AMAP_KEY` | 高德 Web 服务 Key（需开通「搜索POI 2.0」「路径规划 2.0」） | 空（未配置则两个工具都回报没配置） |
-| `AMAP_TIMEOUT_SEC` | 单次请求读超时（秒） | `8` |
+| `AMAP_TIMEOUT_SEC` | 单次请求连接超时（秒） | `8` |
 | `AMAP_POI_LIMIT` | 每次搜索默认返回几条（1~25） | `5` |
 
 `tests/navi_check.py` 把这条链路钉住（全离线，只打桩高德的 HTTP 请求，走真 registry）：

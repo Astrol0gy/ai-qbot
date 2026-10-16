@@ -9,6 +9,7 @@ python tests/review_regressions.py
 python tests/architecture_check.py
 python tests/net_proxy_check.py
 python tests/long_thinking_check.py
+python tests/progress_timing_check.py
 python tests/logging_check.py
 python tests/message_split_check.py
 python tests/skill_loading_check.py
