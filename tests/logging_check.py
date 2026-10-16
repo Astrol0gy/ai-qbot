@@ -42,19 +42,20 @@ class LoggingCases(unittest.IsolatedAsyncioTestCase):
         events = records(text)
         self.assertTrue(any(e['event'] == 'tool.finish' and e['tool'] == 'load_skill' for e in events))
 
-    async def test_timeout_has_one_terminal_event_and_request_stage(self):
+    async def test_long_thinking_has_one_terminal_event_after_completion(self):
         async def slow(*args, **kwargs):
-            await asyncio.sleep(2)
+            await asyncio.sleep(.04)
+            return '答案'
         output = io.StringIO()
-        with patch.object(core, 'chat', slow), patch.object(core, 'DEEPSEEK_ROUND_TIMEOUT_SEC', .01), contextlib.redirect_stdout(output):
+        with patch.object(core, 'chat', slow), patch.object(core, 'DEEPSEEK_THINKING_NOTICE_SEC', .01), contextlib.redirect_stdout(output):
             await core.handle_message(IncomingMessage(channel='onebot', conv_id='g', user_id='a',
                 message_id='102', text='在吗', is_at_bot=True), audit.Sender())
             await asyncio.sleep(.01)
         ends = [e for e in records(output.getvalue()) if e['event'] == 'message.finish']
         self.assertEqual(len(ends), 1)
-        self.assertEqual(ends[0]['status'], 'timeout')
+        self.assertEqual(ends[0]['status'], 'ok')
         self.assertEqual(ends[0]['message_id'], '102')
-        self.assertIn('stage', ends[0])
+        self.assertTrue(any(e['event'] == 'model.round.long_running' for e in records(output.getvalue())))
 
     async def test_parallel_messages_have_separate_trace_ids(self):
         async def answer(*args, **kwargs):
@@ -91,20 +92,21 @@ class LoggingCases(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('sensitive-12345', console.getvalue())
         self.assertNotIn('unsafe', console.getvalue())
 
-    async def test_real_model_request_timeout_identifies_active_stage(self):
+    async def test_real_model_request_error_identifies_active_stage(self):
         from types import SimpleNamespace as NS
         async def slow(**kwargs):
-            await asyncio.sleep(2)
+            await asyncio.sleep(.04)
+            raise ConnectionError('service disconnected')
         output = io.StringIO()
-        with patch.object(dc, 'client', NS(chat=NS(completions=NS(create=slow)))), patch.object(core, 'DEEPSEEK_ROUND_TIMEOUT_SEC', .02), contextlib.redirect_stdout(output):
+        with patch.object(dc, 'client', NS(chat=NS(completions=NS(create=slow)))), patch.object(core, 'DEEPSEEK_THINKING_NOTICE_SEC', .02), contextlib.redirect_stdout(output):
             await core.handle_message(IncomingMessage(channel='onebot', conv_id='g', user_id='a',
                 message_id='103', text='在吗', is_at_bot=True), audit.Sender())
             await asyncio.sleep(.01)
         events = records(output.getvalue())
         self.assertTrue(any(e['event'] == 'model.request.start' for e in events))
         end = next(e for e in events if e['event'] == 'message.finish')
-        self.assertEqual(end['stage'], 'model.request')
-        self.assertEqual(end['status'], 'timeout')
+        self.assertTrue(any(e['event'] == 'model.round.finish' and e.get('status') == 'error' for e in events))
+        self.assertEqual(end['status'], 'error')
 
     async def test_local_command_records_failed_delivery(self):
         class RejectedSender:

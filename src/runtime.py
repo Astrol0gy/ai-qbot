@@ -144,7 +144,7 @@ class RoundLease:
     def __init__(self, conv_id, timeout):
         self.conv_id = conv_id
         self.id = uuid.uuid4().hex
-        self.deadline = time.monotonic() + timeout
+        self.deadline = float("inf") if timeout is None else time.monotonic() + timeout
         self.valid = True
         self.writes = {}
         self.after_commit = []

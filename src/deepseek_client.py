@@ -23,7 +23,6 @@ from .config import (
     DEEPSEEK_ENABLE_THINKING,
     DEEPSEEK_REASONING_EFFORT,
     DEEPSEEK_ENABLE_SEARCH,
-    DEEPSEEK_ROUND_TIMEOUT_SEC,
     DEEPSEEK_API_FAIL_LIMIT,
     DEEPSEEK_API_COOLDOWN_SEC,
     BOT_SYSTEM_PROMPT,
@@ -46,17 +45,16 @@ from . import campaign_state
 from .observability import log_event, stage, tool_arguments
 
 # 异步客户端。
-# 这里只管**单次请求**的上限；真正的总时限在 core 里（到点就放弃这一轮，晚到的回答一律
-# 作废）。所以既不能让一次请求无限等（SDK 默认 read=600s），也不能让 SDK 悄悄重试出
-# 一堆"晚到的回答"—— 重试 1 次够应付抖动，剩下的交给 core 的总时限。
+# 长考等待不设读取截止时间；连接、写入与连接池仍有网络超时。
+# 出错或主动取消时仍撤销轮次，不提交失效状态。
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url=DEEPSEEK_BASE_URL,
     timeout=Timeout(
         connect=5.0,
-        read=DEEPSEEK_ROUND_TIMEOUT_SEC,
-        write=DEEPSEEK_ROUND_TIMEOUT_SEC,
-        pool=DEEPSEEK_ROUND_TIMEOUT_SEC,
+        read=None,
+        write=30.0,
+        pool=10.0,
     ),
     max_retries=1,
 )
@@ -71,7 +69,7 @@ _conversations: dict[str, list[dict]] = defaultdict(list)
 # 线上事故（2026-10-15 日志）：DeepSeek 服务端那段时间在挂（日志里有 503 Service is too
 # busy），而这里没有任何兜底 —— 每一轮都规规矩矩地硬等满 60 秒才放弃，群里连着几轮都
 # 等不到回复，用户看到的就是「bot 哑了」。连续失败到阈值就进冷却，冷却期内不再发请求、
-# 直接放弃本轮：不回话也比两分钟后才回话强，而且不占着会话锁。
+# 直接结束本轮，避免故障请求继续占用会话锁。长考本身不触发熔断。
 # ============================================
 _fail_streak = 0
 _cooldown_until = 0.0
@@ -343,9 +341,8 @@ async def _chat_round(
                     all_blocked = False
                     _tool_call_counts[tool_name] = count + 1
                     # 工具实现全是同步阻塞的（requests，单次 8~10s）。直接在事件循环里调，
-                    # 一次高德/搜索往返就把**所有群、两条通道**一起冻住 —— 连 core 那道 60 秒
-                    # 总时限也一起失效（asyncio.wait 的 timeout 靠事件循环计时，循环被堵住时
-                    # 定时器根本轮不到触发）。丢进工作线程后循环保持可用，闸门才算真存在。
+                    # 一次高德/搜索往返就把所有群、两条通道一起冻住，长考提示与取消也无法
+                    # 及时处理。丢进工作线程后，事件循环才能继续处理其他会话和定时器。
                     with stage('tool', tool=tool_name, iteration=round_num,
                             arguments=tool_arguments(tc.function.arguments)):
                         result = await runtime.run_blocking(
@@ -600,7 +597,7 @@ def commit_delivery(lease, text):
 async def chat(*args, **kwargs):
     if runtime.current() is not None:
         return await _chat_round(*args, **kwargs)
-    lease = runtime.RoundLease(args[0] if args else kwargs["group_id"], DEEPSEEK_ROUND_TIMEOUT_SEC)
+    lease = runtime.RoundLease(args[0] if args else kwargs["group_id"], None)
     with runtime.use(lease):
         try:
             reply = await _chat_round(*args, **kwargs)

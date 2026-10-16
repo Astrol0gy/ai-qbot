@@ -29,12 +29,12 @@ DEEPSEEK_ENABLE_THINKING = os.getenv("DEEPSEEK_ENABLE_THINKING", "false").lower(
 DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
 # 仅控制 web_search / fetch_url / search_images，不是所有业务工具的总开关。
 DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() == "true"
-# 单轮思考总时限（秒）：到点就放弃这一轮 —— 一条消息都不发、不写历史、退出互动窗口，
-# 之后即便 API 才返回也一律丢弃（超时才到的回答，在群里已经过时了）
+# 兼容旧配置名：现在只表示长考提示阈值，不再作为整轮取消时限。
 DEEPSEEK_ROUND_TIMEOUT_SEC = float(os.getenv("DEEPSEEK_ROUND_TIMEOUT_SEC", "60"))
-# 服务端不可用时的熔断：连续失败（超时 / 5xx / 连接失败）到 API_FAIL_LIMIT 次后，
-# 进入 API_COOLDOWN_SEC 秒冷却期，期间不再发起请求、直接放弃本轮 —— 与其让每轮都
-# 硬等 60 秒才放弃，不如快速失败（不回话也比两分钟后才回话强）。
+DEEPSEEK_THINKING_NOTICE_SEC = float(os.getenv("DEEPSEEK_THINKING_NOTICE_SEC", str(DEEPSEEK_ROUND_TIMEOUT_SEC)))
+# 服务端不可用时的熔断：连续失败（请求异常 / 5xx / 连接失败）到 API_FAIL_LIMIT 次后，
+# 进入 API_COOLDOWN_SEC 秒冷却期，期间不再发起请求，避免持续请求已明确故障的服务。
+# 长考本身不计入失败。
 DEEPSEEK_API_FAIL_LIMIT = int(os.getenv("DEEPSEEK_API_FAIL_LIMIT", "3"))
 DEEPSEEK_API_COOLDOWN_SEC = float(os.getenv("DEEPSEEK_API_COOLDOWN_SEC", "30"))
 # DeepSeek 官方内置 web search（Anthropic 兼容端点）
@@ -75,7 +75,7 @@ VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").lower() ==
 #   off = 只用直传 URL / base64，超过 32MiB 直接放弃
 VISION_FILES_API = os.getenv("VISION_FILES_API", "auto").strip().lower()
 # 单次看图请求的读超时（秒）。看图是「给对话做配菜」的活，不能拖住整轮：默认的 600s
-# 会在服务端半死时把一轮挂到 60 秒超时放弃，所以这里给一个短上限。
+# 会在服务异常时长时间拖延文字回复，所以这里给一个短上限。
 VISION_TIMEOUT_SEC = float(os.getenv("VISION_TIMEOUT_SEC", "25"))
 # 识别失败的退避窗口（秒）：同一张图在这个窗口内不再下载、不再调用。线上日志的教训是
 # 「失败不缓存 → 每次唤醒重新下载重试」，白白拖慢整轮。
@@ -198,7 +198,7 @@ def validate():
     bounds = {
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
-        "DEEPSEEK_ROUND_TIMEOUT_SEC": (0.01, 600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
+        "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
         "DEEPSEEK_API_COOLDOWN_SEC": (0, 3600), "VISION_TIMEOUT_SEC": (0.01, 120),
         "VISION_FAIL_BACKOFF_SEC": (0, 86400), "STICKER_MAX_FILES": (1, 100000),
         "STICKER_MAX_BYTES": (1, 64 * 1024 * 1024), "STICKER_MAX_PER_REPLY": (0, 10),

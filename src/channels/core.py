@@ -7,7 +7,7 @@
 import asyncio
 import re
 
-from ..config import DEEPSEEK_ROUND_TIMEOUT_SEC, STICKER_MAX_PER_REPLY
+from ..config import DEEPSEEK_THINKING_NOTICE_SEC, STICKER_MAX_PER_REPLY
 from ..deepseek_client import (
     api_cooldown_left,
     chat,
@@ -127,7 +127,7 @@ async def _image_text(msg: IncomingMessage, question: str) -> str | None:
             descs.append(desc)
 
     # 识别不出来的图留中性占位（见 IMAGE_UNAVAILABLE）：主模型要知道「用户确实发过图」，
-    # 但不能拿到「识别失败」四个字去琢磨 —— 那会白烧思考预算，把一轮拖过 60 秒超时
+    # 但不能拿到「识别失败」四个字去琢磨 —— 那会白烧思考预算，拖延本轮回复
     # （线上日志实测：思考第一段就在纠结「图没识别出来，我该不该提一句」）。
     # 描述里的「标签：…」行是给表情包库归档用的，不进上下文（见 stickers_utils.py）。
     return "\n\n".join(
@@ -283,9 +283,9 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         outcome('probe_busy')
         gate.release()
         return
-    lease = runtime.RoundLease(msg.conv_id, DEEPSEEK_ROUND_TIMEOUT_SEC)
+    lease = runtime.RoundLease(msg.conv_id, None)
     set_round(lease.id)
-    log_event('model.round.start', round_id=lease.id, timeout_sec=DEEPSEEK_ROUND_TIMEOUT_SEC)
+    log_event('model.round.start', round_id=lease.id, notice_after_sec=DEEPSEEK_THINKING_NOTICE_SEC)
     lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
     if msg.message_id:
         lease.actors.setdefault(msg.message_id, (msg.user_id, msg.user_name))
@@ -294,20 +294,18 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             thinking = asyncio.create_task(chat(msg.conv_id, msg.user_id, user_msg,
                 msg.user_name, outbox=outbox, history_text=wake_context or None))
         with stage('model.wait'):
-            done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_ROUND_TIMEOUT_SEC)
+            done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_THINKING_NOTICE_SEC)
             if not done:
-                outcome('timeout')
-                log_event('model.round.timeout', round_id=lease.id, timeout_sec=DEEPSEEK_ROUND_TIMEOUT_SEC,
+                log_event('model.round.long_running', round_id=lease.id, notice_after_sec=DEEPSEEK_THINKING_NOTICE_SEC,
                     pending_replies=len(outbox.items) if outbox else 0, stage=active_stage())
-                log_event('model.round.finish', round_id=lease.id, status='timeout', stage=active_stage())
-        if not done:
-            lease.revoke()
-            _abandon(thinking)
-            note_api_failure("单轮模型处理超时")
-            if trigger:
-                trigger.leave_session(msg.conv_id)
-            return
-        reply = thinking.result()
+                if msg.is_direct_address:
+                    try:
+                        await asyncio.wait_for(_send_notice(sender, "正在思考中，请稍等……"), timeout=10)
+                    except Exception as notice_error:
+                        log_event('model.notice.failed', error_type=type(notice_error).__name__)
+                # Waiting longer is not a model error. The task retains its
+                # lease and can still commit state/history once it completes.
+            reply = await asyncio.shield(thinking)
         lease.check()
         # Durable state is committed before announcing success to the user.
         with runtime.use(lease):

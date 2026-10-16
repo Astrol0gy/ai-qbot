@@ -343,80 +343,46 @@ SLOW: dict[str, object] = {}
 
 
 async def scene_4() -> Sim:
-    """场景 4：思考超过时限 → 放弃本轮（晚到的回答也不许进群；打桩，不调 API）"""
-    sim = new_sim(
-        990004,
-        "场景 4：AI 思考超时 —— 放弃本轮（打桩模型：即使它在第 12 秒才返回，也不许发消息）",
-    )
-    cap = 1.0  # 把单轮时限压到 1 秒，假装模型很慢
+    """场景 4：长考时先提示，继续等待最终回复（打桩，不调 API）。"""
+    sim = new_sim(990004, "场景 4：长考提示后继续等待并发送最终答案（打桩模型）")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    SLOW.clear()
 
     async def slow_chat(conv_id, user_id, user_message, user_name="", outbox=None, history_text=None):
-        """慢模型：真时限 1s，但它要 6s 才有结果，而且「吞掉取消」继续跑完"""
-        SLOW["started"] = True
-        try:
-            await asyncio.sleep(6.0)
-        except asyncio.CancelledError:
-            # 最坏情况：取消没拦住，请求其实还在跑，晚点才返回
-            SLOW["cancel_seen"] = True
-            await asyncio.sleep(6.0)
+        started.set()
+        await release.wait()
+        SLOW["returned"] = True
         if outbox is not None:
-            # 晚到的回答试图说话 —— 这句绝对不许进群
-            outbox.items.append(ReplyItem(text="这句晚到的回答绝对不能出现在群里"))
-        SLOW["late_returned"] = True
-        SLOW["sent_when_late"] = len(sim.sent)
-        return "这句晚到的回答绝对不能出现在群里"
+            outbox.items.append(ReplyItem(text="周末有空，一起吃饭吧"))
+        return "周末有空，一起吃饭吧"
 
-    async def fast_chat(conv_id, user_id, user_message, user_name="", outbox=None, history_text=None):
-        """下一轮：正常答，同时记下它看到的上下文"""
-        SLOW["next_ctx"] = history_text or ""
-        if outbox is not None:
-            outbox.items.append(ReplyItem(text="在的，刚走神了一下"))
-            return "在的，刚走神了一下"
-        return "在的，刚走神了一下"
-
-    real_chat, real_cap = core.chat, core.DEEPSEEK_ROUND_TIMEOUT_SEC
-    core.chat, core.DEEPSEEK_ROUND_TIMEOUT_SEC = slow_chat, cap
+    real_chat, real_notice = core.chat, core.DEEPSEEK_THINKING_NOTICE_SEC
+    core.chat, core.DEEPSEEK_THINKING_NOTICE_SEC = slow_chat, 0.02
+    pending = asyncio.create_task(sim.user_says(
+        ZHANG, "张三", "肥鱼，在线吗？问你个事：周末有空一起吃饭不", at=True,
+    ))
     try:
-        await sim.user_says(ZHANG, "张三", "肥鱼，在线吗？问你个事：周末有空一起吃饭不", at=True)
-
-        say(
-            f"  {elapsed():>6}s  [超时瞬间] 发出 {len(sim.sent)} 条 / "
-            f"互动窗口={'开着' if trigger.is_active(sim.conv_id) else '已关闭'} / "
-            f"缓冲残留「{trigger.buffer.peek(sim.conv_id)}」"
-        )
-        check("场景4：超时后一条消息都没发", not sim.sent, f"实际 {len(sim.sent)} 条")
-        check("场景4：超时后退出互动窗口（要再开口得等下一次唤醒）", not trigger.is_active(sim.conv_id))
-        check(
-            "场景4：超时的片段留在缓冲里（和 skip 一致，不丢上下文）",
-            bool(trigger.buffer.peek(sim.conv_id).strip()),
-        )
-
-        # 等那个「取消没拦住」的请求真的返回
-        await asyncio.sleep(7.0)
-        say(
-            f"  {elapsed():>6}s  [晚到的回答返回] late_returned={SLOW.get('late_returned')} "
-            f"那一刻群里已有 {SLOW.get('sent_when_late')} 条 / 现在 {len(sim.sent)} 条"
-        )
-        check(
-            "场景4：晚到的回答（第 12 秒）一条都没进群",
-            SLOW.get("late_returned") is True and not sim.sent,
-            f"late_returned={SLOW.get('late_returned')}，发出 {len(sim.sent)} 条",
-        )
-        check("场景4：取消确实送到了（它吞掉取消也没能拖住这一轮）", SLOW.get("cancel_seen") is True)
-
-        # 下一次唤醒：@ 重新开局，且没丢前面那段
-        core.chat = fast_chat
-        await sim.user_says(LI, "李四", "在不在？我也想问周末的事", at=True)
-        ctx = str(SLOW.get("next_ctx") or "")
-        say(f"  {elapsed():>6}s  [下一轮上下文]\n" + "\n".join(f"        {ln}" for ln in ctx.splitlines()))
-        check("场景4：超时之后的 @ 能正常接上", len(sim.sent) == 1, f"发出 {len(sim.sent)} 条")
-        check(
-            "场景4：下一轮上下文里张三那条还在（超时没丢上下文）",
-            "张三" in ctx and "李四" in ctx,
-            ctx.replace("\n", " | "),
-        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        for _ in range(100):
+            if sim.sent:
+                break
+            await asyncio.sleep(0.01)
+        check("场景4：长考先发送一条思考提示", len(sim.sent) == 1 and "正在思考" in sim.sent[0]["text"])
+        check("场景4：提示后仍等待模型", not pending.done() and not SLOW.get("returned"))
+        await asyncio.sleep(0.06)
+        check("场景4：长考提示只发一次", len(sim.sent) == 1)
+        release.set()
+        await asyncio.wait_for(pending, timeout=2)
+        check("场景4：模型未被取消并返回结果", SLOW.get("returned") is True)
+        check("场景4：最终答案正常发出", len(sim.sent) == 2 and sim.sent[-1]["text"] == "周末有空，一起吃饭吧")
+        check("场景4：成功回复后保留互动窗口", trigger.is_active(sim.conv_id))
     finally:
-        core.chat, core.DEEPSEEK_ROUND_TIMEOUT_SEC = real_chat, real_cap
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        core.chat, core.DEEPSEEK_THINKING_NOTICE_SEC = real_chat, real_notice
     return sim
 
 

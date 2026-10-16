@@ -78,7 +78,7 @@ class AuditCases(unittest.IsolatedAsyncioTestCase):
             (dc, "_conversations", defaultdict(list)),
             (dc, "_fail_streak", 0), (dc, "_cooldown_until", 0.0),
             (dc, "DEEPSEEK_ENABLE_SEARCH", True),
-            (core, "DEEPSEEK_ROUND_TIMEOUT_SEC", 1.0),
+            (core, "DEEPSEEK_THINKING_NOTICE_SEC", 1.0),
             (tr, "ONEBOT_GROUP_BLACKLIST", set()), (tr, "ONEBOT_GROUP_WHITELIST", set()),
             (tr, "TRIGGER_RECOGNIZE_IMAGES", True),
         ]:
@@ -192,8 +192,12 @@ class AuditCases(unittest.IsolatedAsyncioTestCase):
                 return response("晚到回答")
 
         sender = Sender()
-        with patch.object(dc, "client", NS(chat=NS(completions=LateModel()))), patch.object(core, "DEEPSEEK_ROUND_TIMEOUT_SEC", 0.02):
-            await core.handle_message(IncomingMessage(conv_id="g", user_id="a", text="在吗", is_at_bot=True), sender)
+        with patch.object(dc, "client", NS(chat=NS(completions=LateModel()))), patch.object(core, "DEEPSEEK_THINKING_NOTICE_SEC", 0.02):
+            processing = asyncio.create_task(core.handle_message(IncomingMessage(conv_id="g", user_id="a", text="在吗", is_at_bot=True), sender))
+            await asyncio.sleep(0.01)
+            processing.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await processing
             await asyncio.sleep(0.06)
         self.assertFalse(sender.sent)
         self.assertEqual(dc.get_history_length("g"), 0, "超时后真实 chat 仍提交历史")
@@ -213,10 +217,13 @@ class AuditCases(unittest.IsolatedAsyncioTestCase):
                 finished.set()
 
         model = Model([response(calls=[("load_skill", {"name": "用户偏好"})]), response(calls=[("manage_user_profile", {"action": "remember", "info": "超时后才写入"})])])
-        with patch.object(dc, "client", model), patch.object(dc, "execute_tool", slow_execute), patch.object(core, "DEEPSEEK_ROUND_TIMEOUT_SEC", 0.1):
+        with patch.object(dc, "client", model), patch.object(dc, "execute_tool", slow_execute), patch.object(core, "DEEPSEEK_THINKING_NOTICE_SEC", 0.1):
             try:
-                await core.handle_message(IncomingMessage(conv_id="g", user_id="a", text="记偏好", is_at_bot=True), Sender())
-                self.assertTrue(started.is_set())
+                processing = asyncio.create_task(core.handle_message(IncomingMessage(conv_id="g", user_id="a", text="记偏好", is_at_bot=True), Sender()))
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                processing.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await processing
             finally:
                 release.set()
                 await asyncio.to_thread(finished.wait, 3)

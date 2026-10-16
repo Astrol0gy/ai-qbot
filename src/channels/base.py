@@ -90,7 +90,7 @@ class IncomingMessage:
             if len(brief) > IMAGE_NOTE_MAX:
                 brief = brief[:IMAGE_NOTE_MAX] + "…"
             # 识别不出来的图留中性占位（别写「识别失败」：主模型会拿它去琢磨，
-            # 白烧思考预算，日志里实测把一轮拖过 60 秒超时）
+            # 白烧思考预算，会无谓拖延本轮回复）
             parts.append(f"[图片{i + 1}：{brief or IMAGE_UNAVAILABLE}]")
         if self.image_urls and self.image_descs is None:
             parts.append(f"[{len(self.image_urls)}张图片：{IMAGE_UNAVAILABLE}]")
