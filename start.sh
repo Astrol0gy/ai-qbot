@@ -3,6 +3,7 @@
 # ai-qbot 一键管理脚本（Termux 单机部署：机器人 + NapCat 同机）
 #
 #   bash start.sh           一键启动（唤醒锁 → NapCat → 机器人）
+#   bash start.sh reload    仅重载机器人代码，保留 NapCat 与 QQ 登录
 #   bash start.sh stop      停止机器人 + NapCat，并释放唤醒锁
 #   bash start.sh status    查看状态（进程真活着没 / 端口 / QQ 在线 / 日志尾部）
 #   bash start.sh webui     打开 NapCat 的 WebUI（首次登录 QQ 要扫码）
@@ -155,6 +156,33 @@ drop_stale_session() {
     sleep 1
 }
 
+# ------------------------------ 仅启动机器人 ------------------------------
+start_bot() {
+    mkdir -p "$LOG_DIR"
+    if bot_running; then
+        info "机器人已在运行，跳过启动"
+        if [ ! -f "$BOT_LOG" ]; then
+            warn "它不是本脚本启动的，所以没有日志文件"
+            info "想要日志，请先停止原机器人，再用 bash start.sh 启动"
+        fi
+    else
+        drop_stale_session "$BOT_SESSION"
+        screen -dmS "$BOT_SESSION" env \
+            QBOT_DIR="$PROJECT_DIR" \
+            QBOT_PY="$PYTHON_CMD" \
+            QBOT_LOG="$BOT_LOG" \
+            bash -lc 'cd "$QBOT_DIR" && exec "$QBOT_PY" -u -m src.runner'
+        sleep 2
+        if bot_running; then
+            ok "已启动机器人（日志：$BOT_LOG）"
+        else
+            err "机器人启动后立刻退出了，看看日志："
+            tail -n 20 "$BOT_LOG" 2>/dev/null
+            return 1
+        fi
+    fi
+}
+
 # ------------------------------ 启动 ------------------------------
 do_start() {
     require_screen
@@ -218,34 +246,47 @@ do_start() {
     fi
 
     # 3) 机器人（输出同时进日志文件，方便事后回看「它到底卡在哪」）
-    if bot_running; then
-        info "机器人已在运行，跳过启动"
-        if [ ! -f "$BOT_LOG" ]; then
-            warn "它不是本脚本启动的，所以没有日志文件"
-            info "想要日志（下次出事能查）：bash start.sh stop && bash start.sh"
-        fi
-    else
-        drop_stale_session "$BOT_SESSION"
-        screen -dmS "$BOT_SESSION" env \
-            QBOT_DIR="$PROJECT_DIR" \
-            QBOT_PY="$PYTHON_CMD" \
-            QBOT_LOG="$BOT_LOG" \
-            bash -lc 'cd "$QBOT_DIR" && exec "$QBOT_PY" -u -m src.runner'
-        sleep 2
-        if bot_running; then
-            ok "已启动机器人（日志：$BOT_LOG）"
-        else
-            err "机器人启动后立刻退出了，看看日志："
-            tail -n 20 "$BOT_LOG" 2>/dev/null
-            exit 1
-        fi
-    fi
+    start_bot || return 1
 
     echo
     ok "启动完成"
     info "看日志：bash start.sh log      或  screen -r $BOT_SESSION"
     info "看状态：bash start.sh status"
     info "停全部：bash start.sh stop"
+}
+
+# ------------------------------ 仅重载机器人 ------------------------------
+do_reload() {
+    require_screen
+    require_python
+    # Check new source/configuration before interrupting the current process.
+    if ! "$PYTHON_CMD" -c 'import ast; from pathlib import Path; [ast.parse(p.read_text(encoding="utf-8-sig"), filename=str(p)) for p in Path("src").rglob("*.py")]; from src.config import validate; validate()'; then
+        err "新代码语法或配置检查失败，未停止原机器人"
+        return 1
+    fi
+    local state i
+    state="$(session_state "$BOT_SESSION")"
+    if bot_running && [ "$state" != "running" ]; then
+        err "发现不受当前 screen 会话管理的机器人，请先手动停止该进程，再用 bash start.sh 启动一次"
+        return 1
+    fi
+    if [ "$state" = "running" ] && bot_running; then
+        info "正在退出机器人；NapCat 保持运行"
+        if ! screen -S "$BOT_SESSION" -p 0 -X stuff $'\003' >/dev/null 2>&1; then
+            err "无法通知机器人退出，未启动第二个进程"
+            return 1
+        fi
+        for ((i=0; i<15; i++)); do
+            bot_running || break
+            sleep 1
+        done
+        if bot_running; then
+            err "机器人仍在退出中，稍后重试 bash start.sh reload；未强制终止，也未重复启动"
+            return 1
+        fi
+    fi
+    start_bot || return 1
+    ok "机器人代码已重载（NapCat 与终端保持运行）"
 }
 
 # ------------------------------ 停止 ------------------------------
@@ -478,11 +519,12 @@ do_log() {
 }
 
 usage() {
-    sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-start}" in
     start)  do_start ;;
+    reload) do_reload ;;
     stop)   do_stop ;;
     status) do_status ;;
     webui)  do_webui ;;
