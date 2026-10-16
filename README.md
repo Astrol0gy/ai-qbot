@@ -80,7 +80,7 @@ python -m src.migrate_data data/campaigns/旧文件.json --group-id 完整会话
 
 网页和图片下载连接到本轮 DNS 校验通过的具体公网 IP，保留原始 Host、TLS SNI 和证书主机名校验，逐跳重定向重新校验。网页最多 4 MiB，视觉图片最多 64 MiB，出站图片最多 8 MiB，采集图片使用 `STICKER_MAX_BYTES`，下载含大小/耗时限制并关闭响应。两条通道先下载网络图片再上传字节，不让平台代抓任意网址。
 
-默认不继承 `HTTP_PROXY`/`HTTPS_PROXY`，拒绝 fake-IP 和非公网地址。确需代理时显式设置 `TRUST_PROXY_URL`：该代理须负责目标 DNS 和路由限制；仅在此模式允许 fake-IP。它是受信配置，不代表能在客户端固定代理背后的实际目标。配置启动时检查数字范围、有限值、布尔及枚举；主模型和视觉关闭思考均显式发送 disabled，参见 [DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。代码默认 reasoning effort 为 high，现有 `.env.example` 模板设为 max，以实际配置为准。
+默认不继承 `HTTP_PROXY`/`HTTPS_PROXY`，未配置 `TRUST_PROXY_URL` 时直接下载公网资源。配置后优先连接该 HTTP/Mixed 代理，代理地址本身允许为本机或内网地址；代理未启动或无法建立连接时，本次下载重新解析目标并回退直连，下次下载仍会尝试代理，开关 Clash 无需删改配置。代理路径允许 fake-IP，且本地 DNS 失败时由代理解析域名；受信代理须负责目标 DNS 和路由限制。读取超时、证书错误与代理返回的拒绝不会触发直连回退，两条路径共用单次下载总时限。直连仍拒绝 fake-IP 和非公网目标，代理路径也不允许把显式本机/内网目标作为抓取地址。配置启动时检查数字范围、有限值、布尔及枚举；主模型和视觉关闭思考均显式发送 disabled，参见 [DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/)。代码默认 reasoning effort 为 high，现有 `.env.example` 模板设为 max，以实际配置为准。
 
 若下载日志提示 QQ 图片域名指向 `198.18.x.x`，可能是代理 DNS 返回了 fake-IP。可将 `.env` 的 `TRUST_PROXY_URL` 设为机器人运行设备实际可达的 HTTP/Mixed 代理地址（如 `http://127.0.0.1:7890`，端口以代理配置为准，不使用 SOCKS 端口），或调整代理 DNS，让图片域名返回真实公网 IP；Mihomo 的配置参见 [fake-ip-filter](https://wiki.metacubex.one/config/dns/#fake-ip-filter)。修改后重启机器人，重新发图验证，也会清除进程中的图片失败退避缓存。不会自动放行 fake-IP 或其他内网目标。
 
@@ -287,7 +287,7 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 ## 表情包
 
 机器人会**自己攒表情包**，也会**主动发**：群里或私聊中出现的图被识别为「表情包／梗图」时，原图会下载进本地库；
-此后它想表达情绪，就从库里挑一张贴切的，随自己的话一起发出去。
+此后它想表达情绪，就从库里挑一张贴切的，先发文字，再单独发送表情包。
 
 **采集**：看图模型判定为表情包时会额外输出一行五个标签（`情绪｜动作｜主体｜风格｜文字`），
 文件名就是这五个标签加一个序号，用下划线连接：
@@ -310,14 +310,16 @@ OneBot 是一套接口标准（类比「OpenAI 兼容接口」），真正登录
 拿不准库里有什么，就先调 `list_stickers` 看现成的张数与常用标签。
 
 工具按情绪词从库里检索（标签完全相等优先，两个字的互相包含次之，命中多个标签加权），挑中后返回一行
-`[img]<库里的文件路径>[/img]`，模型把这一行放进回复，那张图就随这句话一起发出（这一行本身不会显示给用户）；
+`[img]<库里的文件路径>[/img]`，模型把这一行放进回复，通道会先发文字，再把每张表情包单独发成一条消息（这一行本身不会显示给用户）；
 **挑不到就不返回路径**（不会硬塞一张不相关的图），只发图不配字也允许。回复里的 `[img]` 是网址就当网络图发、
-是库内已索引的图片路径就当表情包发，库外路径、索引 JSON、非图片与越界符号链接一律丢掉（模型抄错或编出来的路径不该进发送环节）。用法规则见 `src/skills/image.md`。
+是库内已索引的图片路径就当表情包发，库外路径、索引 JSON、非图片与越界符号链接一律丢掉（模型抄错或编出来的路径不该进发送环节）。文字和表情包分别记录发送回执；文字成功而表情包失败时保留已送达文字，表情包回执未知时不重发，也不继续发送后续消息。多次 `reply` 仍共用整轮表情包数量上限。用法规则见 `src/skills/image.md`。
+
+**纯表情包回复**：模型可只输出 `[img]…[/img]`，成功时不附加任何文字。图片明确被拒、未连接或文件不可用时，按该图情绪标签改发一次简短文字（如 `（无语）`，无标签时使用 `（表情）`）；文字也失败即结束本轮发送，不重试图片、不重试兜底文字，也不继续发送本轮后续回复。回执未知时图片可能已经送达，直接停止，不额外发送兜底文字。历史仅记录成功或回执未知的实际内容；文字兜底成功不把失败的表情包写成已送达。已有文字成功的图文回复不重复发送文字。
 
 | 通道 | 能否发本地表情包 |
 |------|:---:|
 | OneBot（NapCatQQ） | 是，直接把本地绝对路径填进 `image` 段（协议端与机器人在同一台机器，Termux 单机部署就是这么跑的） |
-| 官方通道 | **否**，官方富媒体必须先把文件上传换 `file_id`。这里降级为纯文字：有文字就发文字，没有则返回 `dropped`，不记作已回答 |
+| 官方通道 | **否**，官方富媒体必须先把文件上传换 `file_id`。这里降级为纯文字：有文字就发文字，纯表情包请求则尝试一次情绪文字兜底 |
 
 跑团（DM）模式下按需加载跑团正文，**不会默认开放表情包工具**；只有额外加载「图片理解」后，这些工具才进入本轮可用范围，使用分寸仍按指引把关。
 已识别的表情包照常入库；DM 中未 @ 的群消息会直接丢弃、不识图，也不会采集。
@@ -574,10 +576,19 @@ bash start.sh               # 一键启动
 | 命令 | 作用 |
 |---|---|
 | `bash start.sh` | 启动全部（重复执行不会重复拉起；会先清掉残留的空壳会话） |
+| `bash start.sh reload` | 仅重载机器人 Python 进程，保留 NapCat、QQ 登录和终端 |
 | `bash start.sh status` | 查看**进程是否真活着** / 端口 / **QQ 是否在线** / 日志尾部 |
 | `bash start.sh webui` | 打开 NapCat 的 WebUI（**扫码登录 QQ 用**，自动读 token 并弹出浏览器） |
 | `bash start.sh log` | 实时跟随机器人日志 |
 | `bash start.sh stop` | 停止机器人 + NapCat 并释放唤醒锁 |
+
+更新代码后不必停止整个部署，使用：
+
+```bash
+git pull && bash start.sh reload
+```
+
+这是仅重启机器人的轻量重载：先检查新源码语法和配置，再通知当前 Python 进程退出，随后启动新代码；不会停止 NapCat、释放唤醒锁或关闭终端，QQ 登录由 NapCat 保持。Python 重启会清空内存中的对话历史、互动窗口和等待队列，正在处理的请求可能中断；画像、跑团存档及表情包库保留。新版本新增依赖时，先安装 `requirements.txt`。如果原进程仍在退出，命令会报错并拒绝重复启动，稍后重试即可。仅执行 `git pull` 不会自动重载；首次使用本功能也可直接运行该命令，无需先停止 NapCat。真实 Termux/screen 环境仍需设备验证。
 
 > **NapCat 的启动命令写在脚本开头**（`NAPCAT_CMD`），默认就是第 3 节那条 `proot-distro ...`。
 > 启动命令不一样（装了 TUI-CLI、或 NapCat 直接跑在 Termux 里）也不用改脚本：
@@ -656,6 +667,7 @@ HyperOS 的省电策略很激进，必须手动放行，否则会被杀后台：
 python tests/review_regressions.py
 python tests/architecture_check.py
 python tests/net_proxy_check.py
+python tests/message_split_check.py
 python tests/skill_loading_check.py
 python tests/_degrade_check.py
 python tests/state_isolation_check.py
@@ -664,6 +676,7 @@ python tests/history_compress_check.py
 python tests/navi_check.py
 python tests/sim_chat.py 4 5
 bash -n start.sh
+bash tests/reload_check.sh
 ```
 
 历史审查与修复对照见 `docs/implementation-audit-2026-10-15.md` 和 `docs/implementation-fixes-2026-10-16.md`。
