@@ -138,7 +138,7 @@ class Sender(ABC):
     绑定到某条入站消息的发送器。
 
     每个通道为每条消息构造一个 Sender 实例；core 只调用 send()，
-    由通道自行决定「先图后文」的具体实现。
+    由通道负责拆分成具体的平台消息；OneBot 的表情包始终单独成条。
     """
 
     max_text_len: int = 2000
@@ -151,7 +151,10 @@ class Sender(ABC):
         reply_to: str | None = None,
         sticker_paths: list[str] | None = None,
     ) -> SendResult:
-        """发送一条回复（先发图片，再发文字）。
+        """发送一条逻辑回复，返回各条平台消息的汇总回执。
+
+        OneBot 先发送文字/网络图片，再把每张本地表情包单独发送。
+        纯表情包明确失败时只尝试一次情绪文字兜底；文字失败后结束，不重复发送。
 
         ``reply_to`` 是要引用的消息 id（AI 用 reply 工具的 reply_to 指定）。
         通道不支持引用时忽略即可，不影响正文发送。

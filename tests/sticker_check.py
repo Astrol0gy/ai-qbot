@@ -216,6 +216,8 @@ async def main() -> int:
     # ---------- 6. 回复解析 ----------
     print("\n6. 回复解析（[img] 里的本地路径 → 表情包）")
     payload = found.group(1) if found else ""
+    check("纯表情包的文字兜底取自情绪标签", stickers_utils.fallback_text(payload) == "（无语）")
+    check("兜底不泄露库外文件路径", stickers_utils.fallback_text(str(ROOT / "README.md")) == "（表情）")
     urls, paths = core._split_image_payloads([payload])
     check("库内路径认成表情包", urls == [] and paths == [payload], str(paths))
     urls2, paths2 = core._split_image_payloads(["https://example.com/a.jpg", str(ROOT / "README.md")])
@@ -238,16 +240,17 @@ async def main() -> int:
     sender = OneBotSender(_FakeClient(), True, "8888", "9999")  # type: ignore[arg-type]
     await sender.send("行吧", sticker_paths=paths)
     action, params = sent[-1]
-    seg = params["message"][-2]
+    seg = params["message"][0]
     check("action 是 send_group_msg", action == "send_group_msg", action)
     check("段数组里有 image 段且 file 是本地绝对路径",
-          len(params["message"]) == 2
+          len(sent) == 2 and len(params["message"]) == 1
           and seg["type"] == "image" and seg["data"]["file"] == paths[0],
           str(params["message"]))
+    check("文字独立为前一条消息", sent[0][1]["message"] == [{"type": "text", "data": {"text": "行吧"}}])
     await sender.send("", sticker_paths=paths)
     check("纯表情包（text 为空）也会发出去", len(sent[-1][1]["message"]) == 1)
     await sender.send("", sticker_paths=None)
-    check("空内容不产生任何请求", len(sent) == 2)
+    check("空内容不产生任何请求", len(sent) == 3)
 
     # ---------- 端到端：core.handle_message ----------
     print("\n8. 端到端（工具给的 [img] → 通道）")
@@ -323,7 +326,7 @@ async def main() -> int:
         await off.send("", sticker_paths=paths)
     finally:
         official._safe_reply, official._safe_send_group = real_reply, real_group
-    check("只发文字、不发表情包", official_sent == ["行吧"], str(official_sent))
+    check("不支持的纯表情包自动降级为情绪文字", official_sent == ["行吧", "（无语）"], str(official_sent))
 
     # ---------- 上下文净化 ----------
     print("\n10. 上下文净化")

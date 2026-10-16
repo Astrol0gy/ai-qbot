@@ -350,6 +350,18 @@ class OfficialSender(Sender):
         self._receipts = receipts = []
         self._inflight = None
         self._dropped_stickers = bool(sticker_paths)
+        if sticker_paths and not text and not urls:
+            # Local stickers cannot be delivered on this adapter; use the same
+            # one-shot text fallback as a definitely rejected sticker send.
+            from .. import stickers_utils
+            text = stickers_utils.fallback_text(sticker_paths[0])
+            self._seq += 1
+            self._inflight = SendResult("unknown", text)
+            receipt = await _safe_send_group(self._api, self._message.group_openid,
+                self._message.id, text, self._seq)
+            receipts.append(receipt)
+            self._inflight = None
+            return receipt
         for url in urls:
             downloaded = await runtime.run_blocking(_download_image, url, 8 * 1024 * 1024)
             if downloaded is None:

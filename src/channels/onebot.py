@@ -196,6 +196,8 @@ class OneBotSender(Sender):
         text = truncate_text(text or "", self.max_text_len)
         urls = [u for u in (image_urls or []) if u][:ONEBOT_MAX_IMAGES]
         stickers = [p for p in (sticker_paths or []) if p]
+        sticker_only = bool(stickers) and not text and not urls
+        requested_stickers = stickers
         from .. import runtime, stickers_utils
         from ..vision_utils import _download_image
         import base64
@@ -210,48 +212,102 @@ class OneBotSender(Sender):
             visible_urls.append(url)
         stickers = [resolved for p in stickers if (resolved := stickers_utils.resolve(p))]
         urls = visible_urls
+        if sticker_only and not stickers:
+            return await self._sticker_fallback(requested_stickers[0], reply_to, [])
         if not text and not urls and not stickers:
             return SendResult("dropped", detail="无可发送内容")
 
-        # 用段数组发送：引用段必须排在最前（放后面引用不生效），图段其次，文字最后。
-        # 表情包直接给本地绝对路径：协议端与我们同机，省掉一次转存（见 src/stickers_utils.py）。
-        segments: list[dict] = []
-        if reply_to:
-            segments.append({"type": "reply", "data": {"id": str(reply_to)}})
-        segments += [{"type": "image", "data": {"file": encoded}} for encoded in safe_images]
-        segments += [{"type": "image", "data": {"file": path}} for path in stickers]
-        if text:
-            segments.append({"type": "text", "data": {"text": text}})
+        # Text/network images retain their layout. Each sticker is a separate
+        # platform message, including when a single model reply contains both.
+        parts = []
+        if text or urls:
+            segments = [{"type": "image", "data": {"file": encoded}} for encoded in safe_images]
+            if text:
+                segments.append({"type": "text", "data": {"text": text}})
+            parts.append((segments, SendResult(API_OK, text, tuple(urls))))
+        for path in stickers:
+            parts.append(([{"type": "image", "data": {"file": path}}],
+                          SendResult(API_OK, stickers=(path,))))
+        receipts = []
+        for segments, content in parts:
+            if reply_to:
+                segments.insert(0, {"type": "reply", "data": {"id": str(reply_to)}})
+            receipt = await self._send_part(segments, content, receipts,
+                                            max_attempts=1 if sticker_only else 3)
+            if sticker_only and receipt.status in (API_REJECTED, API_OFFLINE, "dropped"):
+                receipt = await self._sticker_fallback(content.stickers[0], reply_to, receipts)
+                receipts.append(receipt)
+                break
+            receipts.append(receipt)
+            if receipt.status != API_OK:
+                break
+            self._pending_result = self._combine(receipts, incomplete=True)
+        result = self._combine(receipts, incomplete=media_failed)
+        self._pending_result = result
+        return result
 
+    async def _sticker_fallback(self, path, reply_to, earlier):
+        from .. import stickers_utils
+        text = stickers_utils.fallback_text(path)
+        segments = [{"type": "text", "data": {"text": text}}]
+        if reply_to:
+            segments.insert(0, {"type": "reply", "data": {"id": str(reply_to)}})
+        print("[表情包降级] 尝试文字兜底")
+        receipt = await self._send_part(segments, SendResult(API_OK, text), earlier, max_attempts=1)
+        self._pending_result = self._combine([*earlier, receipt])
+        return receipt
+
+    @staticmethod
+    def _combine(receipts, *, incomplete=False):
+        visible = [r for r in receipts if r.status in (API_OK, API_UNKNOWN)]
+        if any(r.status == API_UNKNOWN for r in receipts):
+            status = API_UNKNOWN
+        elif visible and (incomplete or len(visible) != len(receipts)):
+            status = "partial"
+        elif visible:
+            status = API_OK
+        else:
+            status = receipts[-1].status if receipts else API_REJECTED
+        detail = "；".join(r.detail for r in receipts if r.detail)
+        if incomplete:
+            detail = "；".join(filter(None, (detail, "部分内容尚未送达")))
+        return SendResult(status, "\n".join(r.text for r in visible if r.text),
+            tuple(url for r in visible for url in r.images),
+            tuple(path for r in visible for path in r.stickers), detail)
+
+    async def _send_part(self, segments, content, earlier, *, max_attempts=3):
+        from .. import stickers_utils
         if self._is_group:
             action, params = "send_group_msg", {"group_id": self._group_id}
         else:
             action, params = "send_private_msg", {"user_id": self._user_id}
         params["message"] = segments
 
-        for attempt in range(1, 4):
-            self._pending_result = SendResult(API_UNKNOWN, text, tuple(urls), tuple(stickers), "已尝试投递，回执未知")
+        for attempt in range(1, max_attempts + 1):
+            pending = SendResult(API_UNKNOWN, content.text, content.images, content.stickers,
+                                 "已尝试投递，回执未知")
+            self._pending_result = self._combine([*earlier, pending])
             result, status = await self._client.call_api_ex(action, params)
             if result is not None:
-                if urls:
-                    print(f"[🖼️ 图片] 已发送 {len(urls)} 张")
-                if stickers:
-                    print(f"[😀 表情包] 已发送 {len(stickers)} 张：{[Path(p).name for p in stickers]}")
-                for path in stickers:
+                if content.images:
+                    print(f"[🖼️ 图片] 已发送 {len(content.images)} 张")
+                if content.stickers:
+                    print(f"[😀 表情包] 已单独发送：{[Path(p).name for p in content.stickers]}")
+                for path in content.stickers:
                     stickers_utils.mark_used(path)
-                return SendResult("partial" if media_failed else API_OK, text, tuple(urls), tuple(stickers), "部分图片下载失败" if media_failed else "")
+                return content
             if status == API_UNKNOWN:
                 # 超时 / 回执超时：消息很可能已经进群了，再发一次就是刷屏
                 print("[⚠️ 发送结果未知] 消息可能已送达，不再重试以免群里出现重复")
-                return SendResult(API_UNKNOWN, text, tuple(urls), tuple(stickers))
+                return SendResult(API_UNKNOWN, content.text, content.images, content.stickers)
             if status != API_OFFLINE:
                 # 明确被拒（参数错、风控）：同一份内容再发还是被拒
                 print("[❌ 发送失败] 协议端拒绝了这条消息，不再重试")
                 return SendResult(API_REJECTED, detail="协议端拒绝")
-            if attempt < 3:
-                self._pending_result = SendResult(API_OFFLINE)
+            if attempt < max_attempts:
+                self._pending_result = self._combine([*earlier, SendResult(API_OFFLINE)])
                 wait = attempt * 2
-                print(f"[⚠️ 发送等待重试 {attempt}/3] 等 {wait}s...")
+                print(f"[⚠️ 发送等待重试 {attempt}/{max_attempts}] 等 {wait}s...")
                 await asyncio.sleep(wait)
         print("[❌ 发送最终失败] OneBot 未连接，消息未送达")
         return SendResult(API_OFFLINE)

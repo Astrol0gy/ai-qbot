@@ -434,6 +434,25 @@ def resolve(payload: str) -> str | None:
     return None
 
 
+def fallback_text(payload: str) -> str:
+    """Express an indexed sticker's emotion as text, without exposing its path."""
+    default = "（表情）"
+    with _LOCK:
+        _load()
+        try:
+            path = Path(str(payload or ""))
+            if path.is_absolute():
+                if path.resolve().parent != _DIR.resolve():
+                    return default
+            elif path.name != str(path):
+                return default
+        except (OSError, ValueError):
+            return default
+        tags = (_FILES.get(path.name) or {}).get("tags") or []
+        emotion = _clean_tag(str(tags[0]))[:20] if tags else ""
+        return f"（{emotion}）" if emotion and emotion not in _SKIP_TAGS else default
+
+
 # ---- 库现状（list_stickers 工具用） -----------------------------------------
 
 def tag_summary(limit: int = 12) -> str:
