@@ -39,7 +39,7 @@ def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return ip.is_global and not ip.is_multicast
 
 
-def _resolve(url: str):
+def _resolve(url: str, *, proxy: str | None = None):
     """
     校验 URL 并返回去掉首尾空白的版本，不安全时抛 UnsafeURLError。
 
@@ -59,9 +59,19 @@ def _resolve(url: str):
     if parsed.username or parsed.password or "\\" in text or any(ord(c) < 32 for c in text):
         raise UnsafeURLError("不允许凭证、反斜杠或控制字符")
     host = host.encode("idna").decode("ascii")
+    proxy = os.getenv("TRUST_PROXY_URL", "").strip() if proxy is None else proxy
+    # A trusted proxy can resolve public hostnames itself. Local DNS must not
+    # prevent reaching it, but literal private targets remain prohibited.
+    if host.lower() in ("localhost", "localhost.localdomain") or host.lower().endswith(".localhost"):
+        raise UnsafeURLError("不允许访问本机域名")
     try:
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if proxy:
+                return text, parsed, host, port, []
         raise UnsafeURLError(f"域名解析失败：{host}（{e}）") from e
     ips = []
     for info in infos:
@@ -69,7 +79,7 @@ def _resolve(url: str):
             ip = ipaddress.ip_address(info[4][0])
         except ValueError:  # 解析出的东西不是 IP（理论上不会发生）
             raise UnsafeURLError(f"{host} 解析出无法识别的地址 {info[4][0]!r}") from None
-        if not _is_public_ip(ip) and not (os.getenv("TRUST_PROXY_URL", "").strip() and _is_proxy_fake_ip(ip)):
+        if not _is_public_ip(ip) and not (proxy and _is_proxy_fake_ip(ip)):
             hint = ("；检测到可能的代理 fake-IP，请配置 TRUST_PROXY_URL 为受信 HTTP/Mixed 代理地址，"
                     "或让该域名的 DNS 返回真实公网 IP") if _is_proxy_fake_ip(ip) else ""
             raise UnsafeURLError(f"{host} 指向非公网地址 {ip}，拒绝访问{hint}")
@@ -116,6 +126,14 @@ def _limit_connection_lifetime(pool, deadline):
     pool.ConnectionCls = DeadlineConnection
 
 
+def _proxy_unavailable(exc):
+    """Only a failure to establish the proxy connection permits direct fallback."""
+    if isinstance(exc, urllib3.exceptions.ProxyError):
+        exc = exc.original_error
+    return isinstance(exc, (urllib3.exceptions.NewConnectionError,
+                            urllib3.exceptions.ConnectTimeoutError))
+
+
 def safe_get(
     session: requests.Session | None,
     url: str,
@@ -140,8 +158,9 @@ def safe_get(
     # Explicit opt-in: the proxy becomes responsible for DNS/routing restrictions.
     # Environment HTTP_PROXY/HTTPS_PROXY and fake-IP are never implicitly trusted.
     proxy = os.getenv("TRUST_PROXY_URL", "").strip()
-    for _ in range(max_redirects + 1):
-        current, parsed, host, port, ips = _resolve(current)
+    redirects = 0
+    while redirects <= max_redirects:
+        current, parsed, host, port, ips = _resolve(current, proxy=proxy)
         authority = f"[{host}]" if ":" in host else host
         if parsed.port:
             authority += f":{port}"
@@ -159,12 +178,13 @@ def safe_get(
                 raise TimeoutError("下载总时限已到")
             response = pool.urlopen("GET", target, headers=request_headers, redirect=False,
                 retries=False, preload_content=False,
-                timeout=urllib3.Timeout(connect=min(5, remaining), read=remaining))
+                timeout=urllib3.Timeout(connect=min(2 if proxy else 5, remaining), read=remaining))
             location = response.headers.get("Location")
             if response.status in (301, 302, 303, 307, 308) and location:
                 current = urljoin(current, location)
                 request_headers.pop("Authorization", None)
                 request_headers.pop("Cookie", None)
+                redirects += 1
                 continue
             if int(response.headers.get("Content-Length", "0")) > max_bytes:
                 raise UnsafeURLError("响应体超过大小上限")
@@ -196,6 +216,14 @@ def safe_get(
             result._content_consumed = True
             result.encoding = requests.utils.get_encoding_from_headers(result.headers)
             return result
+        except urllib3.exceptions.HTTPError as exc:
+            if proxy and _proxy_unavailable(exc):
+                # The setting is retained: the next download tries it again.
+                # Resolve and validate the direct target afresh on fallback.
+                print("[下载] 配置的代理未连接，尝试直连")
+                next_proxy = ""
+            else:
+                raise
         finally:
             if response is not None:
                 response.close()
@@ -203,4 +231,5 @@ def safe_get(
                 pool.clear()
             else:
                 pool.close()
+        proxy = next_proxy
     raise UnsafeURLError(f"重定向次数超过 {max_redirects} 次，放弃")
