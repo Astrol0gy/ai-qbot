@@ -132,10 +132,10 @@ async def main() -> int:
     check(
         "标签内混进下划线：按分隔符切开，仍然只留五个",
         stickers_utils._clean_tag("无_语") == "无语"
-        and stickers_utils.parse_tags("标签：无语_了｜捂脸｜猫｜实拍｜无文字")
+        and stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n标签：无语_了｜捂脸｜猫｜实拍｜无文字")
         == ["无语", "了", "捂脸", "猫", "实拍"],
     )
-    check("缺的维度补「无」", stickers_utils.parse_tags("标签：无语｜捂脸｜猫｜实拍") == ["无语", "捂脸", "猫", "实拍", "无"])
+    check("缺的维度补「无」", stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n标签：无语｜捂脸｜猫｜实拍") == ["无语", "捂脸", "猫", "实拍", "无"])
 
     # ---------- 2. 入库命名与去重 ----------
     print("\n2. 入库命名与去重")

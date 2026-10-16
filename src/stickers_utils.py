@@ -33,6 +33,7 @@ from pathlib import Path
 
 from .config import STICKER_DIR, STICKER_ENABLE, STICKER_MAX_BYTES, STICKER_MAX_FILES
 from .vision_utils import _download_image
+from .observability import log_event
 
 # ---- 路径与常量 -----------------------------------------------------------
 
@@ -79,14 +80,24 @@ class Sticker:
 
 # ---- 标签解析与文件名规则 --------------------------------------------------
 
+def _explicit_sticker(desc: str) -> bool:
+    """Only a positive classification in the first nonempty line permits harvesting."""
+    if not desc or not desc.strip():
+        return False
+    header = desc.strip().splitlines()[0]
+    match = re.match(r'^类型\s*[：:]\s*([^｜|\r\n]+)', header)
+    if match is None:
+        return False
+    category = re.sub(r'\s+', '', match.group(1))
+    return category in {'表情包', '梗图', '表情包/梗图', '表情包／梗图', '表情包或梗图', '表情包（梗图）'}
+
+
 def parse_tags(desc: str) -> list[str] | None:
     """
-    从 VLM 描述里取出五个标签；不是表情包（没有标签行）时返回 None。
-
-    「有没有标签行」就是「是不是表情包」的判据 —— 提示词只要求表情包输出这一行，
-    所以不需要再去看第一行的类型字样（模型偶尔把类型写歪，标签行反而更稳）。
+    必须明确判定为表情包，且有有效标签行，才返回五个标签。
+    内容图片、否定/不确定的类型、缺失类型都不采集；额外标签不能推翻类型判断。
     """
-    if not desc:
+    if not _explicit_sticker(desc):
         return None
     match = _TAG_LINE.search(desc)
     if match is None:
@@ -283,6 +294,8 @@ def harvest(url: str, desc: str) -> None:
     if _stopping.is_set() or not STICKER_ENABLE or not url or not url.startswith(("http://", "https://")):
         return
     if parse_tags(desc) is None:
+        log_event('sticker.harvest.skipped', explicit_sticker=_explicit_sticker(desc),
+                  reason='classification_or_tags_invalid')
         return
     _ensure_worker()
     try:
@@ -293,6 +306,8 @@ def harvest(url: str, desc: str) -> None:
 
 def collect(url: str, desc: str) -> str | None:
     """真下载并入库（后台线程里跑）。返回文件名，失败返回 None"""
+    if not STICKER_ENABLE or _stopping.is_set():
+        return None
     tags = parse_tags(desc)
     if tags is None:
         return None
