@@ -19,6 +19,7 @@
       E:/miniconda3/envs/ai-qbot/python.exe tests/state_isolation_check.py
 """
 import asyncio
+import json
 import os
 import shutil
 import socket
@@ -514,7 +515,10 @@ check("第一条处理完会自动补一轮（内容不丢）",
 check("另一个群不受影响（各群有自己的锁）", "别的群" in [r[1] for r in rounds], str(rounds))
 check("补一轮时用的是那条消息自己的发送器",
       rounds[-1][3]._message.id == "m2", getattr(rounds[-1][3]._message, "id", "?"))
-check("日志说明了发生了什么", "排队" in buf.getvalue() and "依次处理" in buf.getvalue(), buf.getvalue()[:120])
+queue_events = [json.loads(line) for line in buf.getvalue().splitlines() if line.startswith('{')]
+queued = [e for e in queue_events if e.get('event') == 'queue.enqueued' and e.get('message_id') == 'm2']
+dispatched = [e.get('message_id') for e in queue_events if e.get('event') == 'queue.dispatch']
+check("结构化日志记录排队与依次处理", len(queued) == 1 and dispatched == ['m1', 'm3', 'm2'], str(dispatched))
 
 # ---------------------------------------------------------------- 10. 指令解析
 print("\n=== 10. 指令解析：/forget 与 /list ===")
