@@ -33,11 +33,13 @@
 
 ## 超时
 
-搜索 `model.round.timeout` 或 `message.finish` 的 `status=timeout`，按 `trace_id` 找全链。
-`stage` 能区分等待 `history.summary`、`model.request` 或 `tool`。
-请求开始后没有正常响应、随后取消，说明该请求未在整轮预算内完成；非流式接口仍无法展示
-服务端内部排队与生成分别耗时。`service.failure` 和 `service.cooldown` 明确标识恢复探测，
-不再把一次探测失败误报为新发生三次失败。
+旧版本的 `model.round.timeout` / `message.finish.status=timeout` 表示整轮预算耗尽并被取消。
+新版使用 `model.round.long_running` 表示超过长考提示阈值，`notice_after_sec` 为阈值；
+该事件不会取消模型，@/私聊随后产生一次 `delivery.receipt.kind=notice`。提示发送失败只记录
+`model.notice.failed`，不会取消最终回答；最终仍由 `model.round.finish` 和 `message.finish` 收尾。
+`stage` 区分等待 `history.summary`、`model.request` 或 `tool`。真实接口错误记录 `status=error`，
+主动取消记录 `cancelled`。非流式接口无法展示服务商内部排队与生成分别耗时。
+`service.failure` 和 `service.cooldown` 明确标识失败与恢复探测，长时间等待不会算成服务失败。
 
 ## 引用诊断（当前行为尚未修复）
 
