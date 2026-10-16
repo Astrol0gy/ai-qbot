@@ -24,6 +24,7 @@ from ..vision_utils import (
 )
 from .base import IncomingMessage, Sender
 from .commands import HELP_TEXT, handle_dm_cmd, handle_profile_cmd
+from ..observability import active_stage, log_event, outcome, set_round, stage, traced_message
 
 IMG_MARKER = re.compile(r"\[img\](.*?)\[/img\]")
 
@@ -41,7 +42,7 @@ def _drain_abandoned_task(task: asyncio.Task) -> None:
         return
     exc = task.exception()
     if exc is not None:
-        print(f"[⚠️ 被放弃的一轮思考最后还是抛了异常] {type(exc).__name__}: {exc}")
+        log_event('model.late_result', status='discarded', error_type=type(exc).__name__, detail=str(exc)[:300])
 
 # 主动接话时，模型可用该标记表示「这次不插嘴」
 SKIP_TOKENS = {"[skip]", "__skip__", "[跳过]"}
@@ -187,35 +188,52 @@ async def _deliver(sender, text, reply_to, budget):
     return receipt if isinstance(receipt, SendResult) else SendResult("unknown", detail="发送器没有返回回执")
 
 
+async def _send_notice(sender, text):
+    with stage('delivery', kind='notice'):
+        receipt = await sender.send(text)
+    if receipt is None and not isinstance(sender, Sender):
+        receipt = SendResult('ok', text)
+    status = receipt.status if isinstance(receipt, SendResult) else 'unknown'
+    log_event('delivery.receipt', status=status, kind='notice',
+        text=receipt.text if isinstance(receipt, SendResult) else text,
+        detail=receipt.detail if isinstance(receipt, SendResult) else 'missing_receipt')
+    if status != 'ok':
+        outcome(status)
+
+
+@traced_message
 async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     """Local commands precede enrichment; only model work occupies the model gate."""
     user_msg = (msg.text or "").strip()
+    outcome('local_command' if user_msg.startswith('/') and msg.is_direct_address else 'completed')
     if msg.is_direct_address:
         if user_msg == "/help":
-            await sender.send(HELP_TEXT)
+            await _send_notice(sender, HELP_TEXT)
             return
         if user_msg == "/reset":
             clear_history(msg.conv_id)
-            await sender.send("记忆已清除，让我们重新开始吧！")
+            await _send_notice(sender, "记忆已清除，让我们重新开始吧！")
             return
         result = handle_dm_cmd(user_msg, msg.conv_id, msg.user_id, msg.user_name)
         if result is None:
             result = handle_profile_cmd(user_msg, msg.conv_id, msg.user_id)
         if result is not None:
-            await sender.send(result)
+            await _send_notice(sender, result)
             return
         if user_msg == "/look" or user_msg.startswith("/look "):
             raw_info = user_msg[5:].strip()
             if not raw_info:
-                await sender.send("请提供要记住的信息，例如：/look 我喜欢简短的回答")
+                await _send_notice(sender, "请提供要记住的信息，例如：/look 我喜欢简短的回答")
                 return
             user_msg = f"用户要求记住偏好：「{raw_info}」。加载用户偏好技能，提炼后记录当前用户的偏好并简短确认。"
             msg.ai_decides_reply = False
     user_msg = user_msg or msg.reply_ctx
     try:
-        media = await asyncio.wait_for(_image_text(msg, user_msg), timeout=30) if msg.image_urls else ""
+        with stage('media', image_count=len(msg.image_urls)):
+            media = await asyncio.wait_for(_image_text(msg, user_msg), timeout=30) if msg.image_urls else ""
     except asyncio.TimeoutError:
         media = IMAGE_UNAVAILABLE
+        log_event('media.timeout', timeout_sec=30)
     if media is None:
         media = IMAGE_UNAVAILABLE
     wake_context = ""
@@ -233,28 +251,41 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         outbox = ReplyOutbox(known_ids={entry.message_id for entry in entries if entry.message_id})
     elif media:
         user_msg = f"{user_msg}\n图片描述：{media}"
+    log_event('prompt.context', text=wake_context or user_msg, ai_decides_reply=msg.ai_decides_reply,
+        quote_id=msg.quote.message_id if msg.quote else None,
+        quote_chars=len(msg.quote.text) if msg.quote else len(msg.reply_ctx),
+        quote_forwarded=bool(msg.quote and msg.quote.text and msg.quote.describe() in user_msg
+            or msg.reply_ctx and msg.reply_ctx in user_msg),
+        context_message_ids=[entry.message_id for entry in entries])
     if not user_msg:
         if not msg.is_interjection:
-            await sender.send("你好呀～发送 /help 查看功能。")
+            await _send_notice(sender, "你好呀～发送 /help 查看功能。")
         return
     if api_cooldown_left() > 0 or len(_ABANDONED) >= 16:
+        outcome('model_unavailable')
+        log_event('model.unavailable', cooldown_sec=round(api_cooldown_left(), 1), abandoned_tasks=len(_ABANDONED))
         if trigger:
             trigger.leave_session(msg.conv_id)
         if msg.is_direct_address:
-            await sender.send("我暂时连不上模型服务，过一会儿再试～")
+            await _send_notice(sender, "我暂时连不上模型服务，过一会儿再试～")
         return
     loop = asyncio.get_running_loop()
     gate = _MODEL_GATES.setdefault(loop, asyncio.Semaphore(ONEBOT_MAX_CONCURRENCY))
     try:
-        await asyncio.wait_for(gate.acquire(), timeout=10)
+        with stage('model.gate'):
+            await asyncio.wait_for(gate.acquire(), timeout=10)
     except asyncio.TimeoutError:
+        outcome('busy')
         if msg.is_direct_address:
-            await sender.send("当前请求较多，请稍后再试。")
+            await _send_notice(sender, "当前请求较多，请稍后再试。")
         return
     if not dc.acquire_service_probe():
+        outcome('probe_busy')
         gate.release()
         return
     lease = runtime.RoundLease(msg.conv_id, DEEPSEEK_ROUND_TIMEOUT_SEC)
+    set_round(lease.id)
+    log_event('model.round.start', round_id=lease.id, timeout_sec=DEEPSEEK_ROUND_TIMEOUT_SEC)
     lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
     if msg.message_id:
         lease.actors.setdefault(msg.message_id, (msg.user_id, msg.user_name))
@@ -262,7 +293,13 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         with runtime.use(lease):
             thinking = asyncio.create_task(chat(msg.conv_id, msg.user_id, user_msg,
                 msg.user_name, outbox=outbox, history_text=wake_context or None))
-        done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_ROUND_TIMEOUT_SEC)
+        with stage('model.wait'):
+            done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_ROUND_TIMEOUT_SEC)
+            if not done:
+                outcome('timeout')
+                log_event('model.round.timeout', round_id=lease.id, timeout_sec=DEEPSEEK_ROUND_TIMEOUT_SEC,
+                    pending_replies=len(outbox.items) if outbox else 0, stage=active_stage())
+                log_event('model.round.finish', round_id=lease.id, status='timeout', stage=active_stage())
         if not done:
             lease.revoke()
             _abandon(thinking)
@@ -276,6 +313,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         with runtime.use(lease):
             lease.commit()
         note_api_success()
+        log_event('model.round.finish', round_id=lease.id, status='ok')
     except asyncio.CancelledError:
         lease.revoke()
         if "thinking" in locals() and not thinking.done():
@@ -283,31 +321,39 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         raise
     except Exception as exc:
         lease.revoke()
-        print(f"[本轮失败] {type(exc).__name__}: {exc}")
+        outcome('error')
+        log_event('model.round.finish', round_id=lease.id, status='error', error_type=type(exc).__name__, detail=str(exc)[:500])
         # Parameter/programming/persistence errors do not indicate model outage.
         if dc.is_service_failure(exc):
             note_api_failure(str(exc)[:120])
         if trigger:
             trigger.leave_session(msg.conv_id)
         if msg.is_direct_address:
-            await sender.send("我暂时连不上模型服务，请稍后重试。" if dc.is_service_failure(exc) else "本次处理未完成，请稍后重试。")
+            await _send_notice(sender, "我暂时连不上模型服务，请稍后重试。" if dc.is_service_failure(exc) else "本次处理未完成，请稍后重试。")
         return
     finally:
         gate.release()
         dc.release_service_probe()
     try:
         if outbox is not None and outbox.skipped and not outbox.has_items:
+            outcome('skipped')
             if trigger:
                 trigger.mark_answered(msg.conv_id)
             return
         items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]
         if len(items) == 1 and items[0][0].strip().lower() in SKIP_TOKENS and msg.ai_decides_reply:
+            outcome('skipped')
             return
         receipts = []
         budget = [STICKER_MAX_PER_REPLY, msg.user_name]
         for text, reply_to in items:
             budget[1] = lease.actors.get(reply_to, (msg.user_id, msg.user_name))[1]
-            receipt = await _deliver(sender, text, reply_to, budget)
+            with stage('delivery', reply_to=reply_to):
+                receipt = await _deliver(sender, text, reply_to, budget)
+            log_event('delivery.receipt', status=receipt.status, text=receipt.text,
+                image_count=len(receipt.images), sticker_count=len(receipt.stickers), detail=receipt.detail,
+                reply_to=reply_to)
+            outcome(receipt.status)
             receipts.append(receipt)
             if receipt.status not in ("ok", "dropped"):
                 break  # No duplicate retries after ambiguous or partial delivery.

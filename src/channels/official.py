@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 import botpy
@@ -23,6 +24,7 @@ from botpy.message import GroupMessage
 from ..config import (
     DEEPSEEK_ENABLE_SEARCH,
     DEEPSEEK_ENABLE_THINKING,
+    DEEPSEEK_MODEL,
     OFFICIAL_DEBUG_RAW_EVENTS,
     QQ_BOT_APP_ID,
     QQ_BOT_APP_SECRET,
@@ -30,6 +32,7 @@ from ..config import (
 from .base import IncomingMessage, Sender, SendResult, truncate_text
 from .scheduler import ConversationQueue
 from .core import handle_message
+from ..observability import log_event, message_fields, traced_message
 
 # ============================================
 # botpy 原始 payload 透传（monkeypatch）
@@ -421,12 +424,14 @@ class QBot(botpy.Client):
         if DEEPSEEK_ENABLE_SEARCH:
             flags.append("🌐 联网搜索")
         status = " | ".join(flags) if flags else "标准模式"
-        print(f"✅ 机器人「{self.robot.name}」已上线！[DeepSeek V4 Pro | {status}] 等待群聊 @ 消息...")
+        log_event('channel.ready', channel='official', bot_name=self.robot.name,
+            model=DEEPSEEK_MODEL, thinking=DEEPSEEK_ENABLE_THINKING, features=status)
 
     async def on_group_at_message_create(self, message: GroupMessage):
         """
         收到群聊 @ 消息时触发，归一化为 IncomingMessage 后交给共享核心。
         """
+        trace_id = uuid.uuid4().hex
         user_msg = clean_message(message.content)
         group_id = getattr(message, "group_openid", "")
         user_id = getattr(message.author, "member_openid", "")
@@ -452,11 +457,14 @@ class QBot(botpy.Client):
             if quoted:
                 quoted_text = quoted.get("content") or ""
                 quoted_by = quoted.get("username") or ""
-                print(f"[📎 引用原文] {quoted_by}: {quoted_text}")
+                log_event('quote.lookup', channel='official', conversation_id=group_id,
+                    message_id=str(message.id), user_id=user_id, trace_id=trace_id, quote_id=ref_idx, status='ok',
+                    text=quoted_text, forwarded=not bool(user_msg))
                 if not user_msg:
                     reply_ctx = f"用户引用了「{quoted_by}」的消息：{quoted_text}，请结合上下文回答"
             else:
-                print(f"[📎 引用未命中缓存] ref_idx={ref_idx}")
+                log_event('quote.lookup', channel='official', conversation_id=group_id,
+                    message_id=str(message.id), user_id=user_id, trace_id=trace_id, quote_id=ref_idx, status='cache_miss')
                 if not user_msg:
                     reply_ctx = "用户引用了一条消息，但机器人无法获取引用原文，请根据上下文尽力理解"
 
@@ -471,6 +479,7 @@ class QBot(botpy.Client):
 
         incoming = IncomingMessage(
             channel="official",
+            trace_id=trace_id,
             conv_id=group_id,
             user_id=user_id,
             user_name=user_name,
@@ -483,8 +492,11 @@ class QBot(botpy.Client):
             raw=raw,
         )
         sender = OfficialSender(message, self.api)
+        log_event('message.received', **message_fields(incoming), text=user_msg, at_bot=True,
+            image_count=len(image_urls), quote_id=ref_idx)
         if not hasattr(self, "_queue"):
             self._queue = ConversationQueue()
+        @traced_message
         async def dispatch(item):
             await handle_message(*item)
         try:

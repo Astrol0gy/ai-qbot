@@ -7,6 +7,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import time
+import uuid
 
 from ..vision_utils import IMAGE_UNAVAILABLE, strip_tag_line
 
@@ -68,6 +69,7 @@ class IncomingMessage:
     # 平台原始事件，供通道自身调试；群聊消息须在其中放入 "group_id"（平台原生群号），
     # 供触发策略做群黑白名单匹配
     raw: dict = field(default_factory=dict)
+    trace_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
     def is_direct_address(self) -> bool:

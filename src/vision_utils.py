@@ -342,6 +342,9 @@ def _looks_like_outage(e: Exception) -> bool:
     return any(k in str(e) for k in ("503", "502", "500", "504", "timed out", "timeout"))
 
 
+from .observability import log_event, stage
+
+
 def _describe_media(block: dict, prompt: str, max_tokens: int = 500) -> str | None:
     """发一次视觉请求。图片必须放在 user 消息里（system/assistant 会 400）。"""
     client = _get_client()
@@ -361,19 +364,20 @@ def _describe_media(block: dict, prompt: str, max_tokens: int = 500) -> str | No
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     try:
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {"role": "user", "content": [block, {"type": "text", "text": prompt}]},
-            ],
-            **kwargs,
-        )
+        with stage('vision.request', model=VISION_MODEL):
+            response = client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=[
+                    {"role": "user", "content": [block, {"type": "text", "text": prompt}]},
+                ],
+                **kwargs,
+            )
         # 服务端偶尔会返回 200 但没有 choices（线上日志里出现过，原本只打印成
         # 「'NoneType' object is not subscriptable」，查不动）。这里判空并把原始响应打出来，
         # 这样下次再遇到能直接看到服务端到底回了什么。
         choices = getattr(response, "choices", None)
         if not choices:
-            print(f"[VLM] 响应里没有 choices：{_dump_response(response)}")
+            log_event('vision.response', status='missing_choices')
             return None
         choice = choices[0]
         description = (choice.message.content or "").strip()
@@ -383,7 +387,7 @@ def _describe_media(block: dict, prompt: str, max_tokens: int = 500) -> str | No
             return None
         if choice.finish_reason == "length":
             print("[VLM] 回答触达 max_tokens 被截断，可调大 max_tokens 或关掉思考")
-        print(f"[VLM] 识别结果:\n{description}")
+        log_event('vision.response', status='ok', description_chars=len(description), finish_reason=choice.finish_reason)
         return description
     except Exception as e:
         # 带上异常类型，并把「服务端不可用」这类原因标出来：这类失败要退避，

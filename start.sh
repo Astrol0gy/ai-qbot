@@ -232,13 +232,15 @@ for entry in os.listdir("/proc"):
 
     try:
         with open(os.path.join(base, "cmdline"), "rb") as f:
-            cmd = f.read().replace(b"\0", b" ").decode(
-                "utf-8", "replace"
-            )
+            args = [part.decode("utf-8", "replace") for part in f.read().split(b"\0") if part]
     except OSError:
         continue
 
-    if "src.main" not in cmd and "src/main" not in cmd:
+    # Match argv, not words inside shell/administration command strings.
+    module = any(args[i] == "-m" and args[i + 1] in ("src.main", "src.runner")
+                 for i in range(len(args) - 1))
+    script = len(args) > 1 and args[1].replace("\\", "/").endswith(("src/main.py", "src/runner.py"))
+    if not module and not script:
         continue
 
     # 尽量限制到当前项目，避免服务器上另一个 qbot 被误判。
@@ -448,7 +450,7 @@ start_bot() {
         QBOT_LOG="$BOT_LOG" \
         bash -lc '
             cd "$QBOT_DIR" || exit 1
-            "$QBOT_PY" -u -m src.main 2>&1 | tee -a "$QBOT_LOG"
+            exec "$QBOT_PY" -u -m src.runner
         '
 
     sleep 2

@@ -47,6 +47,7 @@ from ..vision_utils import describe_for_context
 from .base import IncomingMessage, QuoteInfo, Sender, SendResult, truncate_text
 from .scheduler import ConversationQueue
 from .core import handle_message
+from ..observability import log_event, message_fields, outcome, stage, traced_message
 
 # ============================================
 # CQ 码解析（兼容协议端以字符串形式下发消息的情况）
@@ -657,6 +658,8 @@ class OneBotClient:
         )
 
         sender = OneBotSender(self, is_group, raw_gid, raw_uid)
+        log_event('message.received', **message_fields(incoming), text=text, at_bot=at_bot,
+            image_count=len(incoming.image_urls), quote_id=reply_id)
         try:
             await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch)
         except asyncio.QueueFull as exc:
@@ -664,6 +667,7 @@ class OneBotClient:
             if incoming.is_direct_address:
                 await sender.send("当前排队消息较多，请稍后再试。")
 
+    @traced_message
     async def _prepare_and_dispatch(self, item):
         incoming, sender = item
         reply_id = incoming.raw.get("reply_id")
@@ -674,18 +678,22 @@ class OneBotClient:
             if quote and not incoming.text:
                 incoming.reply_ctx = quote.text
         if trigger.needs_image_recognition(incoming):
-            async with self._img_sem:
-                try:
-                    incoming.image_descs = await asyncio.wait_for(describe_for_context(incoming.conv_id, incoming.image_urls), 30)
-                except asyncio.TimeoutError:
-                    from ..vision_utils import IMAGE_UNAVAILABLE
-                    incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
+            with stage('media.preprocess', image_count=len(incoming.image_urls)):
+                async with self._img_sem:
+                    try:
+                        incoming.image_descs = await asyncio.wait_for(describe_for_context(incoming.conv_id, incoming.image_urls), 30)
+                    except asyncio.TimeoutError:
+                        from ..vision_utils import IMAGE_UNAVAILABLE
+                        log_event('media.timeout', timeout_sec=30)
+                        incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
         elif incoming.is_group and not incoming.is_at_bot and incoming.image_urls:
             from ..vision_utils import IMAGE_UNAVAILABLE
             incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
         result = trigger.decide(incoming)
+        log_event('trigger.decision', decision=result.decision.value, reason=result.reason,
+            context_messages=len(trigger.buffer.snapshot(incoming.conv_id)))
         if result.decision is Decision.IGNORE:
-            self._log_ignore(incoming.conv_id, result.reason)
+            outcome('ignored')
             return
         if incoming.is_group and not trigger.is_dm_mode(incoming.conv_id) and not incoming.text.startswith("/"):
             incoming.ai_decides_reply = True
@@ -734,10 +742,13 @@ class OneBotClient:
         try:
             message_id = int(reply_id)
         except (TypeError, ValueError):
+            log_event('quote.lookup', quote_id=reply_id, status='invalid_id')
             return None, []
 
-        data = await self.call_api("get_msg", {"message_id": message_id})
+        with stage('quote.fetch', quote_id=reply_id):
+            data = await self.call_api("get_msg", {"message_id": message_id})
         if not data:
+            log_event('quote.lookup', quote_id=reply_id, status='unavailable')
             return None, []
 
         quoted_text, quoted_images, _, _ = extract_message(data.get("message"), self._self_id)
@@ -751,8 +762,11 @@ class OneBotClient:
             text=(quoted_text or "").strip(),
             is_bot=bool(self._self_id) and uid == str(self._self_id),
         )
-        mark = "（引的是机器人自己）" if quote.is_bot else ""
-        print(f"[📎 引用] {quote.author_name or quote.author_id}{mark}: {quote.text[:80]}")
+        log_event('quote.lookup', quote_id=reply_id, status='ok' if quote.text or quoted_images else 'empty',
+            author_id=uid, text=quote.text, text_chars=len(quote.text), image_count=len(quoted_images),
+            prompt_quote_chars=min(len(quote.text), 60), prompt_truncated=len(quote.text)>60,
+            segment_types=[s.get('type') for s in data.get('message', []) if isinstance(s, dict)]
+                if isinstance(data.get('message'), list) else ['cq_string'])
         return quote, quoted_images
 
     def _log_ignore(self, conv_id: str, reason: str) -> None:
@@ -823,7 +837,7 @@ class OneBotClient:
         retcode = resp.get("retcode")
         if resp.get("status") == "failed" or (retcode is not None and retcode not in (0, 1)):
             message = resp.get("message") or ""
-            print(f"[⚠️ OneBot API 返回失败] {action}: retcode={retcode} {message}")
+            log_event('onebot.api_error', action=action, echo=echo, retcode=retcode, detail=message[:500])
             # 回执超时 ≠ 投递失败：协议端内部发送超时时，消息通常已经发出去了
             if retcode in API_TIMEOUT_RETCODES or "timeout" in message.lower():
                 return None, API_UNKNOWN

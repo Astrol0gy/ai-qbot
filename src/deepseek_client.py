@@ -43,6 +43,7 @@ from . import runtime
 from . import skills
 from . import user_profile
 from . import campaign_state
+from .observability import log_event, stage, tool_arguments
 
 # 异步客户端。
 # 这里只管**单次请求**的上限；真正的总时限在 core 里（到点就放弃这一轮，晚到的回答一律
@@ -109,13 +110,14 @@ def api_cooldown_left() -> float:
 def note_api_failure(reason: str) -> None:
     """记一次失败：连续失败够阈值就熔断一段时间"""
     global _fail_streak, _cooldown_until
+    recovering = bool(_cooldown_until)
     _fail_streak = DEEPSEEK_API_FAIL_LIMIT if _cooldown_until else _fail_streak + 1
+    log_event('service.failure', reason=reason, failure_count=None if recovering else _fail_streak,
+        recovery_probe=recovering)
     if _fail_streak >= DEEPSEEK_API_FAIL_LIMIT:
         _cooldown_until = time.monotonic() + DEEPSEEK_API_COOLDOWN_SEC
-        print(
-            f"[🩺 服务熔断] DeepSeek 连续失败 {_fail_streak} 次（最近：{reason}），"
-            f"接下来 {DEEPSEEK_API_COOLDOWN_SEC:.0f}s 不再发起请求（快速放弃本轮）"
-        )
+        log_event('service.cooldown', reason=reason, cooldown_sec=DEEPSEEK_API_COOLDOWN_SEC,
+            failure_threshold=DEEPSEEK_API_FAIL_LIMIT, recovery_probe=recovering)
         _fail_streak = 0  # 冷却结束后重新计数，避免刷屏
 
 
@@ -123,7 +125,7 @@ def note_api_success() -> None:
     """记一次成功：清零失败计数，并用一条日志宣告服务恢复"""
     global _fail_streak, _cooldown_until
     if _cooldown_until:
-        print("[🩺 服务恢复] DeepSeek 已能正常返回，熔断解除")
+        log_event('service.recovered')
     _fail_streak = 0
     _cooldown_until = 0.0
 
@@ -277,18 +279,25 @@ async def _chat_round(
         allowed_for_request = frozenset(t["function"]["name"] for t in definitions)
         request_ctx = replace(ctx, allowed_tools=allowed_for_request)
         kwargs = _build_request_kwargs(messages, definitions or None)
-        response = await client.chat.completions.create(**kwargs)
+        with stage('model.request', model=DEEPSEEK_MODEL, iteration=round_num,
+                message_count=len(messages), input_chars=sum(len(str(m)) for m in messages),
+                thinking=DEEPSEEK_ENABLE_THINKING, reasoning_effort=DEEPSEEK_REASONING_EFFORT,
+                max_tokens=DEEPSEEK_MAX_TOKENS):
+            response = await client.chat.completions.create(**kwargs)
         runtime.check()
         msg = _first_choice(response).message
 
         # 调试：打印思考过程
         reasoning = getattr(msg, "reasoning_content", None)
-        if reasoning:
-            print(f"[🧠 思考 R{round_num}]\n{reasoning}")
+        usage = getattr(response, 'usage', None)
+        log_event('model.response', iteration=round_num, request_id=getattr(response, '_request_id', None),
+            finish_reason=getattr(_first_choice(response), 'finish_reason', None),
+            reasoning_chars=len(reasoning or ''), output_chars=len(msg.content or ''),
+            usage=usage.model_dump() if hasattr(usage, 'model_dump') else None)
 
         # 有工具调用 → 检查各工具配额
         if msg.tool_calls:
-            print(f"[🔧 工具调用 R{round_num}] {[tc.function.name for tc in msg.tool_calls]}")
+            log_event('model.tool_calls', iteration=round_num, tools=[tc.function.name for tc in msg.tool_calls])
             messages.append(msg)
 
             all_blocked = True
@@ -337,14 +346,15 @@ async def _chat_round(
                     # 一次高德/搜索往返就把**所有群、两条通道**一起冻住 —— 连 core 那道 60 秒
                     # 总时限也一起失效（asyncio.wait 的 timeout 靠事件循环计时，循环被堵住时
                     # 定时器根本轮不到触发）。丢进工作线程后循环保持可用，闸门才算真存在。
-                    result = await runtime.run_blocking(
-                        execute_tool, tool_name, tc.function.arguments, request_ctx
-                    )
+                    with stage('tool', tool=tool_name, iteration=round_num,
+                            arguments=tool_arguments(tc.function.arguments)):
+                        result = await runtime.run_blocking(
+                            execute_tool, tool_name, tc.function.arguments, request_ctx
+                        )
                     runtime.check()
-                    if tool_needs_context(tool_name):
-                        print(f"[🗣️ 表态 R{round_num}][{tool_name}] {result}")
-                    else:
-                        print(f"[📡 结果 R{round_num}][{tool_name} #{_tool_call_counts[tool_name]}/{max_calls}]\n{result}")
+                    # Tool bodies remain in the model context, never in runtime logs.
+                    log_event('tool.result', tool=tool_name, iteration=round_num,
+                        result_chars=len(str(result)), call_count=_tool_call_counts[tool_name])
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -356,7 +366,7 @@ async def _chat_round(
 
         # 最终回答（无工具调用 或 所有工具都被阻塞）
         reply = msg.content or ""
-        print(f"[✅ 完成] 共 {round_num} 轮")
+        log_event('model.complete', iterations=round_num)
         break
     else:
         # fallback：全局轮数用完
@@ -438,7 +448,8 @@ async def _compress_history(
         })
         kwargs = _build_request_kwargs(summary_input, tools=None)
         kwargs["tool_choice"] = "none"
-        response = await client.chat.completions.create(**kwargs)
+        with stage('history.summary', model=DEEPSEEK_MODEL, old_messages=len(old_part)):
+            response = await client.chat.completions.create(**kwargs)
         summary = _first_choice(response).message.content or ""
 
         if not summary:
@@ -456,8 +467,7 @@ async def _compress_history(
         history[:] = summary_pair + recent_part
         messages.extend(summary_pair)
         messages.extend(recent_part)
-        print(f"[🗜️ 压缩] 将 {len(old_part)} 条旧消息压缩为摘要，保留最近 {len(recent_part)} 条"
-              f"（历史 {before} → {len(history)} 条）")
+        log_event('history.compressed', old_messages=before, new_messages=len(history), kept_messages=len(recent_part))
         return messages
     except Exception as e:
         print(f"[⚠️ 压缩失败，退回硬截断] {e}")
@@ -480,7 +490,8 @@ async def _fallback_summarize(messages: list[dict]) -> str:
         kwargs = _build_request_kwargs(messages, tools=None)
         kwargs["tool_choice"] = "none"  # 强制禁止工具调用
 
-        response = await client.chat.completions.create(**kwargs)
+        with stage('model.fallback', model=DEEPSEEK_MODEL):
+            response = await client.chat.completions.create(**kwargs)
         msg = _first_choice(response).message
         reply = msg.content or ""
 
