@@ -5,7 +5,7 @@
 import re
 
 import anthropic
-from httpx import Timeout
+from openai import Timeout
 import requests
 from bs4 import BeautifulSoup
 
