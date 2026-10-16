@@ -75,6 +75,7 @@ class ChatProvider(ToolProvider):
         return [
             {
                 "name": REPLY_TOOL,
+                "tag": "回复整理",
                 "description": (
                     "回一条话。可以多次调用：不同的人在分别接你的话时，"
                     "为每个人各调一次，并用 reply_to 引用他最后那句话；"
@@ -104,6 +105,7 @@ class ChatProvider(ToolProvider):
             },
             {
                 "name": SKIP_TOOL,
+                "tag": "回复判断",
                 "description": (
                     "这轮不开口，一条都不回。用在：群里互相聊天、跟你无关；或者你觉得对方"
                     "还没说完（还会接着补充），想等他继续。不回复没有副作用，"

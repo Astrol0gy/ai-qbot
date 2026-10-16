@@ -29,6 +29,7 @@ class ImageProvider(ToolProvider):
         return [
             {
                 "name": "describe_image",
+                "tag": "识图",
                 "description": (
                     "用视觉模型（DeepSeek）分析图片：结果第一行会判明这是"
                     "「表情包（用户想表达情绪或态度）」还是「内容图片（照片/截图/图表，"
@@ -58,6 +59,7 @@ class ImageProvider(ToolProvider):
             },
             {
                 "name": "search_images",
+                "tag": "搜图",
                 "description": (
                     "搜索互联网上的图片（官方搜索+从来源页提取图片直链）。"
                     "返回图片标题、图片直链和来源页面链接。"
@@ -85,6 +87,7 @@ class ImageProvider(ToolProvider):
             },
             {
                 "name": "text_to_image",
+                "tag": "生图",
                 "description": (
                     "根据文字描述生成图片（文生图）。"
                     "当用户想让你「画一张图」「生成一张图」「画个 XX」等需要 AI 创作图片时使用。"
@@ -115,6 +118,7 @@ class ImageProvider(ToolProvider):
             },
             {
                 "name": "list_stickers",
+                "tag": "表情检索",
                 "description": (
                     "看本地表情包库里有什么：现有多少张、常用情绪标签有哪些。"
                     "想发表情包之前先看这里，拿返回的标签词去调 send_sticker 命中率最高。"
@@ -126,6 +130,7 @@ class ImageProvider(ToolProvider):
             },
             {
                 "name": "send_sticker",
+                "tag": "表情选择",
                 "description": (
                     "从本地表情包库里挑一张，单独发成一条消息 —— 用图片表达情绪"
                     "（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"

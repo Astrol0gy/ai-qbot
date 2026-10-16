@@ -53,11 +53,11 @@ class ThinkingCases(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(processing.done(), 'notice must not cancel the model')
                 self.assertTrue(leases[0].valid)
                 self.assertTrue(math.isinf(leases[0].deadline))
-                self.assertEqual(sender.sent, ['正在思考中，请稍等……'])
+                self.assertEqual(sender.sent, ['正在思考中...'])
             finally:
                 release.set()
                 await asyncio.wait_for(processing, 1)
-        self.assertEqual(sender.sent, ['正在思考中，请稍等……', '最终答案'])
+        self.assertEqual(sender.sent, ['正在思考中...', '最终答案'])
         history = dc._conversations['g']
         self.assertEqual(history[-1]['content'], '最终答案')
         self.assertNotIn('正在思考', str(history))
@@ -129,7 +129,7 @@ class ThinkingCases(unittest.IsolatedAsyncioTestCase):
         with patch.object(core, 'chat', model), patch.object(core, 'DEEPSEEK_THINKING_NOTICE_SEC', .01), \
              patch.object(official, '_safe_send_group', send):
             await core.handle_message(IncomingMessage(conv_id='g', user_id='a', text='问题', is_at_bot=True), sender)
-        self.assertEqual(calls, [('正在思考中，请稍等……', 1), ('最终答案', 2)])
+        self.assertEqual(calls, [('正在思考中...', 1), ('最终答案', 2)])
 
     def test_model_response_has_no_read_deadline(self):
         self.assertIsNone(dc.client.timeout.read)

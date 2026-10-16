@@ -5,6 +5,7 @@
 import re
 
 import requests
+from .. import runtime
 
 from . import ToolProvider
 
@@ -42,6 +43,7 @@ class VideoProvider(ToolProvider):
         return [
             {
                 "name": "search_bilibili_videos",
+                "tag": "视频搜索",
                 "description": (
                     "在 Bilibili（B站）搜索视频。根据用户需求的关键词搜索相关视频，"
                     "返回视频标题、UP主、时长、播放量、链接等信息。"
@@ -77,7 +79,7 @@ class VideoProvider(ToolProvider):
             resp = session.get(
                 "https://api.bilibili.com/x/web-interface/search/type",
                 params={"search_type": "video", "keyword": keyword, "page": 1},
-                timeout=10,
+                timeout=runtime.service_timeout(),
             )
             data = resp.json()
             if data.get("code") != 0:

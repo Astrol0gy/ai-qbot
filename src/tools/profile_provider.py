@@ -16,6 +16,7 @@ class ProfileProvider(ToolProvider):
         return [
             {
                 "name": "manage_user_profile",
+                "tag": "用户画像",
                 "description": (
                     "管理当前说话者（用户）的使用画像。群里所有用户共享同一段对话，但每个人有独立画像；"
                     "你记录的始终是【当前说话者自己】的偏好，不要覆盖或删除其他用户的记录。\n"

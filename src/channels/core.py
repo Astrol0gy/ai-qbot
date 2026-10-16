@@ -6,8 +6,9 @@
 """
 import asyncio
 import re
+import time
 
-from ..config import DEEPSEEK_THINKING_NOTICE_SEC, STICKER_MAX_PER_REPLY
+from ..config import DEEPSEEK_THINKING_NOTICE_SEC, TOOL_CALL_NOTICE_SEC, STICKER_MAX_PER_REPLY
 from ..deepseek_client import (
     api_cooldown_left,
     chat,
@@ -294,17 +295,33 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             thinking = asyncio.create_task(chat(msg.conv_id, msg.user_id, user_msg,
                 msg.user_name, outbox=outbox, history_text=wake_context or None))
         with stage('model.wait'):
-            done, _ = await asyncio.wait({thinking}, timeout=DEEPSEEK_THINKING_NOTICE_SEC)
-            if not done:
-                log_event('model.round.long_running', round_id=lease.id, notice_after_sec=DEEPSEEK_THINKING_NOTICE_SEC,
-                    pending_replies=len(outbox.items) if outbox else 0, stage=active_stage())
+            notified = set()
+            model_notified = False
+            while not thinking.done():
+                kind, tag, started, phase_id = lease.progress
+                threshold = TOOL_CALL_NOTICE_SEC if kind == 'tool' else DEEPSEEK_THINKING_NOTICE_SEC
+                remaining = threshold - (time.monotonic() - started)
+                already_notified = phase_id in notified or kind == "model" and model_notified
+                interval = .05 if already_notified else min(.05, max(.001, remaining))
+                done, _ = await asyncio.wait({thinking}, timeout=interval)
+                if done:
+                    break
+                # Recheck after yielding: the active phase may have changed.
+                if lease.progress[3] is not phase_id or time.monotonic() - started < threshold:
+                    continue
+                if phase_id in notified or kind == 'model' and model_notified:
+                    continue
+                notified.add(phase_id)
+                if kind == 'model':
+                    model_notified = True
+                log_event('tool.long_running' if kind == 'tool' else 'model.round.long_running',
+                    round_id=lease.id, tag=tag, notice_after_sec=threshold, stage=active_stage())
                 if msg.is_direct_address:
+                    text = f"正在调用{tag}技能" if kind == 'tool' else "正在思考中..."
                     try:
-                        await asyncio.wait_for(_send_notice(sender, "正在思考中，请稍等……"), timeout=10)
+                        await asyncio.wait_for(_send_notice(sender, text), timeout=10)
                     except Exception as notice_error:
                         log_event('model.notice.failed', error_type=type(notice_error).__name__)
-                # Waiting longer is not a model error. The task retains its
-                # lease and can still commit state/history once it completes.
             reply = await asyncio.shield(thinking)
         lease.check()
         # Durable state is committed before announcing success to the user.

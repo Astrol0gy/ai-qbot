@@ -62,7 +62,7 @@ class ToolProvider:
         """
         返回该 Provider 提供的所有工具元信息列表。
         每项格式: {"name": str, "description": str, "parameters": dict, "handler": callable,
-                  "max_calls": int（可选，默认 5）, "needs_context": bool（可选，默认 False）,
+                  "tag": str（可选，中文进度标签）, "max_calls": int（可选，默认 5）, "needs_context": bool（可选，默认 False）,
                   "hidden": bool（可选，默认 False）}
 
         - needs_context=True：handler 的第一个参数是**调用方每轮传入的 ChatContext**
@@ -91,6 +91,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._providers: list[ToolProvider] = []
+        self._tags: dict[str, str] = {}
         # name → (def, handler, max_calls, needs_context, hidden)
         self._tool_map: dict[str, tuple[dict, Callable, int, bool, bool]] = {}
 
@@ -99,6 +100,7 @@ class ToolRegistry:
         self._providers.append(provider)
         for tool_meta in provider.get_tools():
             name = tool_meta["name"]
+            self._tags[name] = tool_meta.get("tag", "工具")
             definition = {
                 "type": "function",
                 "function": {
@@ -354,3 +356,8 @@ def execute(tool_name: str, arguments: str, context=None) -> str:
 def needs_context(tool_name: str) -> bool:
     """该工具 handler 是否需要显式 ChatContext（与是否隐藏/授权互相独立）。"""
     return _registry.needs_context(tool_name)
+
+
+def get_tag(tool_name: str) -> str:
+    """Internal progress label, never added to the model tool schema."""
+    return _registry._tags.get(tool_name, "工具")

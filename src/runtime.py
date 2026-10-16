@@ -84,6 +84,25 @@ def remaining(limit):
     return min(limit, max(0.001, lease.deadline - time.monotonic())) if lease else limit
 
 
+@contextmanager
+def phase(kind, tag=""):
+    """Share the active phase with the channel without exposing tool arguments."""
+    lease = current()
+    if lease:
+        lease.progress = (kind, tag, time.monotonic(), object())
+    try:
+        yield
+    finally:
+        if lease:
+            lease.progress = ("model", "", time.monotonic(), object())
+
+
+def service_timeout(connect=5):
+    """API response waiting has no read deadline; connection failures still surface."""
+    check()
+    return (connect, None)
+
+
 def _disk(path):
     try:
         with open(path, encoding="utf-8") as stream:
@@ -146,6 +165,7 @@ class RoundLease:
         self.id = uuid.uuid4().hex
         self.deadline = float("inf") if timeout is None else time.monotonic() + timeout
         self.valid = True
+        self.progress = ("model", "", time.monotonic(), object())
         self.writes = {}
         self.after_commit = []
         self.history = None

@@ -5,6 +5,7 @@
 import re
 
 import anthropic
+from httpx import Timeout
 import requests
 from bs4 import BeautifulSoup
 
@@ -38,7 +39,7 @@ def _get_search_client() -> anthropic.Anthropic:
         _search_client = anthropic.Anthropic(
             base_url=DEEPSEEK_ANTHROPIC_BASE_URL,
             api_key=DEEPSEEK_API_KEY,
-            timeout=25,
+            timeout=Timeout(connect=5, read=None, write=30, pool=10),
             max_retries=0,
         )
     return _search_client
@@ -207,6 +208,7 @@ class SearchProvider(ToolProvider):
         return [
             {
                 "name": "web_search",
+                "tag": "搜索",
                 "description": (
                     "搜索互联网获取实时信息（DeepSeek 官方搜索）。"
                     "返回带来源的搜索摘要，若需要完整内容可用 fetch_url 打开来源链接。"
@@ -227,6 +229,7 @@ class SearchProvider(ToolProvider):
             },
             {
                 "name": "fetch_url",
+                "tag": "网页读取",
                 "description": (
                     "抓取指定网页的完整文字内容。"
                     "当 web_search 返回的摘要信息不够详细时，用此工具打开具体页面获取完整数据（如天气详情、新闻全文等）。"

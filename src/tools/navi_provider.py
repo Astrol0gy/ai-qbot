@@ -98,11 +98,11 @@ def _fmt_duration(seconds: int) -> str:
 def _fetch(url: str, params: dict) -> tuple[dict, str]:
     """发一次高德请求。返回 (响应 JSON, 错误文案)；成功时错误文案是空字符串"""
     try:
-        resp = requests.get(url, params=params, timeout=runtime.remaining(AMAP_TIMEOUT_SEC))
+        resp = requests.get(url, params=params, timeout=runtime.service_timeout(AMAP_TIMEOUT_SEC))
         resp.raise_for_status()
         data = resp.json()
     except requests.Timeout:
-        return {}, f"高德接口超时（{AMAP_TIMEOUT_SEC:.0f} 秒没返回），这次没查到。"
+        return {}, "高德接口连接超时，这次没查到。"
     except requests.RequestException as e:
         return {}, f"高德接口请求失败：{e}"
     except ValueError:
@@ -434,6 +434,7 @@ class NaviProvider(ToolProvider):
         return [
             {
                 "name": "search_place",
+                "tag": "地点搜索",
                 "description": (
                     "搜索地点 / 商家 / 兴趣点，拿到坐标、地址、评分、人均、营业时间、电话。两种用法：\n"
                     "- 按名字找：keywords='春熙路'（可配 city 限定城市）\n"
@@ -479,6 +480,7 @@ class NaviProvider(ToolProvider):
             },
             {
                 "name": "plan_route",
+                "tag": "导航",
                 "description": (
                     "算两地之间的路线：距离、预计耗时、过路费、红绿灯和主要路段。"
                     "支持驾车 / 步行 / 骑行 / 电动车 / 公交换乘。\n"

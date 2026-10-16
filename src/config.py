@@ -32,6 +32,8 @@ DEEPSEEK_ENABLE_SEARCH = os.getenv("DEEPSEEK_ENABLE_SEARCH", "false").lower() ==
 # 兼容旧配置名：现在只表示长考提示阈值，不再作为整轮取消时限。
 DEEPSEEK_ROUND_TIMEOUT_SEC = float(os.getenv("DEEPSEEK_ROUND_TIMEOUT_SEC", "60"))
 DEEPSEEK_THINKING_NOTICE_SEC = float(os.getenv("DEEPSEEK_THINKING_NOTICE_SEC", str(DEEPSEEK_ROUND_TIMEOUT_SEC)))
+# 工具调用提示阈值，超过只提示，不取消调用。
+TOOL_CALL_NOTICE_SEC = float(os.getenv("TOOL_CALL_NOTICE_SEC", "30"))
 # 服务端不可用时的熔断：连续失败（请求异常 / 5xx / 连接失败）到 API_FAIL_LIMIT 次后，
 # 进入 API_COOLDOWN_SEC 秒冷却期，期间不再发起请求，避免持续请求已明确故障的服务。
 # 长考本身不计入失败。
@@ -115,6 +117,7 @@ IMAGE_GEN_ENDPOINT = os.getenv(
 # 留空 = navi 工具不可用（工具会明确说"没配置"，不会静默失败）
 AMAP_KEY = os.getenv("AMAP_KEY", "").strip()
 # 单次请求超时（秒）：导航是"查得到就答"的实时查询，短超时 + 失败即返，不拖住整轮
+# 高德连接超时；响应等待由工具进度提示覆盖，不因耗时取消。
 AMAP_TIMEOUT_SEC = float(os.getenv("AMAP_TIMEOUT_SEC", "8"))
 # 每次搜索默认返回几条 POI（1~25）；结果越长越挤上下文，群里 5 条够用
 AMAP_POI_LIMIT = int(os.getenv("AMAP_POI_LIMIT", "5"))
@@ -198,7 +201,7 @@ def validate():
     bounds = {
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
-        "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
+        "TOOL_CALL_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
         "DEEPSEEK_API_COOLDOWN_SEC": (0, 3600), "VISION_TIMEOUT_SEC": (0.01, 120),
         "VISION_FAIL_BACKOFF_SEC": (0, 86400), "STICKER_MAX_FILES": (1, 100000),
         "STICKER_MAX_BYTES": (1, 64 * 1024 * 1024), "STICKER_MAX_PER_REPLY": (0, 10),

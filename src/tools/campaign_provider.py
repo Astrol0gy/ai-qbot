@@ -27,6 +27,7 @@ class CampaignProvider(ToolProvider):
         return [
             {
                 "name": "manage_campaign",
+                "tag": "跑团",
                 "description": (
                     "管理跑团（TRPG）状态。当用户想开始跑团、或 DM 需要记录/更新/查看剧情状态时使用。\n"
                     "【抗幻觉要求】涉及已发生的剧情事实、玩家的决定，必须用 action=log 写入 facts（只增不改）；"

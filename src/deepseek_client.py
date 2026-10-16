@@ -33,6 +33,7 @@ from .tools import (
     execute as execute_tool,
     get_definitions,
     get_max_calls,
+    get_tag,
     get_tool_names,
     has_tool,
     needs_context as tool_needs_context,
@@ -277,7 +278,7 @@ async def _chat_round(
         allowed_for_request = frozenset(t["function"]["name"] for t in definitions)
         request_ctx = replace(ctx, allowed_tools=allowed_for_request)
         kwargs = _build_request_kwargs(messages, definitions or None)
-        with stage('model.request', model=DEEPSEEK_MODEL, iteration=round_num,
+        with runtime.phase('model'), stage('model.request', model=DEEPSEEK_MODEL, iteration=round_num,
                 message_count=len(messages), input_chars=sum(len(str(m)) for m in messages),
                 thinking=DEEPSEEK_ENABLE_THINKING, reasoning_effort=DEEPSEEK_REASONING_EFFORT,
                 max_tokens=DEEPSEEK_MAX_TOKENS):
@@ -343,7 +344,7 @@ async def _chat_round(
                     # 工具实现全是同步阻塞的（requests，单次 8~10s）。直接在事件循环里调，
                     # 一次高德/搜索往返就把所有群、两条通道一起冻住，长考提示与取消也无法
                     # 及时处理。丢进工作线程后，事件循环才能继续处理其他会话和定时器。
-                    with stage('tool', tool=tool_name, iteration=round_num,
+                    with runtime.phase('tool', get_tag(tool_name)), stage('tool', tool=tool_name, tag=get_tag(tool_name), iteration=round_num,
                             arguments=tool_arguments(tc.function.arguments)):
                         result = await runtime.run_blocking(
                             execute_tool, tool_name, tc.function.arguments, request_ctx

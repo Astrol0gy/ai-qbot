@@ -352,6 +352,9 @@ def _describe_media(block: dict, prompt: str, max_tokens: int = 500) -> str | No
         return None
 
     kwargs: dict = {"max_tokens": max_tokens}
+    lease = runtime.current()
+    if lease and lease.progress[0] == "tool":
+        kwargs["timeout"] = Timeout(connect=5, read=None, write=30, pool=10)
     if VISION_ENABLE_THINKING:
         # 思考模式与可见回答共用 max_tokens（实测一次看图推理就能吃 300~1500 token），
         # 所以要给足预算，否则回答会被挤成空
@@ -672,7 +675,7 @@ def text_to_image(
             IMAGE_GEN_ENDPOINT,
             headers=headers,
             json=body,
-            timeout=runtime.remaining(30),
+            timeout=runtime.service_timeout(),
         )
         resp.raise_for_status()
         data = resp.json()
