@@ -166,6 +166,8 @@ class RoundLease:
         self.deadline = float("inf") if timeout is None else time.monotonic() + timeout
         self.valid = True
         self.progress = ("model", "", time.monotonic(), object())
+        self.business_tools_used = False
+        self.chat_segments_allowed = True
         self.writes = {}
         self.after_commit = []
         self.history = None

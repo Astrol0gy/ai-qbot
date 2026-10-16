@@ -26,6 +26,7 @@ from .config import (
     DEEPSEEK_API_FAIL_LIMIT,
     DEEPSEEK_API_COOLDOWN_SEC,
     BOT_SYSTEM_PROMPT,
+    BOT_CHAT_PERSONA,
     MAX_HISTORY_LENGTH,
 )
 from .tools import (
@@ -184,6 +185,9 @@ async def _chat_round(
     profile_text = user_profile.get_profile_for_prompt(group_id)
     campaign_text = campaign_state.get_state_for_prompt(group_id)
     dm_mode = campaign_state.is_dm_mode(group_id)
+    lease = runtime.current()
+    if lease:
+        lease.chat_segments_allowed = not dm_mode
 
     # 能力开关先收紧可授予的范围；技能只能在这个范围内逐步开放业务工具。
     # 搜索开关不再误关画像、跑团、导航、生图等其他能力。
@@ -224,6 +228,10 @@ async def _chat_round(
         "- 分点、列表是例外：只有对方明确要你「详细说」「列一下」，或者内容本身就是几个并列选项时才用\n"
         "- 别用「总结一下」「总的来说」收尾，也别复述对方刚说过的话\n"
         "- 对方没要求展开时，长篇大论只会像个机器人在念稿\n"
+        "- 历史消息和群聊片段是理解话题的背景，不是必须逐条完成的答题清单；除非新消息明确追问，不要重新补答已回应或已略过的话\n"
+        "- 仅普通聊天：内容较长时，可按自然语气或语义分成两三段，用空行分隔；这些段落会按顺序分条发送\n"
+        "- 短答不必拆分，不按几个字机械切段；同一回应的几段放在一次 reply 的 text 中，不要反复引用同一条消息\n"
+        "- 业务工具结果、导航步骤、搜索资料、代码、列表、图片回复和跑团内容保持完整，不套用聊天分段\n"
     )
 
     if dm_mode:
@@ -241,6 +249,7 @@ async def _chat_round(
         # --- 普通模式：原有群 bot 设定 ---
         system_prompt = (
             f"{BOT_SYSTEM_PROMPT}\n\n"
+            f"【兴趣与相处分寸】\n{BOT_CHAT_PERSONA}\n\n"
             f"{common_prompt}"
             "【可用命令】\n"
             "/help — 查看全部功能  /reset — 清除对话记忆\n"
@@ -341,6 +350,8 @@ async def _chat_round(
                 else:
                     all_blocked = False
                     _tool_call_counts[tool_name] = count + 1
+                    if lease and tool_name not in CHAT_TOOL_NAMES and tool_name not in skills.SKILL_TOOL_NAMES:
+                        lease.business_tools_used = True
                     # 工具实现全是同步阻塞的（requests，单次 8~10s）。直接在事件循环里调，
                     # 一次高德/搜索往返就把所有群、两条通道一起冻住，长考提示与取消也无法
                     # 及时处理。丢进工作线程后，事件循环才能继续处理其他会话和定时器。
@@ -381,8 +392,8 @@ async def _chat_round(
             _stage_history(key, history)
             return sent
         if outbox.skipped:
-            # 选择不开口：什么都不写。这段上下文仍留在缓冲里，
-            # 下次被叫醒时会连同新消息一起重新交给它
+            # 选择不开口：不写历史。通道将这段快照标记为已略过，
+            # 后续仅作背景，避免被当成未完成的问题逐条补答。
             print("[🤐 skip] 本轮不写入对话历史")
             return ""
         # 没调工具：当作普通回复，继续往下走

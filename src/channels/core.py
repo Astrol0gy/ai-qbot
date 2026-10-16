@@ -8,7 +8,8 @@ import asyncio
 import re
 import time
 
-from ..config import DEEPSEEK_THINKING_NOTICE_SEC, TOOL_CALL_NOTICE_SEC, STICKER_MAX_PER_REPLY
+from ..config import (DEEPSEEK_THINKING_NOTICE_SEC, TOOL_CALL_NOTICE_SEC, STICKER_MAX_PER_REPLY,
+                      CHAT_MAX_SEGMENTS, CHAT_SEGMENT_INTERVAL_SEC)
 from ..deepseek_client import (
     api_cooldown_left,
     chat,
@@ -54,11 +55,24 @@ WAKE_PROMPT = (
     "· 有人在跟你说话、问你、或者接着你的话往下说 → 用 reply 工具回话；\n"
     "· 群里只是互相聊天、跟你无关，或者你觉得对方还没说完（还会接着补）→ 用 skip 工具，\n"
     "  这条先不开口。\n"
-    "不要只回最早的那一条：这一段里凡是跟你说话的都要照顾到——不同的人各调一次 reply，\n"
-    "并把要引用的那条消息 id 填进 reply_to；如果几句话同属一件事，也可以合在一条里回应。\n"
+    "当前触发消息id：{focus}。优先理解这条新消息及当前话题，再选择值得参与的内容。\n"
+    "上下文不是待办清单，不要求逐条回复或照顾每个人；旧消息只作理解背景，已回应或已略过的内容不要补答。\n"
+    "你可以挑一条回应、合并回应同一话题，或整轮 skip；如果新消息明确追问旧事，再结合旧背景回答。\n"
+    "确实需要回应多个不同话题时才分别调用 reply。用 reply_to 引用实际选择回应的消息，避免连续重复引用。\n"
     "不开口就调 skip 工具，不要用 [skip] 这类文字标记。\n\n"
     "{context}"
 )
+
+
+def _chat_parts(text, limit):
+    """Use model-chosen paragraph boundaries; keep structured content intact."""
+    if (limit <= 1 or IMG_MARKER.search(text) or re.search(r'https?://|```', text)
+            or re.search(r'^\s*(?:\d+[.、)]|[-*·]|\|)', text, re.M)):
+        return [text]
+    parts = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
+    if len(parts) <= 1:
+        return [text]
+    return parts[:limit-1] + ['\n\n'.join(parts[limit-1:])]
 
 
 def _split_image_payloads(payloads: list[str]) -> tuple[list[str], list[str]]:
@@ -248,7 +262,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         wake_context = "\n".join(entry.line() for entry in entries) or msg.extra_ctx or user_msg
         if media and msg.image_descs is None:
             wake_context += "\n" + media
-        user_msg = WAKE_PROMPT.format(context=wake_context)
+        user_msg = WAKE_PROMPT.format(context=wake_context, focus=msg.message_id or "最新一条消息")
         outbox = ReplyOutbox(known_ids={entry.message_id for entry in entries if entry.message_id})
     elif media:
         user_msg = f"{user_msg}\n图片描述：{media}"
@@ -353,44 +367,65 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         if outbox is not None and outbox.skipped and not outbox.has_items:
             outcome('skipped')
             if trigger:
+                trigger.buffer.mark_reviewed(msg.conv_id, entries)
                 trigger.mark_answered(msg.conv_id)
             return
         items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]
         if len(items) == 1 and items[0][0].strip().lower() in SKIP_TOKENS and msg.ai_decides_reply:
             outcome('skipped')
+            if trigger:
+                trigger.buffer.mark_reviewed(msg.conv_id, entries)
+                trigger.mark_answered(msg.conv_id)
             return
+        selected = {target for _, target in items if target}
+        if trigger and selected:
+            trigger.buffer.mark_reviewed(msg.conv_id,
+                [entry for entry in entries if entry.message_id not in selected])
+        natural_chat = (not lease.business_tools_used and lease.chat_segments_allowed
+                        and all(not IMG_MARKER.search(text) for text, _ in items))
+        planned = []
+        extra = max(0, CHAT_MAX_SEGMENTS - len(items))
+        for text, target in items:
+            parts = _chat_parts(text, extra + 1) if natural_chat else [text]
+            extra -= len(parts) - 1
+            planned.extend((part, target if index == 0 else None, target) for index, part in enumerate(parts))
+        items = planned
         receipts = []
         budget = [STICKER_MAX_PER_REPLY, msg.user_name]
-        for text, reply_to in items:
-            budget[1] = lease.actors.get(reply_to, (msg.user_id, msg.user_name))[1]
-            with stage('delivery', reply_to=reply_to):
-                receipt = await _deliver(sender, text, reply_to, budget)
-            log_event('delivery.receipt', status=receipt.status, text=receipt.text,
-                image_count=len(receipt.images), sticker_count=len(receipt.stickers), detail=receipt.detail,
-                reply_to=reply_to)
-            outcome(receipt.status)
-            receipts.append(receipt)
-            if receipt.status not in ("ok", "dropped"):
-                break  # No duplicate retries after ambiguous or partial delivery.
-        recorded = [r.history_text() for r in receipts if r.status in ("ok", "partial", "unknown")]
-        if recorded:
-            dc.commit_delivery(lease, "\n".join(recorded))
-        if trigger:
-            complete = len(receipts) == len(items) and all(r.delivered for r in receipts)
-            if complete:
-                trigger.buffer.consume(msg.conv_id, entries)
-            else:
-                covered = set()
-                for (_, target), receipt in zip(items, receipts):
-                    if receipt.status in ("ok", "partial", "unknown"):
-                        if target:
-                            covered.add(target)
-                        elif receipt.status in ("partial", "unknown"):
-                            covered.update(entry.message_id for entry in entries)
-                trigger.buffer.consume(msg.conv_id, [entry for entry in entries if entry.message_id in covered])
-            if complete:
-                trigger.mark_answered(msg.conv_id)
-            else:
-                trigger.leave_session(msg.conv_id)
+        try:
+            for index, (text, reply_to, source_target) in enumerate(items):
+                if natural_chat and index and CHAT_SEGMENT_INTERVAL_SEC:
+                    await asyncio.sleep(CHAT_SEGMENT_INTERVAL_SEC)
+                budget[1] = lease.actors.get(source_target, (msg.user_id, msg.user_name))[1]
+                with stage('delivery', reply_to=reply_to):
+                    receipt = await _deliver(sender, text, reply_to, budget)
+                log_event('delivery.receipt', status=receipt.status, text=receipt.text,
+                    image_count=len(receipt.images), sticker_count=len(receipt.stickers), detail=receipt.detail,
+                    reply_to=reply_to)
+                outcome(receipt.status)
+                receipts.append(receipt)
+                if receipt.status not in ("ok", "dropped"):
+                    break  # No duplicate retries after ambiguous or partial delivery.
+        finally:
+            recorded = [r.history_text() for r in receipts if r.status in ("ok", "partial", "unknown")]
+            if recorded:
+                dc.commit_delivery(lease, "\n".join(recorded))
+            if trigger:
+                complete = len(receipts) == len(items) and all(r.delivered for r in receipts)
+                if complete:
+                    trigger.buffer.consume(msg.conv_id, entries)
+                else:
+                    covered = set()
+                    for (_, _, target), receipt in zip(items, receipts):
+                        if receipt.status in ("ok", "partial", "unknown"):
+                            if target:
+                                covered.add(target)
+                            elif receipt.status in ("partial", "unknown"):
+                                covered.update(entry.message_id for entry in entries)
+                    trigger.buffer.consume(msg.conv_id, [entry for entry in entries if entry.message_id in covered])
+                if complete:
+                    trigger.mark_answered(msg.conv_id)
+                else:
+                    trigger.leave_session(msg.conv_id)
     finally:
         lease.revoke()

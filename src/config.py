@@ -62,6 +62,17 @@ BOT_SYSTEM_PROMPT = os.getenv(
     "5.有分寸感，群聊中注意不刷屏、不打乱话题节奏，语气随和但不油腻。"
 )
 MAX_HISTORY_LENGTH = int(os.getenv("MAX_HISTORY_LENGTH", "10"))
+BOT_CHAT_PERSONA = os.getenv(
+    "BOT_CHAT_PERSONA",
+    "喜欢游戏、音乐、电影、动漫、漫画、ACG和电脑技术，对宗教、哲学也有兴趣。"
+    "兴趣影响你选择参与的话题，不要求逢相关话题必答，也不要硬把话题拉回兴趣。"
+    "政治话题保持审慎、克制，区分事实与观点，避免武断站队或断言未核实信息。"
+    "被骂或遇到激烈、相左的意见时，倾向用轻松可爱的语气、适度自嘲来萌混过关，"
+    "也可以不接话；不对骂、不阴阳怪气、不升级冲突，不用玩笑敷衍真实求助。"
+    "卖萌自然适量，不固定复读同一句话。",
+)
+CHAT_MAX_SEGMENTS = int(os.getenv("CHAT_MAX_SEGMENTS", "3"))
+CHAT_SEGMENT_INTERVAL_SEC = float(os.getenv("CHAT_SEGMENT_INTERVAL_SEC", "0.6"))
 
 # ============================================
 # 图片理解（DeepSeek 官方视觉接口）
@@ -205,6 +216,7 @@ def validate():
     if ADMIN_QQ and (not ADMIN_QQ.isascii() or not ADMIN_QQ.isdigit() or int(ADMIN_QQ) <= 0):
         raise ValueError("ADMIN_QQ 必须为空或有效的数字 QQ 号")
     bounds = {
+        "CHAT_MAX_SEGMENTS": (1, 3), "CHAT_SEGMENT_INTERVAL_SEC": (0, 3),
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
         "TOOL_CALL_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),

@@ -64,9 +64,12 @@ class BufferEntry:
     at_bot: bool = False
     quote: str = ""     # 已拼好的人类可读描述，如「引用了你的消息：「…」」
     ts: float = 0.0     # 入缓冲时刻（monotonic），用于「只清掉这一轮之前」的判断
+    reviewed: bool = False  # 已考虑但选择略过，只作后续理解话题的背景
 
     def line(self) -> str:
         marks = []
+        if self.reviewed:
+            marks.append("已看过并略过，仅作背景，无需补答")
         if self.at_bot:
             marks.append("@了你")
         if self.quote:
@@ -132,6 +135,12 @@ class MessageBuffer:
             self._buf[conv_id] = kept
         else:
             self._buf.pop(conv_id, None)
+
+    def mark_reviewed(self, conv_id, entries):
+        identities = {id(entry) for entry in entries}
+        for entry in self._buf.get(conv_id, []):
+            if id(entry) in identities:
+                entry.reviewed = True
 
     def clear(self, conv_id: str, before: float | None = None) -> None:
         """

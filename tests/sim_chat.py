@@ -527,14 +527,14 @@ def report(sim: Sim) -> None:
             check(f"{t}：skip 后一条都没发出去", not sent, f"实际发了 {len(sent)} 条")
             if r["immediate"]:
                 check(
-                    f"{t}：skip 后片段留在缓冲里（下条消息继续用）",
+                    f"{t}：skip 后片段留作背景（无需逐条补答）",
                     bool(r["buf_after"].strip()),
                     r["buf_after"].replace("\n", " | "),
                 )
         elif r["outbox"]:
             check(
-                f"{t}：reply 调用条数 == 实际发送条数",
-                len(sent) == len(r["outbox"]),
+                f"{t}：每条 reply 都有投递（允许语义分条）",
+                len(sent) >= len(r["outbox"]),
                 f"工具 {len(r['outbox'])} 条 / 实际 {len(sent)} 条",
             )
             check(f"{t}：回复后互动窗口仍开着", bool(r["active"]))
