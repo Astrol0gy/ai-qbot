@@ -18,6 +18,7 @@ python tests/skill_loading_check.py
 python tests/_degrade_check.py
 python tests/state_isolation_check.py
 python tests/sticker_check.py
+python tests/sticker_classification_check.py
 python tests/history_compress_check.py
 python tests/navi_check.py
 python tests/sim_chat.py 4 5
