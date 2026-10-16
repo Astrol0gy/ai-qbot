@@ -1,334 +1,518 @@
 #!/usr/bin/env bash
 #
-# ai-qbot 一键管理脚本（Termux 单机部署：机器人 + NapCat 同机）
+# ai-qbot 一键管理脚本
 #
-#   bash start.sh           一键启动（唤醒锁 → NapCat → 机器人）
-#   bash start.sh reload    仅重载机器人代码，保留 NapCat 与 QQ 登录
-#   bash start.sh stop      停止机器人 + NapCat，并释放唤醒锁
-#   bash start.sh status    查看状态（进程真活着没 / 端口 / QQ 在线 / 日志尾部）
-#   bash start.sh webui     打开 NapCat 的 WebUI（首次登录 QQ 要扫码）
-#   bash start.sh log       实时跟随机器人日志
-#   bash start.sh help      帮助
+# 部署结构：
+#   - ai-qbot：宿主机 Python / Conda 环境运行
+#   - NapCatQQ：Docker Compose 运行
+#   - OneBot：NapCat 正向 WebSocket，默认 ws://127.0.0.1:3001
 #
-# 为什么用 bash 调用：项目放在共享存储（/sdcard）上时是 noexec，./start.sh 会
-# Permission denied；bash start.sh 只需要读权限，绕过它。
+# 用法：
 #
-# 若提示 bad interpreter，用 bash 调用即可：bash start.sh
-
-# ------------------------------ 可按需修改 ------------------------------
-# 机器人的 python；用了虚拟环境就改成 /path/to/venv/bin/python
-PYTHON_CMD="${PYTHON_CMD:-python}"
-# NapCat 启动命令：整条命令行（用 bash -lc 执行，可以带引号、管道）。
-# 默认对应官方安装脚本的「Shell (Rootless) / proot 容器」方式：这种方式 Termux 里
-# **没有** napcat 命令（除非安装时选了 TUI-CLI），NapCat 在容器里，得靠 proot-distro 进去跑。
-NAPCAT_CMD_DEFAULT='proot-distro sh napcat -- bash -c "xvfb-run -a /root/Napcat/opt/QQ/qq --no-sandbox"'
-NAPCAT_CMD="${NAPCAT_CMD:-$NAPCAT_CMD_DEFAULT}"
-# 检测 NapCat 在不在跑时匹配的进程关键词（容器方式下进程命令行里含 napcat）
-NAPCAT_PROC="${NAPCAT_PROC:-napcat}"
-# 存在性检查只看整条命令的第一个词（即上面那条的 proot-distro）
-NAPCAT_BIN="${NAPCAT_CMD%% *}"
-# NapCat 的 WebUI 配置文件（默认是容器方式的路径；装法不同就整条覆盖）。
-# 扫码登录用的地址 + token 都在这个文件里，bash start.sh webui 会读它。
-TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-WEBUI_JSON="${WEBUI_JSON:-$TERMUX_PREFIX/var/lib/proot-distro/installed-rootfs/napcat/root/Napcat/opt/QQ/resources/app/app_launcher/napcat/config/webui.json}"
-# 启动 NapCat 后等它监听 WS 端口的秒数（等不到也会继续启动机器人：
-# 机器人自己有重连循环，NapCat 起来后会自动连上）
-# 容器方式（proot + xvfb + QQ）启动慢，给宽一点
-WS_WAIT_SEC="${WS_WAIT_SEC:-45}"
+#   bash start.sh
+#   bash start.sh start
+#       启动 NapCat Docker + qbot
+#
+#   bash start.sh reload
+#       只重启 qbot
+#       不重启 NapCat，不影响 QQ 登录
+#
+#   bash start.sh stop
+#       停止 qbot + NapCat
+#
+#   bash start.sh status
+#       查看 Docker / OneBot / QQ / qbot 状态
+#
+#   bash start.sh log
+#       实时查看 qbot 日志
+#
+#   bash start.sh naplog
+#       实时查看 NapCat 日志
+#
+#   bash start.sh webui
+#       查看 NapCat WebUI SSH 隧道使用方法
+#
+#   bash start.sh help
+#       查看帮助
+#
 # ----------------------------------------------------------------------
 
 set -uo pipefail
 
-PROJECT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# ==============================
+# 可配置项
+# ==============================
+
+# 默认使用执行 start.sh 时当前环境中的 python。
+# 如果当前已 conda activate qbot，则一般就是：
+# /opt/miniconda3/envs/qbot/bin/python
+PYTHON_CMD="${PYTHON_CMD:-python}"
+
+# NapCat Docker Compose 目录
+NAPCAT_DIR="${NAPCAT_DIR:-/opt/napcat}"
+
+# compose.yaml 中 service 名
+NAPCAT_SERVICE="${NAPCAT_SERVICE:-napcat}"
+
+# Docker 容器名
+NAPCAT_CONTAINER="${NAPCAT_CONTAINER:-napcat}"
+
+# WebUI 映射到宿主机的端口
+NAPCAT_WEBUI_PORT="${NAPCAT_WEBUI_PORT:-6099}"
+
+# Docker 启动后最多等多久让 OneBot WS 就绪。
+# QQ 尚未登录或 WS 尚未配置时，即使等不到也会继续启动 qbot，
+# 因为 qbot 自身会进行重连。
+WS_WAIT_SEC="${WS_WAIT_SEC:-30}"
+
+# screen 会话名
+BOT_SESSION="${BOT_SESSION:-qbot}"
+
+
+# ==============================
+# 项目路径
+# ==============================
+
+PROJECT_DIR="$(
+    cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" >/dev/null 2>&1 &&
+    pwd
+)"
+
+if [ -z "$PROJECT_DIR" ]; then
+    echo "无法确定项目目录" >&2
+    exit 1
+fi
+
 cd "$PROJECT_DIR" || exit 1
 
-INSTANCE_ID="$("$PYTHON_CMD" -c 'import hashlib,os; print(hashlib.sha256(os.path.realpath(".").encode()).hexdigest()[:10])')"
-BOT_SESSION="qbot-$INSTANCE_ID"
-NAPCAT_SESSION="napcat-$INSTANCE_ID"
 LOG_DIR="$PROJECT_DIR/logs"
 BOT_LOG="$LOG_DIR/qbot.log"
 
-info() { printf '  %s\n' "$*"; }
-ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
-err()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
+# 先使用默认值；require_python 后再从 src.config 读取真实地址
+WS_URL="ws://127.0.0.1:3001"
 
-# Use the same parser as Python; IPv6 and implicit ws/wss ports are supported.
-read -r WS_HOST WS_PORT ONEBOT_ACTIVE < <(
-    "$PYTHON_CMD" -c 'from urllib.parse import urlsplit; from src.config import ONEBOT_WS_URL,ONEBOT_ENABLE; p=urlsplit(ONEBOT_WS_URL); print(p.hostname or "127.0.0.1", p.port or (443 if p.scheme=="wss" else 80), int(ONEBOT_ENABLE))'
-)
-WS_URL="$("$PYTHON_CMD" -c 'from src.config import ONEBOT_WS_URL; print(ONEBOT_WS_URL)')"
-ONEBOT_ACTIVE="${ONEBOT_ACTIVE:-0}"
 
-# ------------------------------ 基础检查 ------------------------------
-require_screen() {
-    if ! command -v screen >/dev/null 2>&1; then
-        err "没装 screen，先执行：pkg install screen"
-        exit 1
-    fi
+# ==============================
+# 输出函数
+# ==============================
+
+info() {
+    printf '  %s\n' "$*"
 }
+
+ok() {
+    printf '\033[32m✓\033[0m %s\n' "$*"
+}
+
+warn() {
+    printf '\033[33m!\033[0m %s\n' "$*"
+}
+
+err() {
+    printf '\033[31m✗\033[0m %s\n' "$*" >&2
+}
+
+
+# ==============================
+# 基础依赖
+# ==============================
 
 require_python() {
     if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
-        err "找不到 python 命令（$PYTHON_CMD），请检查 PYTHON_CMD 配置"
+        err "找不到 Python：$PYTHON_CMD"
+        info "如果你使用 Conda，请先："
+        info "  conda activate qbot"
         exit 1
     fi
 }
 
-# 会话状态：running / dead / none
-# 注意：screen 里进程退出后会话会以 (Dead) 残留，这里要区分开，
-# 否则会出现「显示在运行、其实早就挂了」的误判。
-session_state() {
-    local line
-    line="$(screen -ls 2>/dev/null | grep -E "[0-9]+\.$1[[:space:]]")"
-    if [ -z "$line" ]; then
-        echo none
-    elif [[ "$line" == *Dead* ]]; then
-        echo dead
-    else
-        echo running
+
+require_screen() {
+    if ! command -v screen >/dev/null 2>&1; then
+        err "没有安装 screen"
+        info "OpenCloudOS / RHEL 系可尝试："
+        info "  dnf install -y screen"
+        exit 1
     fi
 }
 
-port_open() {
-    "$PYTHON_CMD" - "$WS_HOST" "$WS_PORT" <<'PY' 2>/dev/null
-import socket, sys
-try:
-    with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1.5):
-        pass
-except OSError:
-    sys.exit(1)
-PY
+
+require_docker() {
+    if ! command -v docker >/dev/null 2>&1; then
+        err "找不到 docker"
+        exit 1
+    fi
+
+    if ! docker compose version >/dev/null 2>&1; then
+        err "docker compose 不可用"
+        exit 1
+    fi
+
+    if [ ! -d "$NAPCAT_DIR" ]; then
+        err "NapCat 目录不存在：$NAPCAT_DIR"
+        exit 1
+    fi
+
+    if [ ! -f "$NAPCAT_DIR/compose.yaml" ] &&
+       [ ! -f "$NAPCAT_DIR/compose.yml" ] &&
+       [ ! -f "$NAPCAT_DIR/docker-compose.yml" ] &&
+       [ ! -f "$NAPCAT_DIR/docker-compose.yaml" ]; then
+
+        err "在 $NAPCAT_DIR 找不到 Docker Compose 配置"
+        info "支持："
+        info "  compose.yaml"
+        info "  compose.yml"
+        info "  docker-compose.yml"
+        info "  docker-compose.yaml"
+        exit 1
+    fi
 }
 
-# 扫 /proc 找进程（不依赖 procps 的 pgrep，Termux 默认没装）
-# 关键词走环境变量而不是命令行参数：参数会出现在自己的 /proc/<pid>/cmdline 里，
-# 那样每次都扫到自己、永远返回「还活着」，机器人就再也起不来了。
-# 多个关键词任意命中即算存活。
-proc_alive() {
-    PROC_KEYS="$(printf '%s\n' "$@")" PROC_ROOT="${PROC_ROOT:-/proc}" \
-        "$PYTHON_CMD" - <<'PY' 2>/dev/null
+
+# ==============================
+# 配置读取
+# ==============================
+
+load_ws_url() {
+    local value
+
+    value="$(
+        "$PYTHON_CMD" -c \
+            'from src.config import ONEBOT_WS_URL; print(ONEBOT_WS_URL)' \
+            2>/dev/null
+    )" || true
+
+    if [ -n "$value" ]; then
+        WS_URL="$value"
+    else
+        WS_URL="ws://127.0.0.1:3001"
+    fi
+}
+
+
+# ==============================
+# screen / 进程状态
+# ==============================
+
+session_state() {
+    local name="$1"
+    local line
+
+    line="$(
+        screen -ls 2>/dev/null |
+        grep -E "[0-9]+\.${name}[[:space:]]" |
+        head -n 1
+    )"
+
+    if [ -z "$line" ]; then
+        echo "none"
+    elif [[ "$line" == *Dead* ]]; then
+        echo "dead"
+    else
+        echo "running"
+    fi
+}
+
+
+# 查找 qbot Python 进程。
+# 不依赖 pgrep，避免不同发行版差异。
+bot_running() {
+    QBOT_PROJECT_DIR="$PROJECT_DIR" "$PYTHON_CMD" - <<'PY' 2>/dev/null
 import os
 import sys
 
-keys = [k for k in os.environ["PROC_KEYS"].splitlines() if k]
-root = os.environ["PROC_ROOT"]
-try:
-    entries = os.listdir(root)
-except OSError:
-    sys.exit(1)  # 没有 /proc（非 Linux）→ 当作没找到
+project = os.environ.get("QBOT_PROJECT_DIR", "")
 
-for pid in entries:
-    if not pid.isdigit():
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
         continue
+
+    base = os.path.join("/proc", entry)
+
     try:
-        scope = os.environ.get("PROC_CWD")
-        if scope and os.path.realpath(os.path.join(root, pid, "cwd")) != os.path.realpath(scope):
-            continue
-        with open(os.path.join(root, pid, "cmdline"), "rb") as f:
-            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        with open(os.path.join(base, "cmdline"), "rb") as f:
+            cmd = f.read().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
     except OSError:
         continue
-    # 跳过 screen 自己的进程：它的命令行里带着会话名（screen -S napcat），
-    # 会把「空壳会话」误判成「服务还在」
-    if cmd.split(" ", 1)[0].rsplit("/", 1)[-1] in ("screen", "SCREEN"):
+
+    if "src.main" not in cmd and "src/main" not in cmd:
         continue
-    if any(k in cmd for k in keys):
+
+    # 尽量限制到当前项目，避免服务器上另一个 qbot 被误判。
+    try:
+        cwd = os.path.realpath(os.path.join(base, "cwd"))
+    except OSError:
+        cwd = ""
+
+    if cwd == project or cwd.startswith(project + os.sep):
         sys.exit(0)
+
 sys.exit(1)
 PY
 }
 
-# 「真的在跑」和「screen 会话还在」是两件事。
-# 会话里的程序退出后，如果那是个交互式 shell，会话照样活着，于是出现
-# 「显示在运行、其实早就挂了」—— NapCat 半夜挂掉、Termux 却看起来一切正常，
-# 就是这么来的。
-bot_running()    { PROC_CWD="$PROJECT_DIR" proc_alive "-m src.main" "-m src.runner" "src/main.py"; }
-napcat_running() { proc_alive "$NAPCAT_PROC" || port_open; }
 
-# 清掉只剩壳的残留会话，否则 screen -dmS 会因会话重名而起不来
-drop_stale_session() {
-    case "$(session_state "$1")" in
-        none) return 0 ;;
-    esac
-    warn "清理残留的 screen 会话 $1（里面已经没有进程）"
-    screen -S "$1" -X quit >/dev/null 2>&1
-    sleep 1
-}
+drop_stale_bot_session() {
+    local state
 
-# ------------------------------ 仅启动机器人 ------------------------------
-start_bot() {
-    mkdir -p "$LOG_DIR"
-    if bot_running; then
-        info "机器人已在运行，跳过启动"
-        if [ ! -f "$BOT_LOG" ]; then
-            warn "它不是本脚本启动的，所以没有日志文件"
-            info "想要日志，请先停止原机器人，再用 bash start.sh 启动"
-        fi
-    else
-        drop_stale_session "$BOT_SESSION"
-        screen -dmS "$BOT_SESSION" env \
-            QBOT_DIR="$PROJECT_DIR" \
-            QBOT_PY="$PYTHON_CMD" \
-            QBOT_LOG="$BOT_LOG" \
-            bash -lc 'cd "$QBOT_DIR" && exec "$QBOT_PY" -u -m src.runner'
-        sleep 2
-        if bot_running; then
-            ok "已启动机器人（日志：$BOT_LOG）"
-        else
-            err "机器人启动后立刻退出了，看看日志："
-            tail -n 20 "$BOT_LOG" 2>/dev/null
-            return 1
-        fi
-    fi
-}
-
-# ------------------------------ 启动 ------------------------------
-do_start() {
-    require_screen
-    require_python
-    screen -wipe >/dev/null 2>&1
-    mkdir -p "$LOG_DIR"
-
-    # 1) 唤醒锁：挂在 Termux 应用进程上，App 被杀/设备重启后会丢，
-    #    所以每次 start 都重新获取一次（重复获取无副作用）
-    if command -v termux-wake-lock >/dev/null 2>&1; then
-        termux-wake-lock >/dev/null 2>&1 && ok "已获取唤醒锁（息屏后不被冻结）"
-    else
-        warn "找不到 termux-wake-lock，建议 pkg install termux-tools"
-    fi
-
-    # 2) NapCat is only needed when OneBot is enabled.
-    if [ "$ONEBOT_ACTIVE" = "1" ]; then
-    if napcat_running; then
-        info "NapCat 已在运行，跳过启动"
-    else
-        if ! command -v "$NAPCAT_BIN" >/dev/null 2>&1; then
-            err "找不到命令「$NAPCAT_BIN」（NapCat 启动命令的第一个词）"
-            info "NapCat 装在 proot 容器里的话，需要：pkg install proot-distro"
-            info "启动命令不一样的话，整条覆盖掉再跑："
-            info "  NAPCAT_CMD='你的启动命令' bash start.sh"
-            exit 1
-        fi
-        drop_stale_session "$NAPCAT_SESSION"
-        screen -dmS "$NAPCAT_SESSION" bash -lc "$NAPCAT_CMD"
-        ok "已启动 NapCat（screen 会话 $NAPCAT_SESSION）"
-
-        printf '  等待 NapCat 监听 %s ' "$WS_URL"
-        i=0
-        while [ "$i" -lt "$WS_WAIT_SEC" ]; do
-            if port_open; then
-                printf '\n'
-                ok "WS 端口已就绪"
-                break
-            fi
-            sleep 2
-            i=$((i + 2))
-            printf '.'
-        done
-        if ! port_open; then
-            printf '\n'
-            warn "等不到 WS 端口，仍然继续启动机器人（它会自己重连）"
-            if [ "$(session_state "$NAPCAT_SESSION")" = "dead" ]; then
-                err "NapCat 进程已经退出——启动命令本身有问题"
-                info "直接在 Termux 里跑一遍就能看到报错（不用进 screen）："
-                info "  $NAPCAT_CMD"
-                info "命令不对就整条覆盖：NAPCAT_CMD='...' bash start.sh"
-            else
-                info "登录成功之前 NapCat 不会监听这个端口。要扫码登录的话："
-                info "  bash start.sh webui    # 读 webui.json 拼出地址，直接打开扫码页面"
-                info "（进 screen -r $NAPCAT_SESSION 也能看到同一行网址，Ctrl+A 再按 D 退出）"
-                info "其他可能：还没在 WebUI 里建「WebSocket 服务器」"
-            fi
-        fi
-    fi
-
-    fi
-
-    # 3) 机器人（输出同时进日志文件，方便事后回看「它到底卡在哪」）
-    start_bot || return 1
-
-    echo
-    ok "启动完成"
-    info "看日志：bash start.sh log      或  screen -r $BOT_SESSION"
-    info "看状态：bash start.sh status"
-    info "停全部：bash start.sh stop"
-}
-
-# ------------------------------ 仅重载机器人 ------------------------------
-do_reload() {
-    require_screen
-    require_python
-    # Check new source/configuration before interrupting the current process.
-    if ! "$PYTHON_CMD" -c 'import ast; from pathlib import Path; [ast.parse(p.read_text(encoding="utf-8-sig"), filename=str(p)) for p in Path("src").rglob("*.py")]; from src.config import validate; validate()'; then
-        err "新代码语法或配置检查失败，未停止原机器人"
-        return 1
-    fi
-    local state i
     state="$(session_state "$BOT_SESSION")"
-    if bot_running && [ "$state" != "running" ]; then
-        err "发现不受当前 screen 会话管理的机器人，请先手动停止该进程，再用 bash start.sh 启动一次"
+
+    case "$state" in
+        none)
+            return 0
+            ;;
+    esac
+
+    if bot_running; then
+        return 0
+    fi
+
+    warn "清理残留 screen 会话：$BOT_SESSION"
+
+    screen -S "$BOT_SESSION" -X quit >/dev/null 2>&1 || true
+    sleep 1
+
+    screen -wipe >/dev/null 2>&1 || true
+}
+
+
+# ==============================
+# OneBot 端口检查
+# ==============================
+
+port_open() {
+    "$PYTHON_CMD" - "$WS_URL" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+from urllib.parse import urlparse
+
+url = sys.argv[1]
+
+parsed = urlparse(url)
+
+host = parsed.hostname
+port = parsed.port
+
+if not host:
+    raise SystemExit(1)
+
+if port is None:
+    port = 443 if parsed.scheme == "wss" else 80
+
+try:
+    sock = socket.create_connection((host, port), timeout=1.5)
+except OSError:
+    raise SystemExit(1)
+
+sock.close()
+raise SystemExit(0)
+PY
+}
+
+
+wait_ws() {
+    local elapsed=0
+
+    printf '  等待 OneBot WebSocket %s ' "$WS_URL"
+
+    while [ "$elapsed" -lt "$WS_WAIT_SEC" ]; do
+        if port_open; then
+            printf '\n'
+            ok "OneBot WebSocket 已就绪"
+            return 0
+        fi
+
+        printf '.'
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    printf '\n'
+    return 1
+}
+
+
+# ==============================
+# Docker / NapCat
+# ==============================
+
+napcat_running() {
+    [ "$(
+        docker inspect \
+            -f '{{.State.Running}}' \
+            "$NAPCAT_CONTAINER" \
+            2>/dev/null
+    )" = "true" ]
+}
+
+
+napcat_exists() {
+    docker inspect "$NAPCAT_CONTAINER" >/dev/null 2>&1
+}
+
+
+compose() {
+    (
+        cd "$NAPCAT_DIR" || exit 1
+        docker compose "$@"
+    )
+}
+
+
+start_napcat() {
+    require_docker
+
+    if napcat_running; then
+        info "NapCat Docker 已在运行，跳过启动"
+        return 0
+    fi
+
+    info "启动 NapCat Docker..."
+
+    if ! compose up -d "$NAPCAT_SERVICE"; then
+        err "NapCat Docker 启动失败"
         return 1
     fi
-    if [ "$state" = "running" ] && bot_running; then
-        info "正在退出机器人；NapCat 保持运行"
-        if ! screen -S "$BOT_SESSION" -p 0 -X stuff $'\003' >/dev/null 2>&1; then
-            err "无法通知机器人退出，未启动第二个进程"
-            return 1
-        fi
-        for ((i=0; i<15; i++)); do
-            bot_running || break
-            sleep 1
-        done
-        if bot_running; then
-            err "机器人仍在退出中，稍后重试 bash start.sh reload；未强制终止，也未重复启动"
-            return 1
-        fi
+
+    sleep 2
+
+    if napcat_running; then
+        ok "NapCat Docker 已启动"
+        return 0
     fi
-    start_bot || return 1
-    ok "机器人代码已重载（NapCat 与终端保持运行）"
+
+    err "NapCat 容器没有进入运行状态"
+    info "查看日志："
+    info "  bash start.sh naplog"
+
+    return 1
 }
 
-# ------------------------------ 停止 ------------------------------
-do_stop() {
+
+stop_napcat() {
+    require_docker
+
+    if ! napcat_exists; then
+        info "NapCat 容器不存在"
+        return 0
+    fi
+
+    if ! napcat_running; then
+        info "NapCat 已停止"
+        return 0
+    fi
+
+    info "停止 NapCat..."
+
+    if compose stop "$NAPCAT_SERVICE"; then
+        ok "NapCat 已停止"
+    else
+        err "停止 NapCat 失败"
+        return 1
+    fi
+}
+
+
+# ==============================
+# qbot 启停
+# ==============================
+
+start_bot() {
+    require_python
     require_screen
-    for name in "$BOT_SESSION" "$NAPCAT_SESSION"; do
-        case "$(session_state "$name")" in
-            none)
-                info "$name 未在运行"
-                ;;
-            *)
-                if [ "$name" = "$BOT_SESSION" ]; then
-                    screen -S "$name" -p 0 -X stuff $'\003' >/dev/null 2>&1
-                    for ((i=0; i<15; i++)); do
-                        bot_running || break
-                        sleep 1
-                    done
-                fi
-                screen -S "$name" -X quit >/dev/null 2>&1
-                ok "已停止 $name"
-                ;;
-        esac
-    done
-    screen -wipe >/dev/null 2>&1
 
-    # 容器方式下 proot 的子孙进程偶尔会活过 screen 会话，确认一下（没有 python 就跳过，
-    # 停止这件事不能因为缺工具而失败）
-    if command -v "$PYTHON_CMD" >/dev/null 2>&1 && port_open; then
-        warn "NapCat 的 WS 端口还在（$WS_URL）——容器里可能有残留进程没退"
-        info "稍等几秒再看一次：bash start.sh status"
+    mkdir -p "$LOG_DIR"
+
+    if bot_running; then
+        info "qbot 已在运行，跳过启动"
+        return 0
     fi
 
-    if command -v termux-wake-unlock >/dev/null 2>&1; then
-        termux-wake-unlock >/dev/null 2>&1 && info "已释放唤醒锁"
+    drop_stale_bot_session
+
+    # 将当前 Python 的绝对路径传进 screen。
+    # 这样即使 screen 里的 login shell 没继承 Conda 环境，
+    # 仍然会使用当前 qbot 环境中的 Python。
+    local python_abs
+    python_abs="$(command -v "$PYTHON_CMD")"
+
+    info "启动 qbot..."
+    info "Python：$python_abs"
+
+    screen -dmS "$BOT_SESSION" env \
+        QBOT_DIR="$PROJECT_DIR" \
+        QBOT_PY="$python_abs" \
+        QBOT_LOG="$BOT_LOG" \
+        bash -lc '
+            cd "$QBOT_DIR" || exit 1
+            "$QBOT_PY" -u -m src.main 2>&1 | tee -a "$QBOT_LOG"
+        '
+
+    sleep 2
+
+    if bot_running; then
+        ok "qbot 已启动"
+        info "日志：$BOT_LOG"
+        return 0
     fi
+
+    err "qbot 启动后立即退出"
+
+    if [ -f "$BOT_LOG" ]; then
+        echo
+        tail -n 30 "$BOT_LOG"
+    fi
+
+    return 1
 }
 
-# ------------------------------ 状态 ------------------------------
-# 直连 NapCat 查 get_status / get_login_info，判断 QQ 本身在不在线。
-# 这是「机器人像死了但其实只是 QQ 掉线」唯一靠谱的判据：
-# NapCat 进程活着、WS 也连着，只是 QQ 那条长连接断了，于是收不到任何消息。
-# 会短暂开第二条 WS（NapCat 支持多客户端），不影响正在跑的机器人。
+
+stop_bot() {
+    require_screen
+
+    local state
+    state="$(session_state "$BOT_SESSION")"
+
+    if ! bot_running && [ "$state" = "none" ]; then
+        info "qbot 未运行"
+        return 0
+    fi
+
+    info "停止 qbot..."
+
+    if [ "$state" != "none" ]; then
+        screen -S "$BOT_SESSION" -X quit >/dev/null 2>&1 || true
+    fi
+
+    # 最多等十秒让 Python 真正退出。
+    local i=0
+
+    while bot_running && [ "$i" -lt 10 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+
+    screen -wipe >/dev/null 2>&1 || true
+
+    if bot_running; then
+        err "qbot 仍在退出中"
+        info "暂不重复启动，稍后再执行："
+        info "  bash start.sh reload"
+        return 1
+    fi
+
+    ok "qbot 已停止"
+    return 0
+}
+
+
+# ==============================
+# QQ 在线状态检查
+# ==============================
+
 check_qq() {
     "$PYTHON_CMD" - <<'PY'
 import asyncio
@@ -340,200 +524,589 @@ import aiohttp
 from src.config import ONEBOT_ACCESS_TOKEN, ONEBOT_WS_URL
 
 
-async def call(ws, action, echo):
-    await ws.send_str(json.dumps({"action": action, "echo": echo}))
+async def request(ws, action, echo):
+    await ws.send_str(
+        json.dumps(
+            {
+                "action": action,
+                "params": {},
+                "echo": echo,
+            }
+        )
+    )
+
     while True:
-        msg = await ws.receive()
-        if msg.type is not aiohttp.WSMsgType.TEXT:
+        message = await ws.receive()
+
+        if message.type != aiohttp.WSMsgType.TEXT:
             return None
+
         try:
-            payload = json.loads(msg.data)
+            payload = json.loads(message.data)
         except Exception:
             continue
-        for item in payload if isinstance(payload, list) else [payload]:
-            if isinstance(item, dict) and str(item.get("echo")) == echo:
+
+        messages = payload if isinstance(payload, list) else [payload]
+
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+
+            if str(item.get("echo")) == echo:
                 return item
 
 
-async def main():
+async def probe():
     headers = {}
+
     if ONEBOT_ACCESS_TOKEN:
-        headers["Authorization"] = f"Bearer {ONEBOT_ACCESS_TOKEN}"
+        headers["Authorization"] = (
+            f"Bearer {ONEBOT_ACCESS_TOKEN}"
+        )
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.ws_connect(ONEBOT_WS_URL) as ws:
-            status = await asyncio.wait_for(call(ws, "get_status", "probe-status"), 6)
-            login = await asyncio.wait_for(call(ws, "get_login_info", "probe-login"), 6)
+    timeout = aiohttp.ClientTimeout(total=15)
 
-    who = ""
-    if login and login.get("data"):
-        d = login["data"]
-        nick = d.get("nickname") or ""
-        who = f"（{d.get('user_id', '?')}{' ' + nick if nick else ''}）"
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+    ) as session:
 
-    if not status:
-        print("?  NapCat 没回 get_status，无法判断登录状态")
+        async with session.ws_connect(
+            ONEBOT_WS_URL,
+            heartbeat=None,
+        ) as ws:
+
+            status = await asyncio.wait_for(
+                request(ws, "get_status", "qbot-status"),
+                timeout=6,
+            )
+
+            login = await asyncio.wait_for(
+                request(ws, "get_login_info", "qbot-login"),
+                timeout=6,
+            )
+
+    online = bool(
+        isinstance(status, dict)
+        and isinstance(status.get("data"), dict)
+        and status["data"].get("online") is True
+    )
+
+    user_id = "?"
+    nickname = ""
+
+    if isinstance(login, dict):
+        data = login.get("data")
+
+        if isinstance(data, dict):
+            user_id = data.get("user_id", "?")
+            nickname = data.get("nickname") or ""
+
+    identity = str(user_id)
+
+    if nickname:
+        identity += f" {nickname}"
+
+    if online:
+        print(
+            "\033[32m✓\033[0m "
+            f"QQ 在线（{identity}）"
+        )
         return 0
 
-    if (status.get("data") or {}).get("online") is True:
-        print(f"\033[32m✓\033[0m QQ 在线{who}")
-        return 0
+    print(
+        "\033[31m✗\033[0m "
+        f"QQ 当前不在线（{identity}）"
+    )
+    print(
+        "  NapCat 容器可能还活着，"
+        "但 QQ 登录本身已经断开。"
+    )
+    print(
+        "  查看：bash start.sh naplog"
+    )
+    print(
+        "  登录：bash start.sh webui"
+    )
 
-    print(f"\033[31m✗\033[0m QQ 掉线{who} —— NapCat 活着，但 QQ 自己断了")
-    print("   重连机器人没用，要重新登录 QQ：")
-    print("     screen -r napcat                      # 看 NapCat 的提示/二维码（Ctrl+A 再按 D 退出）")
-    print("     bash start.sh stop && bash start.sh   # 或整体重启")
     return 1
 
 
+async def main():
+    try:
+        return await probe()
+
+    except asyncio.TimeoutError:
+        print(
+            "\033[31m✗\033[0m "
+            "OneBot 请求超时"
+        )
+        return 1
+
+    except aiohttp.WSServerHandshakeError as exc:
+        print(
+            "\033[31m✗\033[0m "
+            f"WebSocket 握手失败：HTTP {exc.status}"
+        )
+        print(
+            "  请检查 ONEBOT_ACCESS_TOKEN "
+            "是否与 NapCat 一致。"
+        )
+        return 1
+
+    except Exception as exc:
+        print(
+            "\033[31m✗\033[0m "
+            f"无法连接 NapCat："
+            f"{type(exc).__name__}: {exc}"
+        )
+        return 1
+
+
 try:
-    sys.exit(asyncio.run(asyncio.wait_for(main(), 20)))
+    sys.exit(
+        asyncio.run(
+            asyncio.wait_for(main(), timeout=20)
+        )
+    )
 except asyncio.TimeoutError:
-    print("\033[31m✗\033[0m 连接 NapCat 超时（没监听 / 没建 WebSocket 服务器）")
-    sys.exit(1)
-except Exception as e:
-    print(f"\033[31m✗\033[0m 连不上 NapCat：{type(e).__name__}: {e}")
+    print(
+        "\033[31m✗\033[0m "
+        "NapCat 状态检查整体超时"
+    )
     sys.exit(1)
 PY
 }
 
-do_status() {
+
+# ==============================
+# start
+# ==============================
+
+do_start() {
+    require_python
     require_screen
-    require_python
+    require_docker
 
-    # 只看 screen 会话会被空壳会话骗到，必须查进程/端口
-    echo "── 真实运行状态 ──────────────────────"
-    if bot_running; then
-        ok "机器人 运行中"
-        [ -f "$BOT_LOG" ] || warn "  但它不是本脚本启动的，没有日志文件"
-    else
-        case "$(session_state "$BOT_SESSION")" in
-            dead) warn "机器人 未运行（会话以 (Dead) 残留，启动时会自动清理）" ;;
-            none) warn "机器人 未运行" ;;
-            *)    warn "机器人 未运行（screen 会话还在，但里面已经没有进程了）" ;;
-        esac
-    fi
+    load_ws_url
 
-    if [ "$ONEBOT_ACTIVE" != "1" ]; then
-        info "OneBot 未启用，无需 NapCat"
-    elif port_open; then
-        ok "NapCat 运行中（$WS_URL 已就绪）"
-    elif proc_alive "$NAPCAT_PROC"; then
-        warn "NapCat 进程在，但 $WS_URL 没监听（多半是还没登录 QQ）"
-        info "  登录：bash start.sh webui    # 直接打开扫码页面"
-        info "  掉登录了也一样：说这条的日志是「连不上协议端」而不是「QQ 掉线」"
-    else
-        case "$(session_state "$NAPCAT_SESSION")" in
-            dead) warn "NapCat 未运行（会话以 (Dead) 残留，启动时会自动清理）" ;;
-            none) warn "NapCat 未运行" ;;
-            *)    warn "NapCat 未运行（screen 会话还在，但里面已经没有进程了）" ;;
-        esac
-    fi
+    screen -wipe >/dev/null 2>&1 || true
+    mkdir -p "$LOG_DIR"
 
-    echo "── QQ 登录状态 ───────────────────────"
-    if [ "$ONEBOT_ACTIVE" != "1" ]; then
-        info "官方通道模式，跳过 NapCat 检查"
-    elif port_open; then
-        check_qq
-    else
-        warn "端口没开，跳过（先把 NapCat 跑起来）"
-    fi
+    echo "── NapCat ─────────────────────────────"
 
-    echo "── 机器人日志尾部 ────────────────────"
-    if [ -f "$BOT_LOG" ]; then
-        tail -n 6 "$BOT_LOG"
-        info "（完整日志：$BOT_LOG，实时跟随：bash start.sh log）"
-    else
-        warn "还没有日志文件（用本脚本启动后才会写）"
-    fi
-
-    echo
-    if ! bot_running || { [ "$ONEBOT_ACTIVE" = "1" ] && ! port_open; }; then
-        info "要拉起它们：bash start.sh"
-    fi
-    info "唤醒锁：Termux 重启后会失效，重跑一次 bash start.sh 即可"
-}
-
-# ------------------------------ 打开 WebUI ------------------------------
-# 首次登录 QQ 要扫码：二维码画在 WebUI 页面上，而进这个页面需要地址 + token
-# （token 每次安装随机生成，存在 webui.json 里）。与其让你进 screen 里手抄，
-# 不如直接读文件拼出来，能弹浏览器就顺手弹出来。
-do_webui() {
-    require_python
-
-    local url
-    if ! url="$(WEBUI_JSON="$WEBUI_JSON" "$PYTHON_CMD" - <<'PY'
-import json
-import os
-import sys
-
-# 下面的报错信息带中文：locale 不是 UTF-8 时（Termux 上把 LANG 设成 C 很常见）
-# 直接 print 会 UnicodeEncodeError，退出码就不是约定的 2/3 了，脚本也就给不出提示
-sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-path = os.environ["WEBUI_JSON"]
-try:
-    with open(path, encoding="utf-8") as f:
-        cfg = json.load(f)
-except OSError as e:
-    print(f"读不到 {path}（{e.strerror}）", file=sys.stderr)
-    sys.exit(2)
-except ValueError as e:
-    print(f"这个文件不是合法 JSON：{e}", file=sys.stderr)
-    sys.exit(3)
-print(f"http://127.0.0.1:{cfg.get('port', 6099)}/webui?token={cfg.get('token', '')}")
-PY
-    )"; then
-        err "拿不到 WebUI 地址"
-        info "要读的文件：$WEBUI_JSON"
-        info "NapCat 装在别处的话：WEBUI_JSON=/实际路径 bash start.sh webui"
+    if ! start_napcat; then
         exit 1
     fi
 
-    if ! napcat_running; then
-        warn "NapCat 现在没在跑，这个页面会打不开——先 bash start.sh"
+    if ! wait_ws; then
+        warn "OneBot WebSocket 暂未就绪"
+        info "可能原因："
+        info "  1. QQ 尚未登录"
+        info "  2. WebUI 中尚未启用 WebSocket 服务器"
+        info "  3. WebSocket 端口不是 3001"
+        info "  4. .env 的 ONEBOT_WS_URL 配置错误"
+        info
+        info "仍然继续启动 qbot，它会自行重连。"
     fi
 
     echo
-    ok "NapCat WebUI："
-    info "$url"
-    if command -v termux-open-url >/dev/null 2>&1; then
-        if termux-open-url "$url" >/dev/null 2>&1; then
-            info "已在浏览器里打开（二维码就在页面上，扫它登录 QQ）"
-        else
-            warn "自动打开浏览器失败，把上面那条地址手动粘到浏览器里"
-        fi
-    else
-        info "想让它自动开浏览器：pkg install termux-tools"
+    echo "── qbot ──────────────────────────────"
+
+    if ! start_bot; then
+        exit 1
     fi
-    info "登录成功后 NapCat 才会监听 $WS_URL，确认：bash start.sh status"
+
+    echo
+    ok "启动完成"
+
+    info "状态："
+    info "  bash start.sh status"
+
+    info "qbot 日志："
+    info "  bash start.sh log"
+
+    info "NapCat 日志："
+    info "  bash start.sh naplog"
+
+    info "仅重载 qbot："
+    info "  bash start.sh reload"
 }
+
+
+# ==============================
+# reload
+# ==============================
+
+do_reload() {
+    require_python
+    require_screen
+
+    load_ws_url
+
+    echo "── qbot reload ───────────────────────"
+
+    info "检查 Python 源码..."
+
+    if ! "$PYTHON_CMD" -m compileall -q "$PROJECT_DIR/src"; then
+        err "Python 语法检查失败"
+        err "拒绝重启当前机器人"
+        exit 1
+    fi
+
+    info "检查配置..."
+
+    if ! "$PYTHON_CMD" - <<'PY'
+from src import config
+
+assert config.ONEBOT_WS_URL
+PY
+    then
+        err "配置加载失败"
+        err "拒绝重启当前机器人"
+        exit 1
+    fi
+
+    ok "源码和配置检查通过"
+
+    if ! stop_bot; then
+        exit 1
+    fi
+
+    if ! start_bot; then
+        exit 1
+    fi
+
+    echo
+    ok "qbot 重载完成"
+    ok "NapCat Docker 未重启"
+    ok "QQ 登录保持不变"
+}
+
+
+# ==============================
+# stop
+# ==============================
+
+do_stop() {
+    require_python
+    require_screen
+
+    echo "── qbot ──────────────────────────────"
+
+    stop_bot || true
+
+    echo
+    echo "── NapCat ─────────────────────────────"
+
+    if command -v docker >/dev/null 2>&1 &&
+       docker compose version >/dev/null 2>&1; then
+
+        stop_napcat || true
+    else
+        warn "Docker 不可用，无法自动停止 NapCat"
+    fi
+
+    echo
+    ok "停止流程完成"
+}
+
+
+# ==============================
+# status
+# ==============================
+
+do_status() {
+    require_python
+    require_screen
+
+    load_ws_url
+
+    echo "── qbot ──────────────────────────────"
+
+    if bot_running; then
+        ok "qbot 运行中"
+
+        local python_abs
+        python_abs="$(command -v "$PYTHON_CMD")"
+
+        info "Python：$python_abs"
+    else
+        case "$(session_state "$BOT_SESSION")" in
+            dead)
+                warn "qbot 未运行，存在 Dead screen 会话"
+                ;;
+            running)
+                warn "screen 会话存在，但 qbot Python 已退出"
+                ;;
+            *)
+                warn "qbot 未运行"
+                ;;
+        esac
+    fi
+
+
+    echo
+    echo "── NapCat Docker ─────────────────────"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        err "Docker 不可用"
+
+    elif napcat_running; then
+        ok "NapCat 容器运行中"
+
+        docker ps \
+            --filter "name=^/${NAPCAT_CONTAINER}$" \
+            --format '  镜像：{{.Image}}
+  状态：{{.Status}}
+  端口：{{.Ports}}'
+
+    elif napcat_exists; then
+        warn "NapCat 容器存在，但当前已停止"
+
+    else
+        warn "找不到 NapCat 容器"
+    fi
+
+
+    echo
+    echo "── OneBot WebSocket ──────────────────"
+
+    info "地址：$WS_URL"
+
+    if port_open; then
+        ok "OneBot WebSocket 端口可连接"
+    else
+        warn "OneBot WebSocket 当前无法连接"
+    fi
+
+
+    echo
+    echo "── QQ 登录状态 ───────────────────────"
+
+    if port_open; then
+        check_qq || true
+    else
+        warn "OneBot 端口未就绪，跳过 QQ 状态查询"
+        info "查看 NapCat："
+        info "  bash start.sh naplog"
+    fi
+
+
+    echo
+    echo "── qbot 日志尾部 ─────────────────────"
+
+    if [ -f "$BOT_LOG" ]; then
+        tail -n 8 "$BOT_LOG"
+
+        echo
+        info "实时日志："
+        info "  bash start.sh log"
+    else
+        warn "尚无 qbot 日志"
+    fi
+
+
+    echo
+
+    if ! bot_running; then
+        info "启动：bash start.sh"
+    fi
+}
+
+
+# ==============================
+# WebUI
+# ==============================
+
+do_webui() {
+    echo "── NapCat WebUI ──────────────────────"
+    echo
+
+    if command -v docker >/dev/null 2>&1; then
+        if napcat_running; then
+            ok "NapCat 容器正在运行"
+        else
+            warn "NapCat 容器当前未运行"
+            info "先执行："
+            info "  bash start.sh"
+            echo
+        fi
+    fi
+
+    info "WebUI 在服务器上只监听本机："
+    info "  http://127.0.0.1:${NAPCAT_WEBUI_PORT}/webui"
+
+    echo
+    info "在你自己的 Windows / macOS / Linux 电脑运行："
+    echo
+
+    printf '  ssh -L %s:127.0.0.1:%s root@你的服务器公网IP\n' \
+        "$NAPCAT_WEBUI_PORT" \
+        "$NAPCAT_WEBUI_PORT"
+
+    echo
+    info "保持 SSH 窗口打开，然后本机浏览器访问："
+    echo
+
+    printf '  http://127.0.0.1:%s/webui\n' \
+        "$NAPCAT_WEBUI_PORT"
+
+    echo
+    info "WebUI 登录使用你在 /opt/napcat/compose.yaml"
+    info "里设置的 WEBUI_TOKEN。"
+
+    echo
+    info "注意："
+    info "  WEBUI_TOKEN 和 ONEBOT_ACCESS_TOKEN 是两回事。"
+    info "  不要把任何 token 粘贴到聊天、日志或 Git 仓库。"
+}
+
+
+# ==============================
+# qbot log
+# ==============================
 
 do_log() {
     if [ ! -f "$BOT_LOG" ]; then
-        err "还没有日志文件，先 bash start.sh 启动"
+        err "尚无 qbot 日志"
+        info "先执行："
+        info "  bash start.sh"
         exit 1
     fi
-    info "实时日志（Ctrl+C 退出，不影响后台运行）：$BOT_LOG"
+
+    info "qbot 实时日志"
+    info "Ctrl+C 仅退出日志，不停止机器人"
+    echo
+
     tail -n 50 -f "$BOT_LOG"
 }
 
-usage() {
-    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+
+# ==============================
+# NapCat log
+# ==============================
+
+do_naplog() {
+    require_docker
+
+    if ! napcat_exists; then
+        err "找不到 NapCat 容器"
+        exit 1
+    fi
+
+    info "NapCat 实时日志"
+    info "Ctrl+C 仅退出日志，不停止 NapCat"
+    echo
+
+    compose logs --tail=100 -f "$NAPCAT_SERVICE"
 }
 
+
+# ==============================
+# help
+# ==============================
+
+usage() {
+    cat <<'EOF'
+ai-qbot 管理脚本
+
+用法：
+
+  bash start.sh
+  bash start.sh start
+      启动 NapCat Docker + qbot
+
+  bash start.sh reload
+      仅重启 qbot
+      NapCat / QQ 登录不受影响
+
+  bash start.sh stop
+      停止 qbot + NapCat
+
+  bash start.sh status
+      查看：
+        - qbot 状态
+        - NapCat Docker 状态
+        - OneBot WebSocket
+        - QQ 在线状态
+        - qbot 最近日志
+
+  bash start.sh log
+      实时查看 qbot 日志
+
+  bash start.sh naplog
+      实时查看 NapCat 日志
+
+  bash start.sh webui
+      显示 WebUI SSH 隧道连接方法
+
+  bash start.sh help
+      显示本帮助
+
+
+默认部署：
+
+  NapCat Compose:
+      /opt/napcat
+
+  NapCat container:
+      napcat
+
+  OneBot:
+      ws://127.0.0.1:3001
+
+  WebUI:
+      127.0.0.1:6099
+
+以上项目均可通过环境变量覆盖。
+EOF
+}
+
+
+# ==============================
+# 命令入口
+# ==============================
+
 case "${1:-start}" in
-    start)  do_start ;;
-    reload) do_reload ;;
-    stop)   do_stop ;;
-    status) do_status ;;
-    webui)  do_webui ;;
-    log)    do_log ;;
-    help|-h|--help) usage ;;
+
+    start)
+        do_start
+        ;;
+
+    reload)
+        do_reload
+        ;;
+
+    stop)
+        do_stop
+        ;;
+
+    status)
+        do_status
+        ;;
+
+    log)
+        do_log
+        ;;
+
+    naplog)
+        do_naplog
+        ;;
+
+    webui)
+        do_webui
+        ;;
+
+    help|-h|--help)
+        usage
+        ;;
+
     *)
         err "未知命令：$1"
         echo
         usage
         exit 1
         ;;
+
 esac
