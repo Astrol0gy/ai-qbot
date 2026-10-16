@@ -6,6 +6,7 @@
 
 ```bash
 python tests/review_regressions.py
+python tests/admin_check.py
 python tests/architecture_check.py
 python tests/net_proxy_check.py
 python tests/long_thinking_check.py

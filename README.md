@@ -74,6 +74,7 @@ bash start.sh reload
 - [服务器部署与运维](docs/operations.md)
 - [配置参考](docs/configuration.md)
 - [命令使用](docs/usage.md)
+- [私聊管理控制台](docs/admin-console.md)
 - [架构、技能与运行行为](docs/architecture.md)
 - [运行日志与故障定位](docs/runtime-logging.md)
 - [开发与回归验证](docs/development.md)
