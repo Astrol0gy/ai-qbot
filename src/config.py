@@ -10,6 +10,10 @@ from dotenv import load_dotenv
 _env_file = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_file)
 
+# 仅 OneBot 的该账号私聊可管理；留空禁用。身份只能在部署端修改。
+ADMIN_QQ = os.getenv("ADMIN_QQ", "").strip()
+PRIVATE_READONLY_CONFIG_KEYS = frozenset({"ADMIN_QQ"})
+
 # ============================================
 # QQ Bot
 # ============================================
@@ -198,6 +202,8 @@ def validate():
     """按启用的通道检查必要配置是否已填写"""
     import math
     from urllib.parse import urlsplit
+    if ADMIN_QQ and (not ADMIN_QQ.isascii() or not ADMIN_QQ.isdigit() or int(ADMIN_QQ) <= 0):
+        raise ValueError("ADMIN_QQ 必须为空或有效的数字 QQ 号")
     bounds = {
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),

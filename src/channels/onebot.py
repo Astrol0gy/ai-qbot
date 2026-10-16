@@ -654,10 +654,13 @@ class OneBotClient:
             quote=None,
             is_group=is_group,
             is_at_bot=at_bot,
-            raw={"group_id": raw_gid, "user_id": raw_uid, "message_id": event.get("message_id"), "reply_id": reply_id},
+            raw={"message_type": event.get("message_type"), "group_id": raw_gid, "user_id": raw_uid, "message_id": event.get("message_id"), "reply_id": reply_id},
         )
 
         sender = OneBotSender(self, is_group, raw_gid, raw_uid)
+        from ..admin import handle as handle_admin
+        if await handle_admin(incoming, sender):
+            return
         log_event('message.received', **message_fields(incoming), text=text, at_bot=at_bot,
             image_count=len(incoming.image_urls), quote_id=reply_id)
         try:

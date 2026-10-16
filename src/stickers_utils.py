@@ -26,6 +26,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -480,3 +481,65 @@ def stats() -> dict:
             "total": len(_FILES),
             "used": sum(int(i.get("used") or 0) for i in _FILES.values()),
         }
+
+
+def admin_list(query: str = "") -> list[str]:
+    with _LOCK:
+        _load()
+        return sorted(name for name, info in _FILES.items()
+                      if not query or query in name or any(query in t for t in info['tags']))
+
+
+def admin_edit(name: str, new_name: str | None = None) -> None:
+    """Rename or quarantine one indexed image; keep disk and memory in sync."""
+    with _LOCK:
+        _load()
+        if (not name or Path(name).name != name or '/' in name or '\\' in name
+                or name not in _FILES):
+            raise ValueError("请提供索引中的完整表情包文件名")
+        source = _DIR / name
+        if source.is_symlink() or source.resolve().parent != _DIR.resolve() or not source.is_file():
+            raise ValueError("表情包文件不存在或路径不可用")
+        if new_name is not None:
+            if (not new_name or new_name in ('.', '..') or _ILLEGAL.search(new_name)
+                    or Path(new_name).name != new_name or len(new_name) > 180
+                    or new_name.startswith('.') or Path(new_name).suffix != source.suffix):
+                raise ValueError("新名称必须是同扩展名的图片文件名，不能包含目录或特殊字符")
+            if new_name == name:
+                return
+            target = _DIR / new_name
+            if target.exists() or target.is_symlink() or new_name in _FILES:
+                raise ValueError("新文件名已存在")
+        else:
+            trash = _DIR / '.admin-trash'
+            if trash.is_symlink():
+                raise ValueError("回收目录不可用")
+            trash.mkdir(mode=0o700, exist_ok=True)
+            target = trash / (uuid.uuid4().hex + '-' + name)
+        old_files = dict(_FILES)
+        # A same-directory temporary index and os.replace make index writes atomic.
+        temp_index = _DIR / ('.admin-index-' + uuid.uuid4().hex)
+        if new_name is not None:
+            # Exclusive creation prevents a concurrent external file from being overwritten.
+            os.link(source, target)
+            try:
+                source.unlink()
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+        else:
+            os.replace(source, target)
+        _FILES.pop(name)
+        if new_name is not None:
+            _FILES[new_name] = old_files[name]
+        try:
+            temp_index.write_text(json.dumps({'version': _INDEX_VERSION, 'files': _FILES},
+                                            ensure_ascii=False, indent=1), encoding='utf-8')
+            os.replace(temp_index, _INDEX_FILE)
+        except BaseException:
+            _FILES.clear()
+            _FILES.update(old_files)
+            os.replace(target, source)
+            raise
+        finally:
+            temp_index.unlink(missing_ok=True)

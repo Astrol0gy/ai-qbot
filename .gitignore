@@ -1,5 +1,7 @@
 # 环境变量（包含密钥，不可提交）
 .env
+# Crash leftovers from atomic private configuration edits also contain credentials.
+/.admin-env-*
 
 # Python
 .venv/
