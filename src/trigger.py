@@ -69,7 +69,7 @@ class BufferEntry:
     def line(self) -> str:
         marks = []
         if self.reviewed:
-            marks.append("已看过并略过，仅作背景，无需补答")
+            marks.append("已看过并略过，仅作背景，无需单独补答；仍可用于理解后续补充")
         if self.at_bot:
             marks.append("@了你")
         if self.quote:

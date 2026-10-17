@@ -52,12 +52,10 @@ SKIP_TOKENS = {"[skip]", "__skip__", "[跳过]"}
 WAKE_PROMPT = (
     "以下是群里自你上次开口以来发生的事（可能有好几个人同时在说，也可能同一个人连发了几条）。\n"
     "这一轮开不开口、跟谁说话、说什么，都由你自己决定：\n"
-    "· 有人在跟你说话、问你、或者接着你的话往下说 → 用 reply 工具回话；\n"
-    "· 群里只是互相聊天、跟你无关，或者你觉得对方还没说完（还会接着补）→ 用 skip 工具，\n"
-    "  这条先不开口。\n"
+    "按系统的聊天参与规则判断表达是否完整，再选择 reply 或 skip。被 @ 或处于互动中也不必抢答未完的表达。\n"
     "当前触发消息id：{focus}。优先理解这条新消息及当前话题，再选择值得参与的内容。\n"
-    "上下文不是待办清单，不要求逐条回复或照顾每个人；旧消息只作理解背景，已回应或已略过的内容不要补答。\n"
-    "你可以挑一条回应、合并回应同一话题，或整轮 skip；如果新消息明确追问旧事，再结合旧背景回答。\n"
+    "上下文不是待办清单，不要求逐条回复或照顾每个人；旧内容可用于理解新补充，不自动逐条补答。\n"
+    "尚在铺垫时 skip(reason=wait)，无需参与时 skip(reason=irrelevant)；有清晰问题则结合近期图文回答或澄清。\n"
     "确实需要回应多个不同话题时才分别调用 reply。用 reply_to 引用实际选择回应的消息，避免连续重复引用。\n"
     "不开口就调 skip 工具，不要用 [skip] 这类文字标记。\n\n"
     "{context}"
@@ -367,9 +365,12 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         dc.release_service_probe()
     try:
         if outbox is not None and outbox.skipped and not outbox.has_items:
-            outcome('skipped')
+            waiting = outbox.skip_reason == 'wait'
+            outcome('waiting' if waiting else 'skipped')
+            log_event('chat.skipped', reason=outbox.skip_reason)
             if trigger:
-                trigger.buffer.mark_reviewed(msg.conv_id, entries)
+                if not waiting:
+                    trigger.buffer.mark_reviewed(msg.conv_id, entries)
                 trigger.mark_answered(msg.conv_id)
             return
         items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]

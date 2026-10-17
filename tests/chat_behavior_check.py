@@ -201,7 +201,7 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
         prompt = next(m['content'] for m in second.requests[0]['messages']
                       if isinstance(m,dict) and m.get('role')=='user')
         self.assertIn('旧话题', prompt)
-        self.assertIn('已看过并略过，仅作背景，无需补答', prompt)
+        self.assertIn('已看过并略过，仅作背景，无需单独补答；仍可用于理解后续补充', prompt)
         self.assertIn('当前触发消息id：new', prompt)
 
     async def test_skip_does_not_mark_messages_arriving_during_thinking(self):
@@ -216,6 +216,51 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
             await core.handle_message(IncomingMessage(conv_id='g',user_id='a',text='旧',ai_decides_reply=True),audit.Sender())
         self.assertTrue(old.reviewed)
         self.assertFalse(new.reviewed)
+
+    async def test_wait_preserves_images_for_followup_without_reviewed_mark(self):
+        image = BufferEntry(text='[图片1：报错截图，连接失败]', message_id='image',user_id='a')
+        explanation = BufferEntry(text='我这个程序刚才',message_id='half',user_id='a')
+        for entry in (image,explanation):
+            self.trigger.buffer.add('g',entry)
+        model = audit.Model([audit.response(calls=[('skip',{'reason':'wait'})]),audit.response()])
+        sender = await self.run_model(model,msg=IncomingMessage(conv_id='g',user_id='a',text='我这个程序刚才',
+            message_id='half',ai_decides_reply=True))
+        self.assertEqual(sender.sent,[])
+        self.assertFalse(image.reviewed)
+        self.assertFalse(explanation.reviewed)
+        self.assertNotIn('g',dc._conversations)
+        self.trigger.buffer.add('g',BufferEntry(text='为什么连不上？',message_id='question',user_id='a'))
+        followup = audit.Model([audit.response(calls=[('reply',{'text':'先检查连接地址','reply_to':'question'})]),audit.response()])
+        sender = await self.run_model(followup,msg=IncomingMessage(conv_id='g',user_id='a',text='为什么连不上？',
+            message_id='question',ai_decides_reply=True))
+        prompt = next(m['content'] for m in followup.requests[0]['messages'] if isinstance(m,dict) and m.get('role')=='user')
+        self.assertIn('报错截图，连接失败',prompt)
+        self.assertIn('我这个程序刚才',prompt)
+        self.assertNotIn('已看过并略过',prompt)
+        self.assertEqual([x['text'] for x in sender.sent],['先检查连接地址'])
+
+    async def test_explicit_irrelevant_marks_background_and_skip_after_reply_does_not_cancel(self):
+        entry=BufferEntry(text='完整闲聊',message_id='old',user_id='a')
+        self.trigger.buffer.add('g',entry)
+        model=audit.Model([audit.response(calls=[('skip',{'reason':'irrelevant'})]),audit.response()])
+        await self.run_model(model,msg=IncomingMessage(conv_id='g',user_id='a',text='完整闲聊',ai_decides_reply=True))
+        self.assertTrue(entry.reviewed)
+        model=audit.Model([audit.response(calls=[('reply',{'text':'已选回复'}),('skip',{'reason':'wait'})]),audit.response()])
+        sender=await self.run_model(model,msg=IncomingMessage(conv_id='g',user_id='a',text='新话题',ai_decides_reply=True))
+        self.assertEqual([x['text'] for x in sender.sent],['已选回复'])
+
+    async def test_chat_policy_is_consistent_and_dm_avoids_casual_rules(self):
+        model=audit.Model([audit.response('好的')])
+        await self.run_model(model)
+        prompt=model.requests[0]['messages'][0]['content']
+        for fragment in ['skip(reason=wait)','skip(reason=irrelevant)','不代表之前没收到图','私聊直接回答','技术任务确实需要代码']:
+            self.assertIn(fragment,prompt)
+        model=audit.Model([audit.response('剧情继续')])
+        with patch.object(dc.campaign_state,'is_dm_mode',return_value=True):
+            await self.run_model(model)
+        prompt=model.requests[0]['messages'][0]['content']
+        self.assertNotIn('默认就回一两句',prompt)
+        self.assertNotIn('skip(reason=wait)',prompt)
 
     async def test_partial_delivery_marks_unselected_background_not_failed_source(self):
         ignored = BufferEntry(text='旧',message_id='old')

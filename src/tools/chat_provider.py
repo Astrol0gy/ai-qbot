@@ -3,9 +3,8 @@
 
 与其他工具不同，这两个不是"干活"的，而是"表态"：
 
-- ``reply(text, reply_to?)`` → 记一条要发出去的回复。可以调用多次：几个人分别
-  接你的话，就为每个人各调一次，并用 ``reply_to`` 引用他最后那句话。
-- ``skip()`` → 本轮不开口（跟你无关的群聊、或你觉得对方还没说完）。它**不撤销**
+- ``reply(text, reply_to?)`` → 记下选择参与的话题；同一话题合并回应，不逐人补答。
+- ``skip(reason)`` → 本轮不开口；wait 等待补充，irrelevant 选择不参与。它**不撤销**
   已经 reply 过的回复：队列里有回复时，skip 只表示"不再补充"，那些回复照常发出。
 
 它们**不发消息**，只是攒下这一轮"要说什么、引用谁"，等模型思考结束由
@@ -16,7 +15,7 @@
 上下文**绝不存进 Provider 或注册表**：注册表是全局单例，把"待发消息"存进去，两个群
 同时说话就会串台（A 群的话发到 B 群）。所以状态跟着调用走，不跟着对象走。
 
-唤醒由系统负责（收到消息就交给 AI），开口与否由这里的工具决定。
+唤醒由系统触发策略负责；被唤醒不代表必须回复。
 """
 from __future__ import annotations
 
@@ -40,6 +39,20 @@ MAX_CHAT_CALLS = 6
 MAX_SKIP_CALLS = 2
 
 
+CHAT_POLICY = (
+    "【聊天参与与上下文】\n"
+    "- 被唤醒不等于必须开口。先合并理解当前话题中的截图、文字和表情包，再判断用户是否表达完整。\n"
+    "- 明确的问题、请求或适合接话的完整表达，可以回应；单独截图、话题名称、表情包或半句话不自动构成回复邀请。\n"
+    "- 用户可能分多条消息铺垫和补充；还没形成清晰意思时，群聊优先 skip(reason=wait)，不要抢先概括、点评或逐张接梗。\n"
+    "- 完整但与你无关、无需参与的话题，群聊用 skip(reason=irrelevant)。不要为参与而强行找话说。\n"
+    "- 已回应或选择不参与的消息不逐条补答，但仍可用于理解后续补充；等待补充不代表问题已解决。\n"
+    "- 「这个」「刚才那张」优先联系最近的图片描述和话题；不确定指哪张就澄清。当前消息没有新图，不代表之前没收到图。\n"
+    "- 有图片描述时依据描述理解，不声称直接看到了未提供的细节；图片内容未读到时如实说没看清，不编造。\n"
+    "- 群聊需要回复时用 reply；同一话题通常一次，用 text 内空行表示自然停顿，不为每个人分别作答。\n"
+    "- 私聊直接回答，不调用未提供的 reply/skip；表达不完整时可简短确认或澄清。\n"
+)
+
+
 @dataclass
 class ReplyItem:
     """一条待发送的回复"""
@@ -55,6 +68,7 @@ class ReplyOutbox:
     known_ids: set[str] = field(default_factory=set)  # 本轮上下文里出现过的消息 id
     items: list[ReplyItem] = field(default_factory=list)
     skipped: bool = False
+    skip_reason: str = "irrelevant"
 
     @property
     def has_items(self) -> bool:
@@ -78,7 +92,8 @@ class ChatProvider(ToolProvider):
                 "tag": "回复整理",
                 "description": (
                     "回复你选择参与的消息或话题，不要求逐条回复每个人。优先当前问题和仍在进行的话题，"
-                    "旧消息只作背景，已回应或已略过的内容不补答。同一话题可以合并回应。"
+                    "先结合截图、文字、表情包确认表达是否完整；未说完时用 skip(reason=wait)。"
+                    "旧内容仍可用于理解补充，不逐条补答已回应或不参与的话题。同一话题可以合并回应。"
                     "确实需要分别回应不同话题时才多次调用。普通聊天想自然分条时，用一次 text 内的空行表示语义停顿。"
                     "reply_to 可引用你实际选择回应的消息；不想参与时用 skip。"
                 ),
@@ -87,7 +102,7 @@ class ChatProvider(ToolProvider):
                     "properties": {
                         "text": {
                             "type": "string",
-                            "description": "要发送的内容，纯文本，不要 Markdown",
+                            "description": "要发送的内容，默认纯文本；自然停顿用空行，代码仅在任务需要时保留必要格式；工具返回的 [img] 标记原样保留",
                         },
                         "reply_to": {
                             "type": "string",
@@ -108,12 +123,15 @@ class ChatProvider(ToolProvider):
                 "name": SKIP_TOOL,
                 "tag": "回复判断",
                 "description": (
-                    "这轮不开口，一条都不回。用在：群里互相聊天、跟你无关；或者你觉得对方"
-                    "还没说完（还会接着补充），想等他继续。不回复没有副作用，"
-                    "群里有新消息时会再叫你。已经用 reply 排好回复后就不要再用它："
+                    "本轮不新增回复。reason=wait：截图、文字、表情包可能仍在补充，尚无清晰问题、请求或完整意思，"
+                    "先保留上下文等待；reason=irrelevant：表达已完整，但无需参与。等待的内容不会标记为已略过。"
+                    "这不会启动定时器，也不保证下一条消息必然唤醒，后续是否唤醒由触发策略决定。"
+                    "已有明确问题但指代不清时先结合近期图片和文字，必要时用 reply 澄清。已经用 reply 排好回复后不要再用它："
                     "回复已经进了发送队列，skip 不会撤销，想结束本轮停止调用工具即可。"
                 ),
-                "parameters": {"type": "object", "properties": {}},
+                "parameters": {"type": "object", "properties": {
+                    "reason": {"type": "string", "enum": ["wait", "irrelevant"],
+                               "description": "wait=等待用户补充；irrelevant=选择不参与；省略时兼容旧调用，按 irrelevant 处理"}}},
                 "handler": self._skip,
                 "max_calls": MAX_SKIP_CALLS,
                 "needs_context": True,
@@ -153,10 +171,12 @@ class ChatProvider(ToolProvider):
         )
 
     @classmethod
-    def _skip(cls, context: ChatContext) -> str:
+    def _skip(cls, context: ChatContext, reason: str = "irrelevant") -> str:
         outbox = cls._outbox_of(context)
         if outbox is None:
             return "本轮没有可用的表态通道（skip 只在群聊唤醒路径注入），本次调用没有生效。"
+        if reason not in {"wait", "irrelevant"}:
+            return "reason 只能是 wait（等待补充）或 irrelevant（选择不参与），本次调用没有生效。"
         # skip = 本轮不开口，但它**不撤销**已经攒下的回复。
         # 模型常把 skip 当"这轮我说完了"用；撤销会让它撤了又重发（真机上出现过
         # reply×2 → skip → 又 reply×2：群里结果没错，却白烧一次调用、多拖十几秒，
@@ -167,10 +187,13 @@ class ChatProvider(ToolProvider):
                 "skip 不会撤销它们。想结束这一轮，直接停止调用工具就行。"
             )
         outbox.skipped = True
-        return "已记录：本轮不开口。群里有新消息时会再叫你。"
+        outbox.skip_reason = reason
+        return ("已记录：本轮等待补充，保留原上下文，不标记为已略过；未安排定时回复。"
+                if reason == "wait" else "已记录：本轮不参与，旧消息保留为背景，后续补充仍可结合理解。")
 
 
 __all__ = [
+    "CHAT_POLICY",
     "CHAT_TOOL_NAMES",
     "MAX_CHAT_CALLS",
     "MAX_SKIP_CALLS",
