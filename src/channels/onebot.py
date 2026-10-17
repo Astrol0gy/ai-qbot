@@ -168,6 +168,24 @@ API_UNKNOWN = "unknown"    # 超时或回执超时：可能已经送达，绝不
 API_TIMEOUT_RETCODES = (1200, 1201)
 
 
+def _sticker_base64(payload):
+    """Read only a validated library image; NapCat may run on another filesystem."""
+    import base64
+    from .. import stickers_utils
+    from ..config import STICKER_MAX_BYTES
+    path = stickers_utils.resolve(payload)
+    if path is None:
+        return None
+    try:
+        with Path(path).open('rb') as image:
+            data = image.read(STICKER_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if not data or len(data) > STICKER_MAX_BYTES:
+        return None
+    return path, 'base64://' + base64.b64encode(data).decode('ascii')
+
+
 # ============================================
 # 发送器
 # ============================================
@@ -211,7 +229,15 @@ class OneBotSender(Sender):
                 continue
             safe_images.append("base64://" + base64.b64encode(downloaded[0]).decode("ascii"))
             visible_urls.append(url)
-        stickers = [resolved for p in stickers if (resolved := stickers_utils.resolve(p))]
+        prepared_stickers = []
+        for path in stickers:
+            prepared = await runtime.run_blocking(_sticker_base64, path)
+            if prepared is None:
+                media_failed = True
+                print('[表情包] 文件不可用或超过大小限制，跳过发送')
+            else:
+                prepared_stickers.append(prepared)
+        stickers = prepared_stickers
         urls = visible_urls
         if sticker_only and not stickers:
             return await self._sticker_fallback(requested_stickers[0], reply_to, [])
@@ -226,8 +252,8 @@ class OneBotSender(Sender):
             if text:
                 segments.append({"type": "text", "data": {"text": text}})
             parts.append((segments, SendResult(API_OK, text, tuple(urls))))
-        for path in stickers:
-            parts.append(([{"type": "image", "data": {"file": path}}],
+        for path, encoded in stickers:
+            parts.append(([{"type": "image", "data": {"file": encoded}}],
                           SendResult(API_OK, stickers=(path,))))
         receipts = []
         for segments, content in parts:
@@ -795,7 +821,7 @@ class OneBotClient:
         调用 OneBot API，返回 (data, 结局)。
 
         结局必须区分「确定没送达」和「不知道有没有送达」，否则发送会重复：超时和
-        `retcode=1200` 都只说明**没等到回执**，消息本身很可能已经进群了。
+        `retcode=1200` 通常说明**没等到回执**，但明确的文件预处理错误说明未发送。
         读类接口（get_msg / get_status / get_login_info）不关心这个，用 call_api 即可。
         """
         ws = self._ws
@@ -841,6 +867,10 @@ class OneBotClient:
         if resp.get("status") == "failed" or (retcode is not None and retcode not in (0, 1)):
             message = resp.get("message") or ""
             log_event('onebot.api_error', action=action, echo=echo, retcode=retcode, detail=message[:500])
+            # NapCat also uses 1200 for media preparation failures, before sendMsg.
+            # Match the explicit stage, never infer rejection from a generic error.
+            if message.startswith(('文件处理失败', '识别URL失败')):
+                return None, API_REJECTED
             # 回执超时 ≠ 投递失败：协议端内部发送超时时，消息通常已经发出去了
             if retcode in API_TIMEOUT_RETCODES or "timeout" in message.lower():
                 return None, API_UNKNOWN

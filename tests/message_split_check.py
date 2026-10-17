@@ -1,5 +1,8 @@
 """Separate sticker delivery, precise receipts and shared round budgets."""
 import asyncio
+import base64
+import json
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 import sys
@@ -21,6 +24,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
             (stickers_utils, "resolve", lambda path: str(path)),
             (stickers_utils, "mark_used", lambda path: None),
             (stickers_utils, "fallback_text", lambda path: "（无语）"),
+            (onebot, "_sticker_base64", lambda path: (str(path), "base64://aW1hZ2U=")),
             (dc, "_conversations", defaultdict(list)),
             (dc, "_cooldown_until", 0),
         ):
@@ -43,7 +47,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([segment["type"] for segment in messages[0]], ["reply", "text"])
                 for message, path in zip(messages[1:], ("one.png", "two.png")):
                     self.assertEqual(message, [{"type": "reply", "data": {"id": "42"}},
-                                               {"type": "image", "data": {"file": path}}])
+                                               {"type": "image", "data": {"file": "base64://aW1hZ2U="}}])
                 self.assertEqual(result.status, "ok")
                 self.assertEqual(result.text, "hello")
                 self.assertEqual(result.stickers, ("one.png", "two.png"))
@@ -65,7 +69,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
             receipt = await sender.send("", sticker_paths=["one.png"])
             self.assertEqual(api.await_count, 1)
             self.assertEqual(api.call_args.args[1]["message"],
-                             [{"type": "image", "data": {"file": "one.png"}}])
+                             [{"type": "image", "data": {"file": "base64://aW1hZ2U="}}])
             self.assertEqual((receipt.status, receipt.text, receipt.stickers), ("ok", "", ("one.png",)))
 
     async def test_sticker_only_failure_sends_text_once(self):
@@ -104,7 +108,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
     async def test_missing_sticker_falls_back_to_text(self):
         api = AsyncMock(return_value=({}, "ok"))
         sender = onebot.OneBotSender(NS(call_api_ex=api), True, 10, 20)
-        with patch.object(stickers_utils, "resolve", return_value=None):
+        with patch.object(onebot, "_sticker_base64", return_value=None):
             receipt = await sender.send("", sticker_paths=["one.png"])
         self.assertEqual(api.await_count, 1)
         self.assertEqual(receipt.text, "（无语）")
@@ -163,7 +167,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.status, "ok")
         messages = [call.args[1]["message"] for call in api.call_args_list]
         self.assertEqual(messages[0], [{"type": "text", "data": {"text": "hello"}}])
-        self.assertEqual(messages[1:], [[{"type": "image", "data": {"file": "one.png"}}]] * 2)
+        self.assertEqual(messages[1:], [[{"type": "image", "data": {"file": "base64://aW1hZ2U="}}]] * 2)
         used.assert_called_once_with("one.png")
 
     async def test_cancelled_offline_wait_keeps_only_confirmed_text(self):
@@ -212,6 +216,96 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
             message = call.args[1]["message"]
             self.assertFalse(any(s["type"] == "image" for s in message)
                              and any(s["type"] == "text" for s in message))
+
+
+class StickerTransportCases(unittest.IsolatedAsyncioTestCase):
+    async def test_real_file_is_encoded_and_path_stays_out_of_platform_payload(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / '表情.png'
+            data = b'\x89PNG\r\n\x1a\nimage'
+            path.write_bytes(data)
+            api = AsyncMock(return_value=({}, 'ok'))
+            sender = onebot.OneBotSender(NS(call_api_ex=api), False, 10, 20)
+            with patch.object(stickers_utils, 'resolve', return_value=str(path)), \
+                 patch.object(stickers_utils, 'mark_used'):
+                receipt = await sender.send('', sticker_paths=[str(path)])
+            encoded = api.call_args.args[1]['message'][0]['data']['file']
+            self.assertEqual(base64.b64decode(encoded.removeprefix('base64://')), data)
+            self.assertNotIn(str(path), str(api.call_args))
+            self.assertEqual(receipt.stickers, (str(path),))
+
+    async def test_unreadable_empty_and_oversized_files_use_text_fallback(self):
+        from src import config
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'image.png'
+            for data in (None, b'', b'12345'):
+                if data is not None:
+                    path.write_bytes(data)
+                api = AsyncMock(return_value=({}, 'ok'))
+                sender = onebot.OneBotSender(NS(call_api_ex=api), False, 10, 20)
+                with patch.object(config, 'STICKER_MAX_BYTES', 4), \
+                     patch.object(stickers_utils, 'resolve', return_value=str(path)), \
+                     patch.object(stickers_utils, 'fallback_text', return_value='（无语）'):
+                    receipt = await sender.send('', sticker_paths=[str(path)])
+                self.assertEqual(receipt.text, '（无语）')
+                self.assertEqual(api.await_count, 1)
+                self.assertEqual(api.call_args.args[1]['message'][0]['type'], 'text')
+
+    async def test_library_rejection_does_not_read_file(self):
+        with patch.object(stickers_utils, 'resolve', return_value=None), \
+             patch.object(Path, 'open') as opened:
+            self.assertIsNone(onebot._sticker_base64('outside.png'))
+            opened.assert_not_called()
+
+    def client_with_responses(self, responses):
+        client = onebot.OneBotClient.__new__(onebot.OneBotClient)
+        client._pending = {}
+        client._echo_seq = 0
+        async def send(frame):
+            request = json.loads(frame)
+            response = responses.pop(0)
+            if response is not None:
+                client._pending.pop(request['echo']).set_result(response)
+        client._ws = NS(closed=False, send_str=AsyncMock(side_effect=send))
+        return client
+
+    async def test_preparation_errors_override_1200_but_real_timeouts_stay_unknown(self):
+        cases = [
+            (1200, '文件处理失败: 识别URL失败, uri= /opt/image.png', 'rejected'),
+            (1200, '识别URL失败, uri= /opt/image.png', 'rejected'),
+            (1200, '文件处理失败: download timeout', 'rejected'),
+            (1200, 'NTEvent sendMsg Timeout', 'unknown'),
+            (1201, 'send failed', 'unknown'),
+            (1200, '', 'unknown'),
+            (100, 'Timeout waiting for sendMsg', 'unknown'),
+            (100, 'invalid params', 'rejected'),
+        ]
+        for code, message, expected in cases:
+            with self.subTest(code=code, message=message):
+                client = self.client_with_responses([{'status':'failed', 'retcode':code, 'message':message}])
+                _, status = await client.call_api_ex('send_private_msg', {})
+                self.assertEqual(status, expected)
+        client = self.client_with_responses([None])
+        _, status = await client.call_api_ex('send_private_msg', {}, timeout=.001)
+        self.assertEqual(status, 'unknown')
+        self.assertFalse(client._pending)
+
+    async def test_1200_preparation_error_triggers_exactly_one_text_attempt(self):
+        for text_ok in (True, False):
+            responses = [
+                {'status':'failed', 'retcode':1200, 'message':'文件处理失败: 识别URL失败'},
+                {'status':'ok', 'retcode':0, 'data':{}} if text_ok else
+                {'status':'failed', 'retcode':100, 'message':'invalid params'},
+            ]
+            client = self.client_with_responses(responses)
+            sender = onebot.OneBotSender(client, False, 10, 20)
+            with patch.object(onebot, '_sticker_base64', return_value=('one.png', 'base64://aW1hZ2U=')), \
+                 patch.object(stickers_utils, 'fallback_text', return_value='（无语）'):
+                receipt = await sender.send('', sticker_paths=['one.png'])
+            self.assertEqual(receipt.status, 'ok' if text_ok else 'rejected')
+            self.assertEqual(client._ws.send_str.await_count, 2)
+            self.assertEqual(json.loads(client._ws.send_str.call_args.args[0])['params']['message'],
+                             [{'type':'text', 'data':{'text':'（无语）'}}])
 
 
 if __name__ == "__main__":

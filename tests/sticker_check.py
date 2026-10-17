@@ -242,10 +242,11 @@ async def main() -> int:
     action, params = sent[-1]
     seg = params["message"][0]
     check("action 是 send_group_msg", action == "send_group_msg", action)
-    check("段数组里有 image 段且 file 是本地绝对路径",
+    import base64
+    check("段数组里有 image 段且 Base64 内容与库内文件一致",
           len(sent) == 2 and len(params["message"]) == 1
-          and seg["type"] == "image" and seg["data"]["file"] == paths[0],
-          str(params["message"]))
+          and seg["type"] == "image"
+          and seg["data"]["file"] == 'base64://' + base64.b64encode(Path(paths[0]).read_bytes()).decode('ascii'))
     check("文字独立为前一条消息", sent[0][1]["message"] == [{"type": "text", "data": {"text": "行吧"}}])
     await sender.send("", sticker_paths=paths)
     check("纯表情包（text 为空）也会发出去", len(sent[-1][1]["message"]) == 1)
