@@ -36,11 +36,13 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
 
     def test_semantic_boundaries_only_and_no_content_lost(self):
         self.assertEqual(core._chat_parts(TEXT, 3), PARTS)
+        self.assertEqual(core._chat_parts('一\n\n二', 3), ['一', '二'])
         self.assertEqual(core._chat_parts('很长的一句话'*100, 3), ['很长的一句话'*100])
         text = '一\n\n二\n\n三\n\n四'
         self.assertEqual(core._chat_parts(text, 3), ['一','二','三\n\n四'])
         for protected in ['https://example.com\n\n说明', '1. 第一步\n\n2. 第二步',
-                          '```python\na=1\n\nb=2\n```', '[img]https://example.com/a.png[/img]\n\n图片']:
+                          '```python\na=1\n\nb=2\n```', '| 项目 | 说明 |\n| --- | --- |\n\n解释',
+                          '[img]https://example.com/a.png[/img]\n\n图片']:
             self.assertEqual(core._chat_parts(protected, 3), [protected])
 
     async def test_private_chat_sends_parts_and_records_delivered_text(self):
@@ -92,17 +94,36 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
             await self.run_model(audit.Model([audit.response(TEXT)]), sender=sender)
         self.assertEqual(sends_at_wait, [(.6,1),(.6,2)])
 
-    async def test_business_tool_results_remain_one_message(self):
-        model = audit.Model([audit.response(calls=[('load_skill',{'name':'地图导航'})]),
-            audit.response(calls=[('plan_route',{'origin':'成都','destination':'北京'})]), audit.response(TEXT)])
-        def execute(name, args, ctx):
-            if name == 'plan_route':
+    async def run_tool_reply(self, text, *, tool='web_search', skill='精准搜索', args=None):
+        model = audit.Model([audit.response(calls=[('load_skill',{'name':skill})]),
+            audit.response(calls=[(tool,args or {'query':'测试问题'})]), audit.response(text)])
+        def execute(name, arguments, ctx):
+            if name == tool:
                 self.assertIn(name, ctx.allowed_tools)
-                return '路线查询结果'
-            return tools.execute(name,args,ctx)
+                return '工具查询结果'
+            return tools.execute(name,arguments,ctx)
         with patch.object(dc, 'execute_tool', execute):
-            sender = await self.run_model(model)
-        self.assertEqual([x['text'] for x in sender.sent], [TEXT])
+            return await self.run_model(model)
+
+    async def test_tool_assisted_plain_explanations_are_split(self):
+        for tool, skill, args in [('web_search','精准搜索',{'query':'测试问题'}),
+                                 ('plan_route','地图导航',{'origin':'成都','destination':'北京'})]:
+            with self.subTest(tool=tool):
+                sender = await self.run_tool_reply(TEXT,tool=tool,skill=skill,args=args)
+                self.assertEqual([x['text'] for x in sender.sent], PARTS)
+
+    async def test_tool_assisted_structured_replies_stay_intact(self):
+        for text in ['说明\n\nhttps://example.com', '步骤\n\n1. 第一步\n\n2. 第二步',
+                     '代码\n\n```python\na=1\n\nb=2\n```',
+                     '表格\n\n| 项目 | 说明 |\n| --- | --- |']:
+            with self.subTest(text=text):
+                sender = await self.run_tool_reply(text)
+                self.assertEqual([x['text'] for x in sender.sent], [text])
+
+    async def test_two_paragraphs_send_no_empty_third_segment(self):
+        sender = await self.run_tool_reply('第一段\n\n第二段')
+        self.assertEqual([x['text'] for x in sender.sent], ['第一段','第二段'])
+        self.assertEqual(dc._conversations['g'][-1]['content'], '第一段\n第二段')
 
     async def test_dm_response_is_not_split_or_given_casual_persona(self):
         model = audit.Model([audit.response(TEXT)])

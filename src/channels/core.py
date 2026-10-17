@@ -72,6 +72,8 @@ def _chat_parts(text, limit):
     parts = [p.strip() for p in re.split(r'\n\s*\n', text.strip()) if p.strip()]
     if len(parts) <= 1:
         return [text]
+    if len(parts) <= limit:
+        return parts
     return parts[:limit-1] + ['\n\n'.join(parts[limit-1:])]
 
 
@@ -381,8 +383,8 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         if trigger and selected:
             trigger.buffer.mark_reviewed(msg.conv_id,
                 [entry for entry in entries if entry.message_id not in selected])
-        natural_chat = (not lease.business_tools_used and lease.chat_segments_allowed
-                        and all(not IMG_MARKER.search(text) for text, _ in items))
+        # Content protection lives in _chat_parts, independently for each reply.
+        natural_chat = lease.chat_segments_allowed
         planned = []
         extra = max(0, CHAT_MAX_SEGMENTS - len(items))
         for text, target in items:
