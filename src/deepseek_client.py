@@ -187,12 +187,12 @@ async def _chat_round(
     campaign_text = campaign_state.get_state_for_prompt(group_id)
     dm_mode = campaign_state.is_dm_mode(group_id)
     lease = runtime.current()
+    focus = getattr(lease, 'focus_text', None)
+    if focus is None:
+        focus = user_message
     if lease:
         lease.chat_segments_allowed = not dm_mode
         # Only the current request can ask for detail; old background cannot opt in.
-        focus = getattr(lease, 'focus_text', user_message)
-        if focus is None:
-            focus = user_message
         lease.brief_chat = not dm_mode and not re.search(
             r'详细|展开|逐步|步骤|教程|代码|脚本|报错|堆栈|配置|部署|安装|翻译|完整|列出|写.{0,8}(?:诗|文|故事)', focus)
         if outbox is not None and lease.brief_chat:
@@ -205,6 +205,9 @@ async def _chat_round(
     enabled_names = {t["function"]["name"] for t in get_definitions()}
     if not DEEPSEEK_ENABLE_SEARCH:
         enabled_names -= {"web_search", "fetch_url", "search_images"}
+    ctx.extra['search_required'] = ('web_search' in enabled_names
+        and bool(re.search(r'搜一下|搜索|搜一搜|帮我搜|查一下|查下|帮我查', focus))
+        and not re.search(r'不用搜|不必搜|不要搜|别搜|不需要搜|无需搜', focus))
     controls = set(skills.SKILL_TOOL_NAMES)
     if outbox is not None:
         controls.update(CHAT_TOOL_NAMES)
@@ -221,6 +224,7 @@ async def _chat_round(
     # 公共系统提示（日期 + 群聊说明 + 回复格式）
     common_prompt = (
         f"当前日期：{today}。涉及时间、天气、新闻等实时信息，先加载相关技能，再使用开放的工具核实，不要凭记忆编造。工具因配置不可用时直接说明。\n\n"
+        "用户明确要求搜索或查证时，即使熟悉主题，也先加载相关技能并实际搜索，不用记忆替代搜索请求；失败时如实说明。\n"
         "【群聊共享对话说明 — 必须遵守】\n"
         "你在 QQ 群里服务，群内所有用户共享同一段对话上下文，不会因换了说话者而遗忘前面的内容。\n"
         "每条用户消息都以【说话者】开头，请据此区分是谁在说话。多人同时在场时，注意称呼和回应对应的说话者。\n\n"
@@ -295,7 +299,7 @@ async def _chat_round(
     # 每个工具有独立的调用上限（max_calls），全局安全上限 20 轮防止死循环
     _MAX_GLOBAL_ROUNDS = 20
     _tool_call_counts: dict[str, int] = {}  # tool_name → 已调用次数
-    decision_reminded = False
+    force_decision = False
 
     for round_num in range(1, _MAX_GLOBAL_ROUNDS + 1):
         definitions = get_definitions(whitelist=skill_session.allowed_tools(controls))
@@ -303,9 +307,19 @@ async def _chat_round(
         allowed_for_request = frozenset(t["function"]["name"] for t in definitions)
         request_ctx = replace(ctx, allowed_tools=allowed_for_request)
         kwargs = _build_request_kwargs(messages, definitions or None)
+        correcting = force_decision
+        force_decision = False
+        if correcting:
+            # The configured API rejects required tool_choice with thinking on.
+            # Only the formatting correction uses this compatible control turn;
+            # normal reasoning and business-tool requests keep their settings.
+            kwargs['extra_body'] = {**kwargs.get('extra_body', {}), 'thinking': {'type': 'disabled'}}
+            kwargs.pop('reasoning_effort', None)
+            kwargs['tool_choice'] = 'required'
         with runtime.phase('model'), stage('model.request', model=DEEPSEEK_MODEL, iteration=round_num,
                 message_count=len(messages), input_chars=sum(len(str(m)) for m in messages),
-                thinking=DEEPSEEK_ENABLE_THINKING, reasoning_effort=DEEPSEEK_REASONING_EFFORT,
+                thinking=DEEPSEEK_ENABLE_THINKING and not correcting,
+                reasoning_effort=None if correcting else DEEPSEEK_REASONING_EFFORT,
                 max_tokens=DEEPSEEK_MAX_TOKENS):
             response = await client.chat.completions.create(**kwargs)
         runtime.check()
@@ -377,6 +391,8 @@ async def _chat_round(
                             execute_tool, tool_name, tc.function.arguments, request_ctx
                         )
                     runtime.check()
+                    if tool_name == 'web_search':
+                        ctx.extra['search_attempted'] = True
                     # Tool bodies remain in the model context, never in runtime logs.
                     log_event('tool.result', tool=tool_name, iteration=round_num,
                         result_chars=len(str(result)), call_count=_tool_call_counts[tool_name])
@@ -386,19 +402,28 @@ async def _chat_round(
                         "content": result,
                     })
 
+            if outbox is not None and (outbox.has_items or outbox.skipped):
+                # A control decision completes this round. Further model turns
+                # can mistake queued content for delivery or reverse the decision.
+                log_event('model.complete', iterations=round_num)
+                break
             if not all_blocked:
                 continue  # 有工具成功执行，继续下一轮
 
         # 最终回答（无工具调用 或 所有工具都被阻塞）
         reply = msg.content or ""
         if outbox is not None and not outbox.has_items and not outbox.skipped:
-            if not decision_reminded:
-                decision_reminded = True
-                messages.append({'role': 'assistant', 'content': reply})
-                messages.append({'role': 'user', 'content':
-                    '本轮是群聊参与判断，正文不会直接发送。先确认消息对象与表达是否完整；'
+            if not correcting:
+                force_decision = True
+                # Discard unsubmitted prose: adding it as an assistant message
+                # makes the model believe the user has already received it.
+                messages[0] = {**messages[0], 'content': messages[0]['content'] + '\n\n'
+                    '【本轮投递状态纠正】本轮还没有任何回复发送给用户，也没有排入发送队列。'
+                    '刚才的普通正文已丢弃，不是已回答的历史，不要因此选择skip。'
+                    '重新查看当前触发消息及原始图文，明确向你提问且表达完整时应调用reply；'
+                    'send_sticker仅选图，不代表图片已发送，需要用reply提交含[img]标记的内容。'
                     '需要参与请调用 reply，不参与请调用 skip(reason=irrelevant)，等待补充请调用 skip(reason=wait)。'
-                    '若决定用表情包表达，再加载图片理解技能；不要求每轮使用表情包。'})
+                    '若决定用表情包表达，再加载图片理解技能；不要求每轮使用表情包。'}
                 log_event('chat.decision_required')
                 continue
             outbox.skipped = True

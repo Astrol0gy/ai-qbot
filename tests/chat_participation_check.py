@@ -95,8 +95,16 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         sender, model = await self.chat([audit.response('不应发出的抢话'),
             audit.response(calls=[('reply', {'text':'已判断后回应'})]), audit.response()])
         self.assertEqual([x['text'] for x in sender.sent], ['已判断后回应'])
-        self.assertEqual(len(model.requests), 3)
+        self.assertEqual(len(model.requests), 2)
         self.assertNotIn('不应发出的抢话', dc._conversations['g'][-1]['content'])
+        correction = model.requests[1]['messages'][0]['content']
+        self.assertIn('本轮还没有任何回复发送', correction)
+        self.assertEqual(model.requests[1]['tool_choice'], 'required')
+        self.assertEqual(model.requests[1]['extra_body']['thinking']['type'], 'disabled')
+        self.assertEqual(model.requests[0]['extra_body']['thinking']['type'],
+                         'enabled' if dc.DEEPSEEK_ENABLE_THINKING else 'disabled')
+        self.assertFalse(any(m.get('role')=='assistant' and m.get('content')=='不应发出的抢话'
+                             for m in model.requests[1]['messages'] if isinstance(m,dict)))
 
     async def test_two_missing_decisions_stay_silent_without_history(self):
         sender, model = await self.chat([audit.response('第一次抢话'), audit.response('第二次抢话')])
@@ -105,6 +113,29 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('g', dc._conversations)
         sender, _ = await self.chat([audit.response('私聊正常直接回答')], group=False)
         self.assertEqual(sender.sent[0]['text'], '私聊正常直接回答')
+
+    async def test_control_decision_finishes_without_an_extra_model_turn(self):
+        for call in [('reply', {'text':'一句回复'}), ('skip', {'reason':'wait'}),
+                     ('skip', {'reason':'irrelevant'})]:
+            dc._conversations.pop('g', None)
+            sender, model = await self.chat([audit.response(calls=[call])])
+            self.assertEqual(len(model.requests), 1)
+            self.assertEqual(bool(sender.sent), call[0]=='reply')
+
+    async def test_sticker_draft_is_not_mistaken_for_delivered_history(self):
+        responses = [audit.response(calls=[('load_skill',{'name':'图片理解'})]),
+                     audit.response(calls=[('send_sticker',{'query':'无语'})]),
+                     audit.response('[img]chosen.gif[/img]'),
+                     audit.response(calls=[('reply',{'text':'[img]chosen.gif[/img]'})])]
+        execute = tools.execute
+        def fake_tool(name, args, ctx):
+            return '[img]chosen.gif[/img]' if name=='send_sticker' else execute(name,args,ctx)
+        with patch.object(dc,'execute_tool',fake_tool), patch.object(stickers_utils,'resolve',return_value='chosen.gif'):
+            sender, model = await self.chat(responses,text='发一张表情包')
+        self.assertEqual(sender.sent[0]['stickers'], ['chosen.gif'])
+        self.assertEqual(len(model.requests), 4)
+        self.assertFalse(any(m.get('role')=='assistant' and m.get('content')=='[img]chosen.gif[/img]'
+                             for m in model.requests[-1]['messages'] if isinstance(m,dict)))
 
     async def test_long_casual_reply_is_rejected_then_rewritten_not_truncated(self):
         sender, _ = await self.chat([
