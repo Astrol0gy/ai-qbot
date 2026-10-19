@@ -61,6 +61,7 @@ class IncomingMessage:
 
     is_group: bool = True          # 群聊 / 私聊
     is_at_bot: bool = False        # 是否 @ 了机器人
+    mention_user_ids: tuple[str, ...] = ()  # 结构化 @ 对象，使用通道内规范化用户 id
     is_interjection: bool = False  # 非直呼的群聊唤醒（AI 自行决定开不开口）
     # 普通群聊唤醒：把 reply / skip 工具交给 AI，由它决定这一轮是否开口
     # （私聊、跑团模式不注入，保持原有行为）
@@ -75,6 +76,14 @@ class IncomingMessage:
     def is_direct_address(self) -> bool:
         """直呼机器人（@ 或私聊）：指令处理按这条判断，与唤醒方式无关"""
         return (not self.is_group) or self.is_at_bot
+
+    @property
+    def addressed_to_others(self) -> bool:
+        if not self.is_group or self.is_at_bot:
+            return False
+        return bool(self.mention_user_ids or (
+            self.quote and self.quote.author_id and not self.quote.is_bot
+            and self.quote.author_id != self.user_id))
 
     def buffer_text(self) -> str:
         """

@@ -17,6 +17,7 @@ from src.trigger import BufferEntry
 
 TEXT = '我觉得\n\n你说的有道理，但是\n\n事情真的是这样吗'
 PARTS = ['我觉得', '你说的有道理，但是', '事情真的是这样吗']
+BRIEF_PARTS = [PARTS[0], '\n\n'.join(PARTS[1:])]
 
 
 class ChatCases(unittest.IsolatedAsyncioTestCase):
@@ -47,8 +48,8 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_chat_sends_parts_and_records_delivered_text(self):
         sender = await self.run_model(audit.Model([audit.response(TEXT)]))
-        self.assertEqual([x['text'] for x in sender.sent], PARTS)
-        self.assertEqual(dc._conversations['g'][-1]['content'], '\n'.join(PARTS))
+        self.assertEqual([x['text'] for x in sender.sent], BRIEF_PARTS)
+        self.assertEqual(dc._conversations['g'][-1]['content'], '\n'.join(BRIEF_PARTS))
 
     async def test_onebot_quotes_selected_source_only_on_first_part(self):
         for mid in ('1','2'):
@@ -59,10 +60,10 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
         await self.run_model(model, sender=sender, msg=IncomingMessage(conv_id='g',user_id='2',
             text='新消息', message_id='2', is_at_bot=True, ai_decides_reply=True))
         messages = [call.args[1]['message'] for call in api.call_args_list]
-        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(messages), 2)
         self.assertEqual(messages[0][0], {'type':'reply','data':{'id':'2'}})
         self.assertTrue(all(not any(s['type']=='reply' for s in m) for m in messages[1:]))
-        self.assertEqual([m[-1]['data']['text'] for m in messages], PARTS)
+        self.assertEqual([m[-1]['data']['text'] for m in messages], BRIEF_PARTS)
 
     async def test_official_parts_increment_sequence(self):
         calls = []
@@ -72,7 +73,7 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
         sender = official.OfficialSender(NS(group_openid='g',id='m'), None)
         with patch.object(official, '_safe_send_group', send):
             await self.run_model(audit.Model([audit.response(TEXT)]), sender=sender)
-        self.assertEqual(calls, list(zip(PARTS,[1,2,3])))
+        self.assertEqual(calls, list(zip(BRIEF_PARTS,[1,2])))
 
     async def test_short_reply_stays_one_message(self):
         sender = await self.run_model(audit.Model([audit.response('你说得有道理。')]))
@@ -92,7 +93,7 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
             await real_sleep(0)
         with patch.object(core, 'CHAT_SEGMENT_INTERVAL_SEC',.6), patch.object(core.asyncio, 'sleep', sleep):
             await self.run_model(audit.Model([audit.response(TEXT)]), sender=sender)
-        self.assertEqual(sends_at_wait, [(.6,1),(.6,2)])
+        self.assertEqual(sends_at_wait, [(.6,1)])
 
     async def run_tool_reply(self, text, *, tool='web_search', skill='精准搜索', args=None):
         model = audit.Model([audit.response(calls=[('load_skill',{'name':skill})]),
@@ -110,7 +111,7 @@ class ChatCases(unittest.IsolatedAsyncioTestCase):
                                  ('plan_route','地图导航',{'origin':'成都','destination':'北京'})]:
             with self.subTest(tool=tool):
                 sender = await self.run_tool_reply(TEXT,tool=tool,skill=skill,args=args)
-                self.assertEqual([x['text'] for x in sender.sent], PARTS)
+                self.assertEqual([x['text'] for x in sender.sent], BRIEF_PARTS)
 
     async def test_tool_assisted_structured_replies_stay_intact(self):
         for text in ['说明\n\nhttps://example.com', '步骤\n\n1. 第一步\n\n2. 第二步',

@@ -116,6 +116,17 @@ def _extract_from_cq(raw: str, self_id: str) -> tuple[str, list[str], bool, str]
     return "".join(text_parts), images, at_bot, reply_id
 
 
+def mention_ids(message, self_id: str) -> tuple[str, ...]:
+    """Keep actual @ segments separate from ordinary text containing an @ sign."""
+    if isinstance(message, str):
+        ids = [_parse_cq_params(m.group(2)).get('qq', '') for m in _CQ_RE.finditer(message) if m.group(1) == 'at']
+    else:
+        ids = [(seg.get('data') or {}).get('qq', '') for seg in (message or [])
+               if isinstance(seg, dict) and seg.get('type') == 'at']
+    return tuple(dict.fromkeys(f'onebot_{uid}' for value in ids
+                              if (uid := str(value)) and uid != self_id))
+
+
 def extract_message(message, self_id: str) -> tuple[str, list[str], bool, str]:
     """把 OneBot 的 message 字段归一化为（文本, 图片URL列表, 是否@机器人, 引用的消息id）"""
     if isinstance(message, str):
@@ -680,6 +691,7 @@ class OneBotClient:
             quote=None,
             is_group=is_group,
             is_at_bot=at_bot,
+            mention_user_ids=mention_ids(event.get('message'), self._self_id),
             raw={"message_type": event.get("message_type"), "group_id": raw_gid, "user_id": raw_uid, "message_id": event.get("message_id"), "reply_id": reply_id},
         )
 
@@ -688,7 +700,7 @@ class OneBotClient:
         if await handle_admin(incoming, sender):
             return
         log_event('message.received', **message_fields(incoming), text=text, at_bot=at_bot,
-            image_count=len(incoming.image_urls), quote_id=reply_id)
+            image_count=len(incoming.image_urls), quote_id=reply_id, mention_user_ids=incoming.mention_user_ids)
         try:
             await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch)
         except asyncio.QueueFull as exc:
@@ -785,7 +797,7 @@ class OneBotClient:
         uid = str(sender.get("user_id") or "")
         quote = QuoteInfo(
             message_id=str(reply_id),
-            author_id=uid,
+            author_id=f'onebot_{uid}' if uid else '',
             author_name=str(sender.get("card") or "").strip()
             or str(sender.get("nickname") or "").strip(),
             text=(quoted_text or "").strip(),

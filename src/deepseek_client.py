@@ -6,6 +6,7 @@ DeepSeek V4 API 封装
 - Tool Calling 联网搜索（模型自主决定调用搜索工具）
 """
 import asyncio
+import re
 import time
 from collections import defaultdict
 from dataclasses import replace
@@ -188,6 +189,16 @@ async def _chat_round(
     lease = runtime.current()
     if lease:
         lease.chat_segments_allowed = not dm_mode
+        # Only the current request can ask for detail; old background cannot opt in.
+        focus = getattr(lease, 'focus_text', user_message)
+        if focus is None:
+            focus = user_message
+        lease.brief_chat = not dm_mode and not re.search(
+            r'详细|展开|逐步|步骤|教程|代码|脚本|报错|堆栈|配置|部署|安装|翻译|完整|列出|写.{0,8}(?:诗|文|故事)', focus)
+        if outbox is not None and lease.brief_chat:
+            outbox.max_text_chars = 160
+        log_event('chat.policy', brief=lease.brief_chat,
+                  max_text_chars=outbox.max_text_chars if outbox else None)
 
     # 能力开关先收紧可授予的范围；技能只能在这个范围内逐步开放业务工具。
     # 搜索开关不再误关画像、跑团、导航、生图等其他能力。
@@ -226,12 +237,12 @@ async def _chat_round(
     chat_style = (
         "【说话风格 — 必须遵守】\n"
         "普通聊天像跟朋友接话，私聊也按同样的自然语气表达：\n"
-        "- 默认就回一两句，像群里随口接话那么短；说完就停，别铺垫、别收尾总结\n"
+        "- 默认一句、一条，通常80字以内；两个独立意思才分两条，普通接话总长不超过160字。说完就停，不追加玩笑、反问或第二个话题；需要技术步骤或用户明确要求详述时例外\n"
         "- 分点、列表是例外：只有对方明确要你「详细说」「列一下」，或者内容本身就是几个并列选项时才用\n"
         "- 别用「总结一下」「总的来说」收尾，也别复述对方刚说过的话\n"
         "- 对方没要求展开时，长篇大论只会像个机器人在念稿\n"
         "- 历史图文是理解后续补充的背景，不是逐条待办；不重新补答与新话题无关的旧消息\n"
-        "- 普通文字解释较长时，可按自然语气或语义分成两三段，用空行分隔；即使调用过搜索、导航等工具，这些段落也会按顺序分条发送\n"
+        "- 分条只表达必要的语义停顿，不增加总内容量；搜索后先给简短结论，普通接话最多两段，用空行分隔，不把条数上限当成目标\n"
         "- 短答不必拆分，不按几个字机械切段；同一回应的几段放在一次 reply 的 text 中，不要反复引用同一条消息\n"
         "- 按最终内容判断：链接、代码、列表、表格、图片回复和跑团内容保持完整；不要为了分条破坏资料或步骤的结构\n"
     )
@@ -284,6 +295,7 @@ async def _chat_round(
     # 每个工具有独立的调用上限（max_calls），全局安全上限 20 轮防止死循环
     _MAX_GLOBAL_ROUNDS = 20
     _tool_call_counts: dict[str, int] = {}  # tool_name → 已调用次数
+    decision_reminded = False
 
     for round_num in range(1, _MAX_GLOBAL_ROUNDS + 1):
         definitions = get_definitions(whitelist=skill_session.allowed_tools(controls))
@@ -379,6 +391,19 @@ async def _chat_round(
 
         # 最终回答（无工具调用 或 所有工具都被阻塞）
         reply = msg.content or ""
+        if outbox is not None and not outbox.has_items and not outbox.skipped:
+            if not decision_reminded:
+                decision_reminded = True
+                messages.append({'role': 'assistant', 'content': reply})
+                messages.append({'role': 'user', 'content':
+                    '本轮是群聊参与判断，正文不会直接发送。先确认消息对象与表达是否完整；'
+                    '需要参与请调用 reply，不参与请调用 skip(reason=irrelevant)，等待补充请调用 skip(reason=wait)。'
+                    '若决定用表情包表达，再加载图片理解技能；不要求每轮使用表情包。'})
+                log_event('chat.decision_required')
+                continue
+            outbox.skipped = True
+            outbox.skip_reason = 'irrelevant'
+            log_event('chat.decision_missing', status='discarded')
         log_event('model.complete', iterations=round_num)
         break
     else:
@@ -399,7 +424,11 @@ async def _chat_round(
             # 不写历史；通道按 reason 区分保留待补充和已略过的背景。
             print("[🤐 skip] 本轮不写入对话历史")
             return ""
-        # 没调工具：当作普通回复，继续往下走
+        # A global-round fallback is not an implicit decision to join a group.
+        outbox.skipped = True
+        outbox.skip_reason = 'irrelevant'
+        log_event('chat.decision_missing', status='discarded')
+        return ''
 
     # 保存对话历史（只存 user/assistant，不存中间 tool 消息）
     history.append({"role": "user", "content": history_user})

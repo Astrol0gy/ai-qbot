@@ -188,13 +188,14 @@ ONEBOT_GROUP_BLACKLIST = _parse_id_set("ONEBOT_GROUP_BLACKLIST")
 # ============================================
 # 两个状态：
 #   空闲   → 系统按概率决定要不要开一局（@ 必定开局）
-#   互动中 → 每条消息都叫醒 AI（不再掷骰子），由它用 reply / skip 决定这轮开不开口
-# 每轮处理完都重新计时：TRIGGER_ACTIVE_TIMEOUT_SEC 秒内没人说话就退出互动，
+#   互动中 → 原参与者和引用机器人的消息免掷骰，其他成员仍按概率判断
+# 仅实际回复成功后重新计时；wait 不续期，irrelevant 退出互动。
+# TRIGGER_ACTIVE_TIMEOUT_SEC 秒窗口到期就退出互动，
 # 回到空闲的概率唤醒。（原 TRIGGER_COOLDOWN_SEC 已废弃：互动窗口替代了它。）
 # ============================================
 # 空闲状态下，未被 @ 的群消息触发一次唤醒的概率（0.1 = 10%）
 TRIGGER_PROBABILITY = float(os.getenv("TRIGGER_PROBABILITY", "0.1"))
-# 互动窗口：AI 处理完一轮后，多久没人说话就算聊完、退出互动回到概率唤醒（秒）
+# 互动窗口：实际回复后持续多少秒；入站消息与 wait 不自动续期
 TRIGGER_ACTIVE_TIMEOUT_SEC = int(os.getenv("TRIGGER_ACTIVE_TIMEOUT_SEC", "60"))
 # 消息长度低于该值不单独唤醒（仍会进入上下文缓冲，随后面某条一起带出去）
 TRIGGER_MIN_LEN = int(os.getenv("TRIGGER_MIN_LEN", "2"))

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 from . import ChatContext, ToolProvider
 
@@ -29,8 +30,7 @@ SKIP_TOOL = "skip"
 #: 本 Provider 的工具名（普通群聊唤醒路径按它显式注入；私聊、跑团不要注入）
 CHAT_TOOL_NAMES = frozenset({REPLY_TOOL, SKIP_TOOL})
 
-#: 单轮最多 reply 几次：一批里可能好几个人同时说话，要给"各回一条"留足额度，
-#: 同时防止模型没完没了地"补一句"烧钱
+#: 工具的安全调用上限，不是建议回复条数；普通接话通常只需一次。
 MAX_CHAT_CALLS = 6
 
 #: skip 单独给一个小额度。它只是"本轮不开口"的一个标记，调一次就够了；
@@ -42,6 +42,8 @@ MAX_SKIP_CALLS = 2
 CHAT_POLICY = (
     "【聊天参与与上下文】\n"
     "- 被唤醒不等于必须开口。先合并理解当前话题中的截图、文字和表情包，再判断用户是否表达完整。\n"
+    "- 活跃期不表示全群都在和你说话。先根据结构化@对象、引用作者、称呼及上下文判断对话双方；明确说给其他人的消息默认旁观。\n"
+    "- 「你」优先指向被@、被引用或当前对话对象，不能默认是机器人；提到你、谈论你、拿你开玩笑不等于邀请你回应。\n"
     "- 明确的问题、请求或适合接话的完整表达，可以回应；单独截图、话题名称、表情包或半句话不自动构成回复邀请。\n"
     "- 用户可能分多条消息铺垫和补充；还没形成清晰意思时，群聊优先 skip(reason=wait)，不要抢先概括、点评或逐张接梗。\n"
     "- 完整但与你无关、无需参与的话题，群聊用 skip(reason=irrelevant)。不要为参与而强行找话说。\n"
@@ -49,6 +51,8 @@ CHAT_POLICY = (
     "- 「这个」「刚才那张」优先联系最近的图片描述和话题；不确定指哪张就澄清。当前消息没有新图，不代表之前没收到图。\n"
     "- 有图片描述时依据描述理解，不声称直接看到了未提供的细节；图片内容未读到时如实说没看清，不编造。\n"
     "- 群聊需要回复时用 reply；同一话题通常一次，用 text 内空行表示自然停顿，不为每个人分别作答。\n"
+    "- 普通接话默认一句、一条，通常不超过80字；最多两个独立意思才分两条，总长以160字为限，不为凑段数追加内容。搜索后也先给简短结论，追问再展开；明确要求详述、代码或必要技术步骤除外。\n"
+    "- 已决定参与、且表情比文字更合适时，可先 load_skill(name=图片理解) 再挑一张表情包，也可只发图；不要求每轮发，不为了发表情包而插话。\n"
     "- 私聊直接回答，不调用未提供的 reply/skip；表达不完整时可简短确认或澄清。\n"
 )
 
@@ -69,6 +73,7 @@ class ReplyOutbox:
     items: list[ReplyItem] = field(default_factory=list)
     skipped: bool = False
     skip_reason: str = "irrelevant"
+    max_text_chars: int | None = None
 
     @property
     def has_items(self) -> bool:
@@ -155,6 +160,12 @@ class ChatProvider(ToolProvider):
         if not str(text).strip():
             return "reply 缺少 text，没有记录任何内容。"
         content = str(text).strip()
+        if outbox.max_text_chars is not None:
+            total = sum(len(re.sub(r'\[img\].*?\[/img\]', '', item.text)) for item in outbox.items)
+            total += len(re.sub(r'\[img\].*?\[/img\]', '', content))
+            if total > outbox.max_text_chars or len(outbox.items) >= 2:
+                return (f"尚未记录这条回复：普通接话整轮总文字上限{outbox.max_text_chars}字，最多两条。"
+                        "请压缩为简短结论，不重复已排好的内容；不要拆成更多调用绕过限制。")
 
         raw_id = str(reply_to or "").strip()
         note = ""

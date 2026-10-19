@@ -168,6 +168,8 @@ class RoundLease:
         self.progress = ("model", "", time.monotonic(), object())
         self.business_tools_used = False
         self.chat_segments_allowed = True
+        self.brief_chat = False
+        self.focus_text = None
         self.writes = {}
         self.after_commit = []
         self.history = None

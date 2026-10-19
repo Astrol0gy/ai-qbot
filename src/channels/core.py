@@ -299,6 +299,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         gate.release()
         return
     lease = runtime.RoundLease(msg.conv_id, None)
+    lease.focus_text = msg.text
     set_round(lease.id)
     log_event('model.round.start', round_id=lease.id, notice_after_sec=DEEPSEEK_THINKING_NOTICE_SEC)
     lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
@@ -371,14 +372,14 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             if trigger:
                 if not waiting:
                     trigger.buffer.mark_reviewed(msg.conv_id, entries)
-                trigger.mark_answered(msg.conv_id)
+                    trigger.leave_session(msg.conv_id)
             return
         items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]
         if len(items) == 1 and items[0][0].strip().lower() in SKIP_TOKENS and msg.ai_decides_reply:
             outcome('skipped')
             if trigger:
                 trigger.buffer.mark_reviewed(msg.conv_id, entries)
-                trigger.mark_answered(msg.conv_id)
+                trigger.leave_session(msg.conv_id)
             return
         selected = {target for _, target in items if target}
         if trigger and selected:
@@ -387,7 +388,8 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         # Content protection lives in _chat_parts, independently for each reply.
         natural_chat = lease.chat_segments_allowed
         planned = []
-        extra = max(0, CHAT_MAX_SEGMENTS - len(items))
+        segment_limit = min(CHAT_MAX_SEGMENTS, 2) if getattr(lease, 'brief_chat', False) else CHAT_MAX_SEGMENTS
+        extra = max(0, segment_limit - len(items))
         for text, target in items:
             parts = _chat_parts(text, extra + 1) if natural_chat else [text]
             extra -= len(parts) - 1
@@ -427,7 +429,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
                                 covered.update(entry.message_id for entry in entries)
                     trigger.buffer.consume(msg.conv_id, [entry for entry in entries if entry.message_id in covered])
                 if complete:
-                    trigger.mark_answered(msg.conv_id)
+                    trigger.mark_answered(msg.conv_id, msg.user_id)
                 else:
                     trigger.leave_session(msg.conv_id)
     finally:

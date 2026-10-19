@@ -5,18 +5,18 @@
 说什么」一律交给 AI 自己用 reply / skip 工具决定。普通群聊有两个状态：
 
 - **空闲**：按概率决定要不要开一局（`TRIGGER_PROBABILITY`），@ 必定开局
-- **互动中**：每条消息都叫醒 AI，不再掷骰子（这正是「等人说完再回」成立的前提）
+- **互动中**：原参与者或引用机器人的消息无需掷骰；其他成员仍按概率评估
 
-每轮处理完（AI 开口或选择 skip）都重新计时，`TRIGGER_ACTIVE_TIMEOUT_SEC` 秒内
-没人说话就退出互动、回到空闲的概率唤醒。状态只用一个截止时间戳表示，
-所以不需要定时器任务。
+实际回复后重置 `TRIGGER_ACTIVE_TIMEOUT_SEC` 窗口；入站消息和 wait 不续期，
+irrelevant 结束窗口。截止时间到期后回到概率唤醒，不需要定时器任务。
 
 其余规则：
 - 私聊                          → 叫（不看概率，也不进互动窗口）
 - 群聊 @机器人                   → 叫，并开启/延续互动窗口
 - 群聊未被 @ 且以 / 开头          → 不叫（发送者显然想调指令，当闲聊交给 AI 只会得到无意义回复）
 - 群聊未被 @ 且处于 DM（跑团）模式 → 不叫（不送 AI、不入缓冲，等价于官方框架 @ 语义）
-- 群聊未被 @ 的其他消息           → 群黑白名单 → 最小长度 → 互动中就叫 / 空闲则掷骰
+- 群聊明确说给其他人             → 留作背景，不唤醒
+- 群聊未被 @ 的其他消息           → 群黑白名单 → 最小长度 → 按参与者及窗口判断 / 掷骰
 
 叫醒时会把「自上次开口以来攒下的群聊片段」一并交给 AI（每条带说话者、消息 id、
 是否 @ 了机器人、引用了谁的话）。
@@ -65,6 +65,9 @@ class BufferEntry:
     quote: str = ""     # 已拼好的人类可读描述，如「引用了你的消息：「…」」
     ts: float = 0.0     # 入缓冲时刻（monotonic），用于「只清掉这一轮之前」的判断
     reviewed: bool = False  # 已考虑但选择略过，只作后续理解话题的背景
+    mention_user_ids: tuple[str, ...] = ()
+    quote_author_id: str = ""
+    quote_is_bot: bool = False
 
     def line(self) -> str:
         marks = []
@@ -72,6 +75,10 @@ class BufferEntry:
             marks.append("已看过并略过，仅作背景，无需单独补答；仍可用于理解后续补充")
         if self.at_bot:
             marks.append("@了你")
+        if self.mention_user_ids:
+            marks.append("明确@对象=" + ",".join(self.mention_user_ids))
+        if self.quote_author_id:
+            marks.append("引用作者id=" + self.quote_author_id + ("（机器人）" if self.quote_is_bot else "（非机器人）"))
         if self.quote:
             marks.append(self.quote)
         if self.message_id:
@@ -171,6 +178,7 @@ class TriggerController:
         # 互动窗口：conv_id → 截止时间（monotonic）。过期即视为「空闲」，
         # 所以状态不需要额外的定时器任务去清理。
         self._active_until: dict[str, float] = {}
+        self._session_users: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # 主判定入口
@@ -192,6 +200,9 @@ class TriggerController:
             at_bot=msg.is_at_bot,
             quote=msg.quote.describe() if msg.quote else "",
             ts=msg.received_at,
+            mention_user_ids=msg.mention_user_ids,
+            quote_author_id=msg.quote.author_id if msg.quote else '',
+            quote_is_bot=bool(msg.quote and msg.quote.is_bot),
         )
 
         # 未被 @ 的指令：直接忽略，不执行、不唤醒、不入缓冲
@@ -212,6 +223,11 @@ class TriggerController:
         # 入缓冲：叫醒时它就是要交给 AI 的上下文
         self.buffer.add(msg.conv_id, entry)
 
+        # Explicit recipients take precedence over the group-wide activity state.
+        if msg.addressed_to_others:
+            entry.reviewed = True
+            return TriggerResult(Decision.IGNORE, reason="对其他人说话")
+
         # 未被 @ 且过短：不值得单独把 AI 叫起来（仍留在缓冲里，等后面某条一起带出去）
         if not msg.is_at_bot and len(ctx_text) < TRIGGER_MIN_LEN:
             return TriggerResult(Decision.IGNORE, reason="过短")
@@ -220,16 +236,18 @@ class TriggerController:
 
         # @机器人：立即唤醒，并开启/延续互动窗口
         if msg.is_at_bot:
-            self._enter_session(msg.conv_id, now)
+            self._enter_session(msg.conv_id, now, msg.user_id)
             return TriggerResult(
                 Decision.WAKE,
                 context=self.buffer.peek(msg.conv_id),
                 reason="@",
             )
 
-        # 互动中：每条消息都叫醒（不再掷骰），并重新计时
-        if self.is_active(msg.conv_id, now):
-            self._enter_session(msg.conv_id, now)
+        # Only the ongoing participant (or a reply to the bot) bypasses sampling.
+        # Incoming messages never slide the deadline forward.
+        if self.is_active(msg.conv_id, now) and (
+                msg.user_id in self._session_users.get(msg.conv_id, set())
+                or msg.quote and msg.quote.is_bot):
             return TriggerResult(
                 Decision.WAKE,
                 context=self.buffer.peek(msg.conv_id),
@@ -240,7 +258,8 @@ class TriggerController:
         if random.random() >= TRIGGER_PROBABILITY:
             return TriggerResult(Decision.IGNORE, reason="概率未命中")
 
-        self._enter_session(msg.conv_id, now)
+        if not self.is_active(msg.conv_id, now):
+            self._enter_session(msg.conv_id, now, msg.user_id)
         return TriggerResult(
             Decision.WAKE,
             context=self.buffer.peek(msg.conv_id),
@@ -262,17 +281,19 @@ class TriggerController:
         模式切换（进出跑团）时调用：两种模式互斥，普通 chat 的互动状态不该带过去。
         """
         self._active_until.pop(conv_id, None)
+        self._session_users.pop(conv_id, None)
 
-    def mark_answered(self, conv_id: str) -> None:
+    def mark_answered(self, conv_id: str, user_id: str = '') -> None:
         """
-        本轮处理完了（AI 开口或选择 skip）：从现在起重新计时。
+        实际回复成功后重新计时，并记录本轮对话参与者；skip 不调用。
 
         计时从「回复完成」开始算，所以 AI 慢慢想的这段时间不会白白吃掉窗口。
         """
-        self._enter_session(conv_id)
+        self._enter_session(conv_id, user_id=user_id)
 
-    def _enter_session(self, conv_id: str, now: float | None = None) -> None:
+    def _enter_session(self, conv_id: str, now: float | None = None, user_id: str = '') -> None:
         self._active_until[conv_id] = (now or time.monotonic()) + TRIGGER_ACTIVE_TIMEOUT_SEC
+        self._session_users[conv_id] = {user_id} if user_id else set()
         if len(self._active_until) > 1000:
             # 顺手清掉已过期的会话，避免长期运行下无界增长
             current = time.monotonic()
@@ -281,6 +302,7 @@ class TriggerController:
             }
             while len(self._active_until) > 1000:
                 self._active_until.pop(next(iter(self._active_until)))
+            self._session_users = {key: users for key, users in self._session_users.items() if key in self._active_until}
 
     def is_dm_mode(self, conv_id: str) -> bool:
         """该会话当前是不是跑团（DM）模式：跑团不注入 reply/skip，行为与从前完全一致"""
