@@ -1,0 +1,3 @@
+# Preserve the pinned upstream copies and their checksums on every platform.
+src/skills/lieflat-less-ai-tone/references/upstream-SKILL.md text eol=lf
+src/skills/lieflat-less-ai-tone/LICENSE text eol=lf
