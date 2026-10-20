@@ -206,7 +206,7 @@ async def _chat_round(
     if not DEEPSEEK_ENABLE_SEARCH:
         enabled_names -= {"web_search", "fetch_url", "search_images"}
     ctx.extra['search_required'] = ('web_search' in enabled_names
-        and bool(re.search(r'搜一下|搜索|搜一搜|帮我搜|查一下|查下|帮我查', focus))
+        and bool(re.search(r'搜一下|搜索|搜一搜|帮我搜|(?:上网|联网|网上).{0,6}查', focus))
         and not re.search(r'不用搜|不必搜|不要搜|别搜|不需要搜|无需搜', focus))
     controls = set(skills.SKILL_TOOL_NAMES)
     if outbox is not None:
@@ -420,7 +420,9 @@ async def _chat_round(
                 messages[0] = {**messages[0], 'content': messages[0]['content'] + '\n\n'
                     '【本轮投递状态纠正】本轮还没有任何回复发送给用户，也没有排入发送队列。'
                     '刚才的普通正文已丢弃，不是已回答的历史，不要因此选择skip。'
-                    '重新查看当前触发消息及原始图文，明确向你提问且表达完整时应调用reply；'
+                    '重新按对话对象、用户表达完整性、参与必要性的顺序判断。'
+                    '用户仍在铺垫或句子未完时先skip(reason=wait)，不能凭截图里的报错补全求助意图；'
+                    '明确向你提问且表达完整时应调用reply；'
                     'send_sticker仅选图，不代表图片已发送，需要用reply提交含[img]标记的内容。'
                     '需要参与请调用 reply，不参与请调用 skip(reason=irrelevant)，等待补充请调用 skip(reason=wait)。'
                     '若决定用表情包表达，再加载图片理解技能；不要求每轮使用表情包。'}

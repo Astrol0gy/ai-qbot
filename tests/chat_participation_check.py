@@ -143,6 +143,32 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
             audit.response(calls=[('reply',{'text':'简短结论'})]), audit.response()])
         self.assertEqual([x['text'] for x in sender.sent], ['简短结论'])
 
+    async def test_explicit_search_rejects_answer_until_attempted(self):
+        execute = tools.execute
+        def fake_tool(name, args, ctx):
+            return '搜索服务暂时失败' if name == 'web_search' else execute(name, args, ctx)
+        with patch.object(dc, 'execute_tool', fake_tool):
+            sender, model = await self.chat([
+                audit.response(calls=[('reply', {'text':'未经搜索的答案'})]),
+                audit.response(calls=[('load_skill', {'name':'精准搜索'})]),
+                audit.response(calls=[('web_search', {'query':'GitHub Actions'})]),
+                audit.response(calls=[('reply', {'text':'搜索暂时失败，请稍后再试。'})])],
+                text='帮我搜一下 GitHub Actions')
+        self.assertEqual([x['text'] for x in sender.sent], ['搜索暂时失败，请稍后再试。'])
+        self.assertEqual(len(model.requests), 4)
+
+    async def test_local_lookup_and_search_opt_out_do_not_require_web(self):
+        for text in ('不用搜索，直接说结论', '查一下本地配置'):
+            dc._conversations.pop('g', None)
+            sender, _ = await self.chat([audit.response(calls=[('reply', {'text':'本地结果'})])], text=text)
+            self.assertEqual(sender.sent[0]['text'], '本地结果')
+
+    async def test_disabled_search_can_report_unavailability(self):
+        with patch.object(dc, 'DEEPSEEK_ENABLE_SEARCH', False):
+            sender, _ = await self.chat([audit.response(calls=[('reply', {'text':'搜索功能未启用。'})])],
+                                       text='帮我搜一下 GitHub Actions')
+        self.assertEqual(sender.sent[0]['text'], '搜索功能未启用。')
+
     async def test_total_budget_cannot_be_bypassed_by_multiple_calls(self):
         sender, _ = await self.chat([audit.response(calls=[
             ('reply',{'text':'甲'*100}), ('reply',{'text':'乙'*100})]), audit.response()])
