@@ -336,6 +336,10 @@ async def _chat_round(
         # 有工具调用 → 检查各工具配额
         if msg.tool_calls:
             log_event('model.tool_calls', iteration=round_num, tools=[tc.function.name for tc in msg.tool_calls])
+            if correcting and getattr(msg, 'reasoning_content', None) is None:
+                # A non-thinking control turn has no reasoning to return. The API
+                # still requires the field when thinking resumes after its tools.
+                msg.reasoning_content = ''
             messages.append(msg)
 
             all_blocked = True
