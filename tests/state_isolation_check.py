@@ -177,7 +177,7 @@ class _FakeCompletions:
         if self.calls == 3:
             # 第二轮：用一个真会同步阻塞 0.6s 的工具
             return _Resp(_Msg(tool_calls=[_TC("slow_tool", '{"tag":"x"}', 1)]))
-        return _Resp(_Msg(content="最终回答"))
+        return _Resp(_Msg(tool_calls=[_TC("reply", '{"text":"最终回答","recipient":"group","expression":"complete"}', 2)]))
 
 
 fake_completions = _FakeCompletions()
@@ -289,11 +289,11 @@ check("非法次数给出可读错误而不是异常", "需要是数字" in r, r
 # ---------------------------------------------------------------- 7. 表态箱隔离
 print("\n=== 7. reply / skip 用本轮上下文（不落到别的群）===")
 ob1, ob2 = ReplyOutbox(), ReplyOutbox()
-tools.execute("reply", '{"text":"A群的话"}', ctx("gA", "u1", "甲", ob1))
-tools.execute("reply", '{"text":"B群的话"}', ctx("gB", "u2", "乙", ob2))
+tools.execute("reply", '{"text":"A群的话","recipient":"group","expression":"complete"}', ctx("gA", "u1", "甲", ob1))
+tools.execute("reply", '{"text":"B群的话","recipient":"group","expression":"complete"}', ctx("gB", "u2", "乙", ob2))
 check("A 群表态箱只有 A 群的话", [i.text for i in ob1.items] == ["A群的话"], str(ob1.items))
 check("B 群表态箱只有 B 群的话", [i.text for i in ob2.items] == ["B群的话"], str(ob2.items))
-r = tools.execute("reply", '{"text":"乱引用","reply_to":"msg_999"}', ctx("gA", "u1", "甲", ob1))
+r = tools.execute("reply", '{"text":"乱引用","reply_to":"msg_999","recipient":"group","expression":"complete"}', ctx("gA", "u1", "甲", ob1))
 check("引用不存在的消息时降级为普通发言", ob1.items[-1].reply_to is None, str(ob1.items[-1]))
 r = tools.execute("skip", "{}", ChatContext(conv_id="gA", user_id="u1"))
 check("没有表态箱时 skip 不生效并说明原因", "没有可用的表态通道" in r, r)

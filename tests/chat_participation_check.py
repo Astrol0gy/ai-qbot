@@ -114,6 +114,18 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         sender, _ = await self.chat([audit.response('私聊正常直接回答')], group=False)
         self.assertEqual(sender.sent[0]['text'], '私聊正常直接回答')
 
+    async def test_non_thinking_tool_correction_can_resume_thinking(self):
+        sender, model = await self.chat([
+            audit.response('草稿不发送'),
+            audit.response(calls=[('reply', {'text':'错误对象', 'recipient':'others'})]),
+            audit.response(calls=[('reply', {'text':'正确对象', 'recipient':'bot'})])])
+        self.assertEqual(sender.sent[0]['text'], '正确对象')
+        self.assertEqual(len(model.requests), 3)
+        previous = [m for m in model.requests[2]['messages'] if getattr(m,'tool_calls',None)]
+        self.assertEqual(previous[0].reasoning_content, '')
+        self.assertEqual(model.requests[2]['extra_body']['thinking']['type'],
+                         'enabled' if dc.DEEPSEEK_ENABLE_THINKING else 'disabled')
+
     async def test_control_decision_finishes_without_an_extra_model_turn(self):
         for call in [('reply', {'text':'一句回复'}), ('skip', {'reason':'wait'}),
                      ('skip', {'reason':'irrelevant'})]:

@@ -73,6 +73,9 @@ BOT_CHAT_PERSONA = os.getenv(
 )
 CHAT_MAX_SEGMENTS = int(os.getenv("CHAT_MAX_SEGMENTS", "3"))
 CHAT_SEGMENT_INTERVAL_SEC = float(os.getenv("CHAT_SEGMENT_INTERVAL_SEC", "0.6"))
+CHAT_COLLECT_SEC = float(os.getenv("CHAT_COLLECT_SEC", "1.2"))
+CHAT_MAX_COLLECT_SEC = float(os.getenv("CHAT_MAX_COLLECT_SEC", "4"))
+CHAT_WAIT_TIMEOUT_SEC = float(os.getenv("CHAT_WAIT_TIMEOUT_SEC", "12"))
 
 # ============================================
 # 图片理解（DeepSeek 官方视觉接口）
@@ -218,6 +221,8 @@ def validate():
         raise ValueError("ADMIN_QQ 必须为空或有效的数字 QQ 号")
     bounds = {
         "CHAT_MAX_SEGMENTS": (1, 3), "CHAT_SEGMENT_INTERVAL_SEC": (0, 3),
+        "CHAT_COLLECT_SEC": (0, 10), "CHAT_MAX_COLLECT_SEC": (0.01, 30),
+        "CHAT_WAIT_TIMEOUT_SEC": (0.1, 120),
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
         "TOOL_CALL_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),

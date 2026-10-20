@@ -239,6 +239,7 @@ def reset_context(conv_id):
         invalidate(conv_id)
         deepseek_client._conversations.pop(conv_id, None)
         trigger.buffer.clear(conv_id)
+        trigger.clear_waiting(conv_id)
         trigger.leave_session(conv_id)
     lease = current()
     if lease:

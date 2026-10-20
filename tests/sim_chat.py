@@ -413,11 +413,11 @@ async def scene_5() -> Sim:
         context = ChatContext(conv_id=conv_id, user_id=user_id, user_name=user_name, outbox=outbox)
         FLIP["r1"] = execute_tool(
             "reply",
-            json.dumps({"text": "先回一条：在的", "reply_to": ids[0] if ids else ""}),
+            json.dumps({"text": "先回一条：在的", "reply_to": ids[0] if ids else "", "recipient":"group", "expression":"complete"}),
             context=context,
         )
         FLIP["r2"] = execute_tool(
-            "reply", json.dumps({"text": "第二条：刚翻了下记录"}), context=context
+            "reply", json.dumps({"text": "第二条：刚翻了下记录", "recipient":"group", "expression":"complete"}), context=context
         )
         FLIP["skip"] = execute_tool("skip", "{}", context=context)
         FLIP["items_after_skip"] = len(outbox.items)

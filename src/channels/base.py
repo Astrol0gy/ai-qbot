@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import time
 import uuid
+from typing import Callable
 
 from ..vision_utils import IMAGE_UNAVAILABLE, strip_tag_line
 
@@ -58,6 +59,9 @@ class IncomingMessage:
     wake_started_at: float = 0.0
     received_at: float = field(default_factory=time.monotonic)
     context_entries: tuple = ()
+    has_newer_input: Callable[[], bool] | None = None
+    wait_recheck: bool = False
+    waiting_token: object = None
 
     is_group: bool = True          # 群聊 / 私聊
     is_at_bot: bool = False        # 是否 @ 了机器人

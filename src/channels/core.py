@@ -265,6 +265,11 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         if media and msg.image_descs is None:
             wake_context += "\n" + media
         user_msg = WAKE_PROMPT.format(context=wake_context, focus=msg.message_id or "最新一条消息")
+        if msg.wait_recheck:
+            user_msg = ("本轮是等待补充截止后的一次复核，期间没有新的相关补充。"
+                        "只复核原等待用户这段表达，其他成员的新话题仍作背景，不借机换对象接话。"
+                        "仍未形成完整表达时保持安静；仅确有参与价值时回复，不为收尾强行追问。"
+                        "本次复核不会再次启动等待计时。\n" + user_msg)
         outbox = ReplyOutbox(known_ids={entry.message_id for entry in entries if entry.message_id})
     elif media:
         user_msg = f"{user_msg}\n图片描述：{media}"
@@ -277,6 +282,11 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     if not user_msg:
         if not msg.is_interjection:
             await _send_notice(sender, "你好呀～发送 /help 查看功能。")
+        return
+    if msg.ai_decides_reply and msg.has_newer_input and msg.has_newer_input():
+        trigger.mark_waiting(msg.conv_id, msg.user_id, msg.message_id)
+        outcome('superseded')
+        log_event('chat.superseded', stage='before_model')
         return
     if api_cooldown_left() > 0 or len(_ABANDONED) >= 16:
         outcome('model_unavailable')
@@ -341,6 +351,13 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
                         log_event('model.notice.failed', error_type=type(notice_error).__name__)
             reply = await asyncio.shield(thinking)
         lease.check()
+        if (msg.ai_decides_reply and not lease.business_tools_used
+                and msg.has_newer_input and msg.has_newer_input()):
+            trigger.mark_waiting(msg.conv_id, msg.user_id, msg.message_id)
+            lease.revoke()
+            outcome('superseded')
+            log_event('chat.superseded', stage='before_commit')
+            return
         # Durable state is committed before announcing success to the user.
         with runtime.use(lease):
             lease.commit()
@@ -372,7 +389,15 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             outcome('waiting' if waiting else 'skipped')
             log_event('chat.skipped', reason=outbox.skip_reason)
             if trigger:
+                if msg.wait_recheck:
+                    trigger.clear_waiting(msg.conv_id, msg.user_id)
+                    trigger.buffer.mark_reviewed(msg.conv_id, entries)
+                    log_event('chat.wait.expired', user_id=msg.user_id)
+                elif waiting:
+                    trigger.mark_waiting(msg.conv_id, msg.user_id, msg.message_id)
+                    log_event('chat.wait.started', user_id=msg.user_id)
                 if not waiting:
+                    trigger.clear_waiting(msg.conv_id, msg.user_id)
                     trigger.buffer.mark_reviewed(msg.conv_id, entries)
                     trigger.leave_session(msg.conv_id)
             return
@@ -403,6 +428,10 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             for index, (text, reply_to, source_target) in enumerate(items):
                 if natural_chat and index and CHAT_SEGMENT_INTERVAL_SEC:
                     await asyncio.sleep(CHAT_SEGMENT_INTERVAL_SEC)
+                if (msg.ai_decides_reply and not lease.business_tools_used
+                        and msg.has_newer_input and msg.has_newer_input()):
+                    log_event('chat.superseded', stage='before_delivery', sent_parts=len(receipts))
+                    break
                 budget[1] = lease.actors.get(source_target, (msg.user_id, msg.user_name))[1]
                 with stage('delivery', reply_to=reply_to):
                     receipt = await _deliver(sender, text, reply_to, budget)

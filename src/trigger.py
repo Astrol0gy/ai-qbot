@@ -35,6 +35,7 @@ from .config import (
     TRIGGER_MIN_LEN,
     TRIGGER_PROBABILITY,
     TRIGGER_RECOGNIZE_IMAGES,
+    CHAT_WAIT_TIMEOUT_SEC,
 )
 from .channels.base import IncomingMessage
 
@@ -179,6 +180,25 @@ class TriggerController:
         # 所以状态不需要额外的定时器任务去清理。
         self._active_until: dict[str, float] = {}
         self._session_users: dict[str, set[str]] = {}
+        self._waiting = {}
+
+    def mark_waiting(self, conv_id, user_id, focus_id):
+        now = time.monotonic()
+        self._waiting = {key: value for key, value in self._waiting.items() if value[0] > now}
+        if len(self._waiting) >= 1000:
+            self._waiting.pop(next(iter(self._waiting)))
+        state = (now + CHAT_WAIT_TIMEOUT_SEC, focus_id, object())
+        self._waiting[conv_id, user_id] = state
+        return state
+
+    def waiting_for(self, conv_id, user_id):
+        return self._waiting.get((conv_id, user_id))
+
+    def clear_waiting(self, conv_id, user_id=None):
+        if user_id is None:
+            self._waiting = {key:value for key,value in self._waiting.items() if key[0] != conv_id}
+        else:
+            self._waiting.pop((conv_id, user_id), None)
 
     # ------------------------------------------------------------------
     # 主判定入口
@@ -227,6 +247,10 @@ class TriggerController:
         if msg.addressed_to_others:
             entry.reviewed = True
             return TriggerResult(Decision.IGNORE, reason="对其他人说话")
+
+        waiting = self.waiting_for(msg.conv_id, msg.user_id)
+        if waiting:
+            return TriggerResult(Decision.WAKE, context=self.buffer.peek(msg.conv_id), reason="等待补充中")
 
         # 未被 @ 且过短：不值得单独把 AI 叫起来（仍留在缓冲里，等后面某条一起带出去）
         if not msg.is_at_bot and len(ctx_text) < TRIGGER_MIN_LEN:
@@ -289,6 +313,7 @@ class TriggerController:
 
         计时从「回复完成」开始算，所以 AI 慢慢想的这段时间不会白白吃掉窗口。
         """
+        self.clear_waiting(conv_id, user_id)
         self._enter_session(conv_id, user_id=user_id)
 
     def _enter_session(self, conv_id: str, now: float | None = None, user_id: str = '') -> None:

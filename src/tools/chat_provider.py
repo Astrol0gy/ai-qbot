@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 import re
 
 from . import ChatContext, ToolProvider
+from ..observability import log_event
 
 REPLY_TOOL = "reply"
 SKIP_TOOL = "skip"
@@ -121,8 +122,12 @@ class ChatProvider(ToolProvider):
                                 "留空就是普通发言"
                             ),
                         },
+                        "recipient": {"type": "string", "enum": ["bot", "group", "others", "unclear"],
+                                      "description": "先判断对话对象：明确向机器人、完整的群话题、其他人或不清楚。其他人或不清楚时应skip。"},
+                        "expression": {"type": "string", "enum": ["complete", "incomplete"],
+                                       "description": "用户本人的表达是否完整，不能用图片报错替用户补完半句话；未完整时应skip(wait)。"},
                     },
-                    "required": ["text"],
+                    "required": ["text", "recipient", "expression"],
                 },
                 "handler": self._reply,
                 "max_calls": MAX_CHAT_CALLS,
@@ -135,7 +140,7 @@ class ChatProvider(ToolProvider):
                 "description": (
                     "本轮不新增回复。reason=wait：截图、文字、表情包可能仍在补充，尚无清晰问题、请求或完整意思，"
                     "先保留上下文等待；reason=irrelevant：表达已完整，但无需参与。等待的内容不会标记为已略过。"
-                    "这不会启动定时器，也不保证下一条消息必然唤醒，后续是否唤醒由触发策略决定。"
+                    "OneBot普通群聊会进入等待状态，同一用户后续补充合并评估；安静超时后仅复核一次，不保证发言。"
                     "已有明确问题但指代不清时先结合近期图片和文字，必要时用 reply 澄清。已经用 reply 排好回复后不要再用它："
                     "回复已经进了发送队列，skip 不会撤销，想结束本轮停止调用工具即可。"
                 ),
@@ -158,13 +163,18 @@ class ChatProvider(ToolProvider):
         return outbox if isinstance(outbox, ReplyOutbox) else None
 
     @classmethod
-    def _reply(cls, context: ChatContext, text: str = "", reply_to: str = "") -> str:
+    def _reply(cls, context: ChatContext, text: str = "", reply_to: str = "",
+               recipient: str = "group", expression: str = "complete") -> str:
         outbox = cls._outbox_of(context)
         if outbox is None:
             return "本轮没有可用的表态通道（reply 只在群聊唤醒路径注入），本次调用没有生效。"
         if not str(text).strip():
             return "reply 缺少 text，没有记录任何内容。"
         content = str(text).strip()
+        log_event('chat.assessment', recipient=recipient, expression=expression, action='reply', reply_to=reply_to)
+        if recipient not in {'bot', 'group'} or expression != 'complete':
+            return ('没有记录回复：对象不明确或是其他人时用skip(irrelevant)，'
+                    '用户表达未完时用skip(wait)，不要先回答再补判断。')
         if context.extra.get('search_required') and not context.extra.get('search_attempted'):
             return ('尚未记录或发送这条回复：用户明确要求搜索，请先加载相关技能并调用web_search，'
                     '再提交简短结论；不能用已有知识冒充搜索结果。搜索失败后可如实说明。')
@@ -196,6 +206,7 @@ class ChatProvider(ToolProvider):
             return "本轮没有可用的表态通道（skip 只在群聊唤醒路径注入），本次调用没有生效。"
         if reason not in {"wait", "irrelevant"}:
             return "reason 只能是 wait（等待补充）或 irrelevant（选择不参与），本次调用没有生效。"
+        log_event('chat.assessment', action='skip', reason=reason)
         # skip = 本轮不开口，但它**不撤销**已经攒下的回复。
         # 模型常把 skip 当"这轮我说完了"用；撤销会让它撤了又重发（真机上出现过
         # reply×2 → skip → 又 reply×2：群里结果没错，却白烧一次调用、多拖十几秒，
@@ -207,7 +218,7 @@ class ChatProvider(ToolProvider):
             )
         outbox.skipped = True
         outbox.skip_reason = reason
-        return ("已记录：本轮等待补充，保留原上下文，不标记为已略过；未安排定时回复。"
+        return ("已记录：本轮等待补充，保留原上下文，不标记为已略过；由通道安排等待及单次超时复核，不自动发送回复。"
                 if reason == "wait" else "已记录：本轮不参与，旧消息保留为背景，后续补充仍可结合理解。")
 
 

@@ -22,6 +22,8 @@ import json
 import random
 import re
 import time
+import uuid
+from dataclasses import replace
 from collections import OrderedDict
 from pathlib import Path
 
@@ -41,6 +43,7 @@ from ..config import (
     ONEBOT_PROBE_SEC,
     ONEBOT_SELF_ID,
     ONEBOT_WS_URL,
+    CHAT_COLLECT_SEC, CHAT_MAX_COLLECT_SEC,
 )
 from ..trigger import Decision, trigger
 from ..vision_utils import describe_for_context
@@ -375,8 +378,9 @@ class OneBotClient:
         self._echo_seq = 0
         self._self_id = str(ONEBOT_SELF_ID or "")
         self._seen: OrderedDict[int, None] = OrderedDict()
-        self._queue = ConversationQueue()
+        self._queue = ConversationQueue(collect_sec=CHAT_COLLECT_SEC, max_collect_sec=CHAT_MAX_COLLECT_SEC)
         self._tasks = set()
+        self._wait_tasks = {}
         # 图片预识别用**独立**额度：一张图最坏要走「下载 + 两次请求」（直传失败再自取），
         # 跟整轮对话抢同一把闸门时，图片一慢，别的会话全在排队干等
         # （日志里实测：图片预识别密集时其他会话的回复明显延后）
@@ -702,15 +706,63 @@ class OneBotClient:
         log_event('message.received', **message_fields(incoming), text=text, at_bot=at_bot,
             image_count=len(incoming.image_urls), quote_id=reply_id, mention_user_ids=incoming.mention_user_ids)
         try:
-            await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch)
+            batch = self._prepare_batch if self._batchable(incoming) else None
+            await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch, batch_handler=batch)
         except asyncio.QueueFull as exc:
             print(f"[入站过载] {exc}")
             if incoming.is_direct_address:
                 await sender.send("当前排队消息较多，请稍后再试。")
 
+    @staticmethod
+    def _batchable(incoming):
+        return (incoming.is_group and not incoming.text.startswith('/')
+                and not trigger.is_dm_mode(incoming.conv_id))
+
+    def _has_newer_input(self, incoming):
+        for later, _ in self._queue.pending(incoming.conv_id):
+            if (later.user_id == incoming.user_id and self._batchable(later)
+                    and not later.wait_recheck and not later.addressed_to_others
+                    and (not later.raw.get('reply_id') or later.is_at_bot)):
+                return True
+        return False
+
+    async def _prepare_batch(self, items):
+        candidates = []
+        for incoming, sender in items:
+            result = await self._prepare(incoming, batching=True)
+            if result.decision is Decision.WAKE:
+                candidates.append((incoming, sender))
+        if not candidates:
+            return
+        # Keep every message in the shared buffer, including other participants.
+        # The last eligible wake provides focus, not authorship for the entire batch.
+        incoming, sender = candidates[-1]
+        incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
+        incoming.extra_ctx = trigger.buffer.peek(incoming.conv_id)
+        await self._dispatch(incoming, sender)
+
     @traced_message
     async def _prepare_and_dispatch(self, item):
         incoming, sender = item
+        if incoming.wait_recheck:
+            state = trigger.waiting_for(incoming.conv_id, incoming.user_id)
+            if state is not incoming.waiting_token:
+                return
+            incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
+            if not incoming.context_entries:
+                trigger.clear_waiting(incoming.conv_id, incoming.user_id)
+                return
+            try:
+                await self._dispatch(incoming, sender)
+            finally:
+                if trigger.waiting_for(incoming.conv_id, incoming.user_id) is state:
+                    trigger.clear_waiting(incoming.conv_id, incoming.user_id)
+            return
+        result = await self._prepare(incoming)
+        if result.decision is Decision.WAKE:
+            await self._dispatch(incoming, sender)
+
+    async def _prepare(self, incoming, batching=False):
         reply_id = incoming.raw.get("reply_id")
         if reply_id and not incoming.text.startswith("/"):
             quote, images = await self._quote_info(reply_id)
@@ -718,7 +770,8 @@ class OneBotClient:
             incoming.image_urls = (incoming.image_urls + images)[:ONEBOT_MAX_IMAGES]
             if quote and not incoming.text:
                 incoming.reply_ctx = quote.text
-        if trigger.needs_image_recognition(incoming):
+        if incoming.image_descs is None and (trigger.needs_image_recognition(incoming) or batching and incoming.is_at_bot
+                and incoming.image_urls and trigger._group_allowed(incoming.raw.get('group_id'))):
             with stage('media.preprocess', image_count=len(incoming.image_urls)):
                 async with self._img_sem:
                     try:
@@ -727,25 +780,55 @@ class OneBotClient:
                         from ..vision_utils import IMAGE_UNAVAILABLE
                         log_event('media.timeout', timeout_sec=30)
                         incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
-        elif incoming.is_group and not incoming.is_at_bot and incoming.image_urls:
+        elif incoming.image_descs is None and incoming.is_group and not incoming.is_at_bot and incoming.image_urls:
             from ..vision_utils import IMAGE_UNAVAILABLE
             incoming.image_descs = [IMAGE_UNAVAILABLE] * len(incoming.image_urls)
         result = trigger.decide(incoming)
-        log_event('trigger.decision', decision=result.decision.value, reason=result.reason,
+        log_event('trigger.decision', **message_fields(incoming), decision=result.decision.value, reason=result.reason,
             context_messages=len(trigger.buffer.snapshot(incoming.conv_id)))
         if result.decision is Decision.IGNORE:
             outcome('ignored')
-            return
+            return result
         if incoming.is_group and not trigger.is_dm_mode(incoming.conv_id) and not incoming.text.startswith("/"):
             incoming.ai_decides_reply = True
             incoming.is_interjection = not incoming.is_at_bot
             incoming.extra_ctx = result.context
             incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
         incoming.wake_started_at = time.monotonic()
-        await self._dispatch(incoming, sender)
+        return result
 
     async def _dispatch(self, incoming: IncomingMessage, sender: Sender) -> None:
+        incoming.has_newer_input = lambda: self._has_newer_input(incoming)
         await handle_message(incoming, sender)
+        state = trigger.waiting_for(incoming.conv_id, incoming.user_id)
+        key = (incoming.conv_id, incoming.user_id)
+        if state is None:
+            previous = self._wait_tasks.get(key)
+            if previous and previous is not asyncio.current_task() and not previous.done():
+                previous.cancel()
+        if state is not None and not incoming.wait_recheck:
+            previous = self._wait_tasks.get(key)
+            if previous and not previous.done():
+                previous.cancel()
+            task = asyncio.create_task(self._recheck_wait(incoming, sender, state))
+            self._wait_tasks[key] = task
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            task.add_done_callback(lambda done: self._wait_tasks.pop(key, None)
+                                   if self._wait_tasks.get(key) is done else None)
+
+    async def _recheck_wait(self, incoming, sender, state):
+        await asyncio.sleep(max(0, state[0] - time.monotonic()))
+        if trigger.waiting_for(incoming.conv_id, incoming.user_id) is not state:
+            return
+        retry = replace(incoming, wait_recheck=True, waiting_token=state,
+                        is_at_bot=False, is_interjection=True, context_entries=(),
+                        trace_id=uuid.uuid4().hex)
+        log_event('chat.wait.recheck', conversation_id=incoming.conv_id, user_id=incoming.user_id)
+        try:
+            await self._queue.submit(incoming.conv_id, (retry, sender), self._prepare_and_dispatch)
+        except asyncio.QueueFull:
+            trigger.clear_waiting(incoming.conv_id, incoming.user_id)
 
     async def close(self):
         await self._queue.close()

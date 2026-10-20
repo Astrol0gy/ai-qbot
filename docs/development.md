@@ -8,6 +8,8 @@
 
 自动判定仅是小样本场景预期，仍需审阅逐次模型输出；自主选表情包的频率是观察项，不要求每轮强制发图。
 
+`python tests/live_turn_timing_check.py --repeats 2` 使用同样的真实API，通过实际OneBot事件入口、收集队列、视觉预处理和发送前检查验证连续消息及思考中补充。仅QQ发送模拟；收集窗口使用实际配置，为缩短测试将等待超时临时设为2秒，不写入.env。报告记录消息到达、模型请求、工具判断与投递时序。
+
 ## 离线检查
 
 以下检查使用假模型、假平台 API 和临时数据；表情包和代理检查只启动本机测试服务，不调用付费服务。
@@ -17,6 +19,7 @@ python tests/review_regressions.py
 python tests/admin_check.py
 python tests/chat_behavior_check.py
 python tests/chat_participation_check.py
+python tests/turn_timing_check.py
 python tests/architecture_check.py
 python tests/net_proxy_check.py
 python tests/long_thinking_check.py

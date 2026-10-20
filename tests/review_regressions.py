@@ -32,7 +32,9 @@ from src.channels import official
 
 def response(text="", calls=()):
     msg = NS(content=text, tool_calls=[
-        NS(id=f"c{i}", function=NS(name=name, arguments=json.dumps(args, ensure_ascii=False)))
+        NS(id=f"c{i}", function=NS(name=name, arguments=json.dumps(
+            {"recipient":"group", "expression":"complete", **args} if name == 'reply' else args,
+            ensure_ascii=False)))
         for i, (name, args) in enumerate(calls)
     ], reasoning_content=None)
     return NS(choices=[NS(message=msg)])

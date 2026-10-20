@@ -27,7 +27,9 @@ PRODUCTION_CATALOG = tuple(skills._SKILLS)
 
 def answer(text="", calls=()):
     return NS(choices=[NS(message=NS(content=text, reasoning_content=None, tool_calls=[
-        NS(id=f"call{i}", function=NS(name=name, arguments=json.dumps(args, ensure_ascii=False)))
+        NS(id=f"call{i}", function=NS(name=name, arguments=json.dumps(
+            {"recipient":"group", "expression":"complete", **args} if name == 'reply' else args,
+            ensure_ascii=False)))
         for i, (name, args) in enumerate(calls)
     ]))])
 
