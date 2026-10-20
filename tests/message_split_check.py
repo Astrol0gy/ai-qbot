@@ -27,6 +27,7 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
             (onebot, "_sticker_base64", lambda path: (str(path), "base64://aW1hZ2U=")),
             (dc, "_conversations", defaultdict(list)),
             (dc, "_cooldown_until", 0),
+            (core, "CHAT_INTENT_ENABLE", False),
         ):
             mock = patch.object(target, name, value)
             mock.start()

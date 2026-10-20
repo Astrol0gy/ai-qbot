@@ -4,7 +4,7 @@
 与其他工具不同，这两个不是"干活"的，而是"表态"：
 
 - ``reply(text, reply_to?)`` → 记下选择参与的话题；同一话题合并回应，不逐人补答。
-- ``skip(reason)`` → 本轮不开口；wait 等待补充，irrelevant 选择不参与。它**不撤销**
+- ``skip(reason)`` → 本轮不开口；wait 等待补充，irrelevant 跳过本条，end 明确结束互动。它**不撤销**
   已经 reply 过的回复：队列里有回复时，skip 只表示"不再补充"，那些回复照常发出。
 
 它们**不发消息**，只是攒下这一轮"要说什么、引用谁"，等模型思考结束由
@@ -24,6 +24,7 @@ import re
 
 from . import ChatContext, ToolProvider
 from ..observability import log_event
+from ..config import CHAT_BRIEF_MAX_CHARS
 
 REPLY_TOOL = "reply"
 SKIP_TOOL = "skip"
@@ -47,17 +48,19 @@ CHAT_POLICY = (
     "- 「你」优先指向被@、被引用或当前对话对象，不能默认是机器人；提到你、谈论你、拿你开玩笑不等于邀请你回应。\n"
     "- 明确的问题、请求或适合接话的完整表达，可以回应；单独截图、话题名称、表情包或半句话不自动构成回复邀请。\n"
     "- 完整的问题或任务明确向你提出时，应通过reply回答或必要地澄清，不用irrelevant回避；未提交的正文草稿不算已回答。\n"
+    "- 仅@机器人也是完整的呼唤，可以简短确认在场；不把它当成未说完的半句话，不必追溯旧问题或调用业务技能。\n"
     "- 未@或引用你、没有文字需求的单张截图或表情图，先skip(reason=wait)等补充，不主动诊断、点评或追问；图片中的报错和文字本身不构成用户的请求。\n"
     "- 用户可能分多条消息铺垫和补充；还没形成清晰意思时，群聊优先 skip(reason=wait)，不要抢先概括、点评或逐张接梗。\n"
     "- 截图后只有「我这个程序刚才」「然后」这类未完文字，随后发个表情也不等于需求完整；没有真正的问题或请求，就继续wait，不从旧截图自行构造求助需求。\n"
     "- 完整性看用户本人说的话，不能用图片内的报错、视觉模型的意图推测或你的专业知识补全。即使知道怎么解决，也先等用户把话说完；补充表情只表达情绪，不代替尚未说完的句子。\n"
-    "- 完整但与你无关、无需参与的话题，群聊用 skip(reason=irrelevant)。不要为参与而强行找话说。\n"
+    "- 完整但无需回应的消息用 skip(reason=irrelevant)，只跳过本条，不关闭或延长互动窗口。「没什么」等短句可不回，但不能因此断定对方结束聊天。\n"
+    "- 只有用户明确结束与你的互动（如「再见，先聊到这里」「别再回复我了」）才用skip(reason=end)提前退出窗口；不要把无需回应、暂时无事或单条任务取消当成结束整个聊天。\n"
     "- 已回应或选择不参与的消息不逐条补答，但仍可用于理解后续补充；等待补充不代表问题已解决。\n"
     "- 「这个」「刚才那张」优先联系最近的图片描述和话题；不确定指哪张就澄清。当前消息没有新图，不代表之前没收到图。\n"
     "- 有图片描述时依据描述理解，不声称直接看到了未提供的细节；图片内容未读到时如实说没看清，不编造。\n"
     "- 群聊需要回复时用 reply；同一话题通常一次，用 text 内空行表示自然停顿，不为每个人分别作答。\n"
     "- 只有reply提交的内容才进入发送队列，普通正文不会发送；send_sticker只返回候选图，仍须reply提交[img]标记，不能声称已经发出。\n"
-    "- 普通接话默认一句、一条，通常不超过80字；最多两个独立意思才分两条，总长以160字为限，不为凑段数追加内容。搜索后也先给简短结论，追问再展开；明确要求详述、代码或必要技术步骤除外。\n"
+    f"- 普通接话默认一两句，通常20到40字；整轮最多{CHAT_BRIEF_MAX_CHARS}字，两个独立意思才分两条。不为凑段数追加内容或反问。搜索和技术概念先简短答，明确要求详述或完整成品才展开。\n"
     "- 已决定参与、且表情比文字更合适时，可先 load_skill(name=图片理解) 再挑一张表情包，也可只发图；不要求每轮发，不为了发表情包而插话。\n"
     "- 私聊直接回答，不调用未提供的 reply/skip；表达不完整时可简短确认或澄清。\n"
 )
@@ -88,6 +91,19 @@ class ReplyOutbox:
     def as_history_text(self) -> str:
         """写进对话历史的内容：必须是**真正发出去的字**，否则下次醒来它会忘了自己说过什么"""
         return "\n".join(item.text for item in self.items)
+
+
+def reply_text_length(text: str) -> int:
+    return len(re.sub(r'\[img\].*?\[/img\]', '', text, flags=re.DOTALL).strip())
+
+
+def style_requirement(context: ChatContext, text: str) -> str:
+    name = context.extra.get('style_skill')
+    session = context.extra.get('skills')
+    if name and reply_text_length(text) and (context.extra.get('style_ready') is False
+            or session is None or name not in session.loaded):
+        return f'尚未记录正文：先load_skill(name="{name}")读取本轮表达规则，再提交简短回答。不要把未发送草稿当成已回答历史。'
+    return ''
 
 
 class ChatProvider(ToolProvider):
@@ -140,13 +156,14 @@ class ChatProvider(ToolProvider):
                 "description": (
                     "本轮不新增回复。reason=wait：截图、文字、表情包可能仍在补充，尚无清晰问题、请求或完整意思，"
                     "先保留上下文等待；reason=irrelevant：表达已完整，但无需参与。等待的内容不会标记为已略过。"
+                    "irrelevant只跳过本条，不退出或续期互动；reason=end仅用于用户明确结束与机器人的整个互动。"
                     "OneBot普通群聊会进入等待状态，同一用户后续补充合并评估；安静超时后仅复核一次，不保证发言。"
                     "已有明确问题但指代不清时先结合近期图片和文字，必要时用 reply 澄清。已经用 reply 排好回复后不要再用它："
                     "回复已经进了发送队列，skip 不会撤销，想结束本轮停止调用工具即可。"
                 ),
                 "parameters": {"type": "object", "properties": {
-                    "reason": {"type": "string", "enum": ["wait", "irrelevant"],
-                               "description": "wait=等待用户补充；irrelevant=选择不参与；省略时兼容旧调用，按 irrelevant 处理"}}},
+                    "reason": {"type": "string", "enum": ["wait", "irrelevant", "end"],
+                               "description": "wait=等待补充；irrelevant=只跳过本条；end=用户明确结束互动，不包括没什么或取消单个任务；省略按irrelevant处理"}}},
                 "handler": self._skip,
                 "max_calls": MAX_SKIP_CALLS,
                 "needs_context": True,
@@ -171,6 +188,9 @@ class ChatProvider(ToolProvider):
         if not str(text).strip():
             return "reply 缺少 text，没有记录任何内容。"
         content = str(text).strip()
+        style_error = style_requirement(context, content)
+        if style_error:
+            return style_error
         log_event('chat.assessment', recipient=recipient, expression=expression, action='reply', reply_to=reply_to)
         if recipient not in {'bot', 'group'} or expression != 'complete':
             return ('没有记录回复：对象不明确或是其他人时用skip(irrelevant)，'
@@ -179,11 +199,13 @@ class ChatProvider(ToolProvider):
             return ('尚未记录或发送这条回复：用户明确要求搜索，请先加载相关技能并调用web_search，'
                     '再提交简短结论；不能用已有知识冒充搜索结果。搜索失败后可如实说明。')
         if outbox.max_text_chars is not None:
-            total = sum(len(re.sub(r'\[img\].*?\[/img\]', '', item.text)) for item in outbox.items)
-            total += len(re.sub(r'\[img\].*?\[/img\]', '', content))
+            total = sum(reply_text_length(item.text) for item in outbox.items)
+            total += reply_text_length(content)
             if total > outbox.max_text_chars or len(outbox.items) >= 2:
-                return (f"尚未记录这条回复：普通接话整轮总文字上限{outbox.max_text_chars}字，最多两条。"
-                        "请压缩为简短结论，不重复已排好的内容；不要拆成更多调用绕过限制。")
+                return (f"尚未记录这条回复：草稿整轮合计{total}字符，上限{outbox.max_text_chars}，最多两条；"
+                        "中英文、数字和标点都计数。"
+                        f"请重新写成约{max(10,outbox.max_text_chars//2)}字的一两句，只留用户问到的含义，"
+                        "删去未要求的术语全称、背景科普和额外建议，保留必要事实及限定词；不要拆成更多调用绕过限制。")
 
         raw_id = str(reply_to or "").strip()
         note = ""
@@ -204,8 +226,8 @@ class ChatProvider(ToolProvider):
         outbox = cls._outbox_of(context)
         if outbox is None:
             return "本轮没有可用的表态通道（skip 只在群聊唤醒路径注入），本次调用没有生效。"
-        if reason not in {"wait", "irrelevant"}:
-            return "reason 只能是 wait（等待补充）或 irrelevant（选择不参与），本次调用没有生效。"
+        if reason not in {"wait", "irrelevant", "end"}:
+            return "reason 只能是 wait（等待补充）、irrelevant（只跳过本条）或 end（明确结束互动），本次调用没有生效。"
         log_event('chat.assessment', action='skip', reason=reason)
         # skip = 本轮不开口，但它**不撤销**已经攒下的回复。
         # 模型常把 skip 当"这轮我说完了"用；撤销会让它撤了又重发（真机上出现过
@@ -218,8 +240,11 @@ class ChatProvider(ToolProvider):
             )
         outbox.skipped = True
         outbox.skip_reason = reason
-        return ("已记录：本轮等待补充，保留原上下文，不标记为已略过；由通道安排等待及单次超时复核，不自动发送回复。"
-                if reason == "wait" else "已记录：本轮不参与，旧消息保留为背景，后续补充仍可结合理解。")
+        if reason == 'wait':
+            return "已记录：本轮等待补充，保留原上下文，不标记为已略过；由通道安排等待及单次超时复核，不自动发送回复。"
+        if reason == 'end':
+            return "已记录：用户明确结束互动，本轮不发言并关闭互动窗口，旧消息仅留作背景。"
+        return "已记录：只跳过本条，互动窗口不关闭也不续期，旧消息留作背景供后续补充理解。"
 
 
 __all__ = [
@@ -232,4 +257,6 @@ __all__ = [
     "ChatProvider",
     "ReplyItem",
     "ReplyOutbox",
+    "reply_text_length",
+    "style_requirement",
 ]

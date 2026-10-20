@@ -290,6 +290,8 @@ async def main() -> int:
         outbox.items.append(ReplyItem(f"行吧 [img]{payload}[/img]", "42"))
         return ""
     core.chat = _fake_reply_chat
+    real_intent = core.CHAT_INTENT_ENABLE
+    core.CHAT_INTENT_ENABLE = False
     try:
         await core.handle_message(IncomingMessage(
             channel="onebot", conv_id="8888", user_id="9999", user_name="张三",
@@ -298,6 +300,7 @@ async def main() -> int:
         ), _Sender())
     finally:
         core.chat = real_chat
+        core.CHAT_INTENT_ENABLE = real_intent
     check("reply 工具路径同样能带表情包",
           routed[-1]["stickers"] and routed[-1]["text"] == "行吧", str(routed[-1]))
 

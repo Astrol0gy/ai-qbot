@@ -43,7 +43,7 @@ from ..config import (
     ONEBOT_PROBE_SEC,
     ONEBOT_SELF_ID,
     ONEBOT_WS_URL,
-    CHAT_COLLECT_SEC, CHAT_MAX_COLLECT_SEC,
+    CHAT_COLLECT_SEC, CHAT_MAX_COLLECT_SEC, CHAT_INTENT_ENABLE,
 )
 from ..trigger import Decision, trigger
 from ..vision_utils import describe_for_context
@@ -733,6 +733,20 @@ class OneBotClient:
             if result.decision is Decision.WAKE:
                 candidates.append((incoming, sender))
         if not candidates:
+            return
+        if CHAT_INTENT_ENABLE:
+            # Merge each author's burst, not different people's pending requests.
+            # Otherwise a later bystander's statement can erase an earlier @.
+            authors = {}
+            for candidate in candidates:
+                user = candidate[0].user_id
+                authors.pop(user, None)
+                authors[user] = candidate
+            for incoming, sender in authors.values():
+                incoming.context_entries = tuple(e for e in trigger.buffer.snapshot(incoming.conv_id)
+                                                 if e.user_id == incoming.user_id)
+                incoming.extra_ctx = trigger.buffer.peek(incoming.conv_id)
+                await self._dispatch(incoming, sender)
             return
         # Keep every message in the shared buffer, including other participants.
         # The last eligible wake provides focus, not authorship for the entire batch.

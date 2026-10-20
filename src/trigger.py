@@ -1,14 +1,14 @@
 """
 触发策略控制器（通道无关）。
 
-系统只回答一个问题：**收到这条消息，要不要把 AI 叫起来**；「开不开口、跟谁说话、
-说什么」一律交给 AI 自己用 reply / skip 工具决定。普通群聊有两个状态：
+默认将符合条件的普通群消息交给独立意图agent；它判断是否参与，主模型只负责回答。
+关闭 CHAT_INTENT_ENABLE 时使用以下兼容策略与主模型 reply/skip：
 
 - **空闲**：按概率决定要不要开一局（`TRIGGER_PROBABILITY`），@ 必定开局
 - **互动中**：原参与者或引用机器人的消息无需掷骰；其他成员仍按概率评估
 
-实际回复后重置 `TRIGGER_ACTIVE_TIMEOUT_SEC` 窗口；入站消息和 wait 不续期，
-irrelevant 结束窗口。截止时间到期后回到概率唤醒，不需要定时器任务。
+实际回复后重置 `TRIGGER_ACTIVE_TIMEOUT_SEC` 窗口；入站消息、wait 和 irrelevant 不续期，
+只有明确结束互动的 end 才提前关闭窗口。截止时间到期后回到概率唤醒。
 
 其余规则：
 - 私聊                          → 叫（不看概率，也不进互动窗口）
@@ -36,14 +36,16 @@ from .config import (
     TRIGGER_PROBABILITY,
     TRIGGER_RECOGNIZE_IMAGES,
     CHAT_WAIT_TIMEOUT_SEC,
+    CHAT_INTENT_ENABLE,
 )
 from .channels.base import IncomingMessage
+from .vision_utils import strip_tag_line
 
 
 class Decision(str, Enum):
     """触发结果"""
 
-    WAKE = "wake"      # 把 AI 叫起来；是否开口、怎么开口由 AI 用 reply/skip 决定
+    WAKE = "wake"      # 进入意图判断（兼容模式由主模型reply/skip决定）
     IGNORE = "ignore"  # 不进 AI，静默丢弃
 
 
@@ -69,6 +71,7 @@ class BufferEntry:
     mention_user_ids: tuple[str, ...] = ()
     quote_author_id: str = ""
     quote_is_bot: bool = False
+    media: str = ""  # Bounded full facts, separate from the short routing context.
 
     def line(self) -> str:
         marks = []
@@ -87,7 +90,11 @@ class BufferEntry:
         if self.user_id:
             marks.append(f"用户id={self.user_id}")
         suffix = f"  [{'，'.join(marks)}]" if marks else ""
-        return f"【{self.speaker or '某人'}】{self.text}{suffix}"
+        body = self.text or ('（仅@机器人，未附正文）' if self.at_bot else '')
+        return f"【{self.speaker or '某人'}】{body}{suffix}"
+
+    def answer_line(self) -> str:
+        return self.line() + (f'\n图片事实（消息id={self.message_id}）：{self.media}' if self.media else '')
 
 
 class MessageBuffer:
@@ -104,9 +111,10 @@ class MessageBuffer:
         self._max_per_conv = max_per_conv or TRIGGER_CONTEXT_MESSAGES
         self._max_convs = max_convs
         self._buf: OrderedDict[str, list[BufferEntry]] = OrderedDict()
+        self._recent: OrderedDict[str, list[BufferEntry]] = OrderedDict()
 
     def add(self, conv_id: str, entry: BufferEntry) -> None:
-        if not conv_id or not (entry.text or "").strip():
+        if not conv_id or (not (entry.text or "").strip() and not entry.at_bot):
             return
 
         entries = self._buf.get(conv_id)
@@ -118,6 +126,12 @@ class MessageBuffer:
 
         entry.ts = entry.ts or time.monotonic()
         entries.append(entry)
+        recent = self._recent.setdefault(conv_id, [])
+        self._recent.move_to_end(conv_id)
+        recent.append(entry)
+        del recent[:-self._max_per_conv]
+        while len(self._recent) > self._max_convs:
+            self._recent.popitem(last=False)
         if len(entries) > self._max_per_conv:
             del entries[: len(entries) - self._max_per_conv]
 
@@ -135,6 +149,10 @@ class MessageBuffer:
 
     def snapshot(self, conv_id):
         return tuple(self._buf.get(conv_id, ()))
+
+    def recent(self, conv_id):
+        """Includes consumed messages so replying does not erase recipient evidence."""
+        return tuple(self._recent.get(conv_id, ()))
 
     def consume(self, conv_id, entries):
         identities = {id(entry) for entry in entries}
@@ -159,6 +177,7 @@ class MessageBuffer:
         """
         if before is None:
             self._buf.pop(conv_id, None)
+            self._recent.pop(conv_id, None)
             return
 
         entries = self._buf.get(conv_id)
@@ -223,6 +242,7 @@ class TriggerController:
             mention_user_ids=msg.mention_user_ids,
             quote_author_id=msg.quote.author_id if msg.quote else '',
             quote_is_bot=bool(msg.quote and msg.quote.is_bot),
+            media='\n'.join(strip_tag_line(desc) for desc in (msg.image_descs or []) if desc)[:4000],
         )
 
         # 未被 @ 的指令：直接忽略，不执行、不唤醒、不入缓冲
@@ -247,6 +267,14 @@ class TriggerController:
         if msg.addressed_to_others:
             entry.reviewed = True
             return TriggerResult(Decision.IGNORE, reason="对其他人说话")
+
+        if CHAT_INTENT_ENABLE:
+            if not ctx_text and not msg.is_at_bot:
+                return TriggerResult(Decision.IGNORE, reason="无可分析内容")
+            if msg.is_at_bot:
+                self._enter_session(msg.conv_id, user_id=msg.user_id)
+            return TriggerResult(Decision.WAKE, context=self.buffer.peek(msg.conv_id),
+                                 reason="等待补充中" if self.waiting_for(msg.conv_id,msg.user_id) else "意图评估")
 
         waiting = self.waiting_for(msg.conv_id, msg.user_id)
         if waiting:

@@ -14,6 +14,7 @@ SKILLS_DIR = Path(__file__).parent
 LOAD_SKILL = "load_skill"
 READ_RESOURCE = "read_skill_resource"
 SKILL_TOOL_NAMES = frozenset({LOAD_SKILL, READ_RESOURCE})
+STYLE_SKILL_NAME = "lieflat-less-ai-tone"
 MAX_SKILL_BYTES = 128 * 1024
 MAX_RESOURCE_BYTES = 64 * 1024
 _SKILLS: list[dict] = []
@@ -83,16 +84,18 @@ def get_skill(name: str) -> dict | None:
     return next((s for s in _SKILLS if s["name"] == name), None)
 
 
-def get_metadata_section() -> str:
+def get_metadata_section(*, answer_only: bool = False) -> str:
     """Level 1：只暴露名称和简介，正文由模型按需请求。"""
     catalog = "\n".join(f"· {s['name']}：{s['description']}" for s in _SKILLS)
+    chat_rule = ("本轮参与判断已完成，只回答指定目标，最终正文由程序投递。" if answer_only else
+                 "不需要业务技能的日常聊天，群聊使用本轮提供的 reply/skip 决定参与；私聊可直接回答。")
     return (
         "\n\n【技能目录：仅名称与简介】\n" + catalog + "\n"
         "涉及某个技能的任务，先用 load_skill(name) 加载该技能，再按返回的正文执行。"
-        "不需要业务技能的日常聊天，群聊仍须使用本轮提供的 reply/skip 决定参与；私聊可直接回答。需要额外能力时继续加载对应技能，"
+        + chat_rule + "需要额外能力时继续加载对应技能，"
         "不能仅凭旧对话或目录简介假定技能已加载。\n"
         "业务工具只开放已加载技能声明且配置允许的范围；多个已加载技能取并集，"
-        "不是互相排斥的限制。load_skill/read_skill_resource 及适用的 reply/skip 是系统控制工具。\n"
+        "不是互相排斥的限制。load_skill/read_skill_resource 是系统加载工具。\n"
         "正文提到附加文件时，按需用 read_skill_resource(name, path) 读取；不要猜文件内容。\n"
     )
 

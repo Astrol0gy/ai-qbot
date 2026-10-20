@@ -89,6 +89,7 @@ def reset_vision() -> None:
 
 
 def main() -> int:
+    core.CHAT_INTENT_ENABLE = False  # This suite exercises the legacy stubbed chat path.
     print("=== 1. 客户端是「短超时 + 不重试」 ===")
     real = vu._get_client()
     check("读超时 = VISION_TIMEOUT_SEC", getattr(real, "timeout", None) is not None

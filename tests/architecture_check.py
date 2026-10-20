@@ -212,7 +212,7 @@ class ArchitectureCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dc._conversations["g"][-1]["content"], "答一")
 
     async def test_unknown_delivery_is_recorded_and_never_retried(self):
-        model = Model([response("【甲】" + "长" * 100)])
+        model = Model([response("【甲】" + "长" * 40)])
         calls = []
         async def api(action, params):
             calls.append(params)

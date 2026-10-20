@@ -170,6 +170,9 @@ class RoundLease:
         self.chat_segments_allowed = True
         self.brief_chat = False
         self.focus_text = None
+        self.reply_only = False
+        self.intent_decision = None
+        self.reply_to = None
         self.writes = {}
         self.after_commit = []
         self.history = None

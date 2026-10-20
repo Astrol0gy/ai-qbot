@@ -155,6 +155,29 @@ class TimingCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.requests), 1)
         self.assertEqual(self.sender.sent[0]['text'], '记忆已清除，让我们重新开始吧！')
 
+    async def test_bare_mention_then_skipped_ack_still_accepts_followup(self):
+        model = audit.Model([audit.response(calls=[('reply', {'text':'在的'})]),
+                             audit.response(calls=[('skip', {'reason':'irrelevant'})]),
+                             audit.response(calls=[('reply', {'text':'当然不会烦'})])])
+        with patch.object(dc,'client',model), patch.object(tr.random,'random',return_value=1), contextlib.redirect_stdout(io.StringIO()):
+            await self.submit(self.msg('1','',at=True))
+            deadline = self.trigger._active_until['g']
+            await self.submit(self.msg('2','没什么'))
+            self.assertEqual(self.trigger._active_until['g'],deadline)
+            await self.submit(self.msg('3','你会不会觉得我烦'))
+        self.assertEqual(len(model.requests),3)
+        self.assertIn('仅@机器人', str(model.requests[0]['messages']))
+        self.assertEqual([x['text'] for x in self.sender.sent],['在的','当然不会烦'])
+
+    async def test_explicit_end_returns_to_probability(self):
+        model = audit.Model([audit.response(calls=[('skip', {'reason':'end'})])])
+        with patch.object(dc,'client',model), patch.object(tr.random,'random',return_value=1), contextlib.redirect_stdout(io.StringIO()):
+            await self.submit(self.msg('1','再见，先聊到这里',at=True))
+            self.assertFalse(self.trigger.is_active('g'))
+            await self.submit(self.msg('2','稍后再说'))
+        self.assertEqual(len(model.requests),1)
+        self.assertEqual(self.sender.sent,[])
+
     def test_structured_reply_rejects_incomplete_or_other_recipient(self):
         box = ReplyOutbox()
         ctx = ChatContext(conv_id='g', outbox=box)

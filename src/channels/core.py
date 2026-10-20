@@ -9,7 +9,7 @@ import re
 import time
 
 from ..config import (DEEPSEEK_THINKING_NOTICE_SEC, TOOL_CALL_NOTICE_SEC, STICKER_MAX_PER_REPLY,
-                      CHAT_MAX_SEGMENTS, CHAT_SEGMENT_INTERVAL_SEC)
+                      CHAT_MAX_SEGMENTS, CHAT_SEGMENT_INTERVAL_SEC, CHAT_INTENT_ENABLE)
 from ..deepseek_client import (
     api_cooldown_left,
     chat,
@@ -54,7 +54,7 @@ WAKE_PROMPT = (
     "这一轮开不开口、跟谁说话、说什么，都由你自己决定：\n"
     "先判断用户自己的文字是否说完，再选择 reply 或 skip。被 @ 或处于互动中也不必抢答未完的表达。\n"
     "截图能看懂、情绪能理解，不代表用户已说完；文字仍是时间、条件、原因等铺垫从句时，必须skip(reason=wait)。"
-    "只有用户已经说出的完整问题、请求或完整陈述才能进入参与判断；禁止从截图补出用户未说出口的主句和求助请求。\n"
+    "只有用户已经说出的完整问题、请求、完整陈述或明确呼唤才能进入参与判断；禁止从截图补出用户未说出口的主句和求助请求。\n"
     "当前触发消息id：{focus}。优先理解这条新消息及当前话题，再选择值得参与的内容。\n"
     "上下文不是待办清单，不要求逐条回复或照顾每个人；旧内容可用于理解新补充，不自动逐条补答。\n"
     "尚在铺垫时 skip(reason=wait)，无需参与时 skip(reason=irrelevant)；有清晰问题则结合近期图文回答或澄清。\n"
@@ -317,10 +317,49 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
     lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
     if msg.message_id:
         lease.actors.setdefault(msg.message_id, (msg.user_id, msg.user_name))
+
+    async def run_turn():
+        if not (msg.ai_decides_reply and CHAT_INTENT_ENABLE):
+            return await chat(msg.conv_id, msg.user_id, user_msg, msg.user_name,
+                              outbox=outbox, history_text=wake_context or None)
+        from .. import chat_intent
+        recent = list(trigger.buffer.recent(msg.conv_id))
+        seen = {id(entry) for entry in recent}
+        recent.extend(entry for entry in entries if id(entry) not in seen)
+        recent, _ = chat_intent.normalize_entries(msg, recent)
+        pending_ids = {entry.message_id for entry in entries}
+        decision = await chat_intent.decide(msg, recent, pending_ids,
+            active=trigger.is_active(msg.conv_id), media=media)
+        lease.intent_decision = decision
+        if decision.action != 'REPLY':
+            outbox.skipped = True
+            outbox.skip_reason = {'WAIT': 'wait', 'IGNORE': 'irrelevant', 'END': 'end'}[decision.action]
+            return ''
+        # Do not start an answer (or a business tool) after the user has continued.
+        if msg.has_newer_input and msg.has_newer_input():
+            return ''
+        lease.reply_only = True
+        lease.reply_to = msg.message_id
+        selected_ids = set(decision.target_message_ids + decision.context_message_ids + decision.evidence_message_ids)
+        selected = [entry for entry in recent if entry.message_id in selected_ids]
+        outbox.known_ids.update(entry.message_id for entry in selected)
+        lease.actors.update({e.message_id: (e.user_id, e.speaker) for e in selected if e.user_id})
+        # Visual descriptions cannot turn casual chat into a technical/search request.
+        lease.focus_text = '\n'.join(re.sub(r'\[图片[^\]]*\]', '', e.text)
+            for e in selected if e.user_id == msg.user_id
+            and e.message_id in pending_ids and not e.reviewed)
+        raw_context = '\n'.join(e.answer_line() for e in selected)
+        answer_input = ('本轮只回应这些消息ID：' + ', '.join(decision.target_message_ids)
+            + '\n以下为目标和必要背景，已看过的内容只用于理解，不逐条补答：\n' + raw_context)
+        if media and msg.image_descs is None:
+            answer_input += '\n当前图片事实：' + media
+            raw_context += '\n' + media
+        return await chat(msg.conv_id, msg.user_id, answer_input, msg.user_name,
+                          outbox=outbox, history_text=raw_context)
+
     try:
         with runtime.use(lease):
-            thinking = asyncio.create_task(chat(msg.conv_id, msg.user_id, user_msg,
-                msg.user_name, outbox=outbox, history_text=wake_context or None))
+            thinking = asyncio.create_task(run_turn())
         with stage('model.wait'):
             notified = set()
             model_notified = False
@@ -399,14 +438,14 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
                 if not waiting:
                     trigger.clear_waiting(msg.conv_id, msg.user_id)
                     trigger.buffer.mark_reviewed(msg.conv_id, entries)
-                    trigger.leave_session(msg.conv_id)
+                    if outbox.skip_reason == 'end':
+                        trigger.leave_session(msg.conv_id)
             return
         items = [(item.text, item.reply_to) for item in outbox.items] if outbox is not None and outbox.has_items else [(reply, None)]
         if len(items) == 1 and items[0][0].strip().lower() in SKIP_TOKENS and msg.ai_decides_reply:
             outcome('skipped')
             if trigger:
                 trigger.buffer.mark_reviewed(msg.conv_id, entries)
-                trigger.leave_session(msg.conv_id)
             return
         selected = {target for _, target in items if target}
         if trigger and selected:

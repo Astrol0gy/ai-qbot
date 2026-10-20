@@ -67,6 +67,7 @@ class SkillLoadingTests(unittest.IsolatedAsyncioTestCase):
         self.set_value(skills, "_SKILLS", [])
         self.set_value(dc, "_conversations", defaultdict(list))
         self.set_value(dc, "DEEPSEEK_ENABLE_SEARCH", True)
+        self.set_value(dc, "CHAT_STYLE_SKILL_ENABLE", False)
         self.set_value(cs, "CAMPAIGNS_DIR", str(self.root / "data" / "campaigns"))
         self.set_value(up, "PROFILES_DIR", str(self.root / "data" / "profiles"))
         self.write_skill("weather", "天气查询", "web_search, fetch_url", "BODY_WEATHER：查询天气流程")

@@ -25,7 +25,7 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 os.environ['STICKER_DIR'] = str(REPORT_DIR / 'stickers')
 
 from PIL import Image, ImageDraw, ImageFont
-from src import config, deepseek_client as dc, runtime, stickers_utils, trigger as tr
+from src import config, deepseek_client as dc, runtime, stickers_utils, trigger as tr, chat_intent
 from src import user_profile, campaign_state, vision_utils as vu
 from src.channels import core, onebot
 from src.channels.base import IncomingMessage
@@ -34,6 +34,7 @@ from src.observability import redact
 CURRENT = None
 CALL_ORIGINAL = dc.client.chat.completions.create
 EXECUTE_ORIGINAL = dc.execute_tool
+INTENT_ORIGINAL = chat_intent.decide
 REPORT = {'model': config.DEEPSEEK_MODEL, 'vision_model': config.VISION_MODEL,
           'api_host': urlsplit(config.DEEPSEEK_BASE_URL).hostname,
           'thinking': config.DEEPSEEK_ENABLE_THINKING,
@@ -54,6 +55,7 @@ async def recording_model(**kwargs):
         raise
     msg = response.choices[0].message
     CURRENT['model_calls'].append({'at_sec': round(start - CURRENT['_start'], 2),
+        'phase': 'intent' if kwargs.get('response_format') else 'answer',
         'elapsed_sec': round(time.monotonic() - start, 2), 'text': msg.content,
         'thinking': kwargs.get('extra_body', {}).get('thinking', {}).get('type'),
         'tool_choice': kwargs.get('tool_choice'),
@@ -61,6 +63,18 @@ async def recording_model(**kwargs):
                   for t in (msg.tool_calls or [])],
         'usage': response.usage.model_dump() if response.usage else None})
     return response
+
+
+async def recording_intent(*args, **kwargs):
+    decision = await INTENT_ORIGINAL(*args, **kwargs)
+    CURRENT.setdefault('intent_decisions', []).append(decision.__dict__)
+    return decision
+
+
+def skip_reasons(case):
+    return ([{'WAIT':'wait','IGNORE':'irrelevant','END':'end'}[d['action']]
+             for d in case.get('intent_decisions', []) if d['action'] != 'REPLY']
+        + [t['arguments'].get('reason', 'irrelevant') for t in case['tool_calls'] if t['name'] == 'skip'])
 
 
 def recording_tool(name, arguments, ctx):
@@ -113,7 +127,7 @@ def recognize(path):
     return description
 
 
-async def run_case(name, entries, expected, *, repeat, history=None):
+async def run_case(name, entries, expected, *, repeat, history=None, group=True):
     global CURRENT
     entries = copy.deepcopy(entries)
     gid = f'live_intent_{repeat}_{name}'
@@ -132,24 +146,31 @@ async def run_case(name, entries, expected, *, repeat, history=None):
     # the hard trigger filter must not conceal semantic failures in this test.
     msg = IncomingMessage(channel='onebot', conv_id=gid, user_id=latest.user_id,
         user_name=latest.speaker, text=latest.text, message_id=latest.message_id,
-        image_descs=[], is_group=True, is_at_bot=latest.at_bot, ai_decides_reply=True,
+        image_descs=[], is_group=group, is_at_bot=latest.at_bot, ai_decides_reply=group,
         is_interjection=not latest.at_bot, context_entries=tuple(entries))
     try:
         with patch.object(tr, 'trigger', controller):
-            await asyncio.wait_for(core.handle_message(msg, onebot.OneBotSender(FakeQQ(), True, 1, 2)), 180)
+            await asyncio.wait_for(core.handle_message(msg, onebot.OneBotSender(FakeQQ(), group, 1, 2)), 180)
     except Exception as exc:
         CURRENT['error'] = redact(type(exc).__name__ + ': ' + str(exc)[:300])
     CURRENT['elapsed_sec'] = round(time.monotonic() - CURRENT.pop('_start'), 2)
     output = [s['data']['text'] for p in CURRENT['platform_payloads'] for s in p['segments'] if s['type'] == 'text']
     images = sum(s['type'] == 'image' for p in CURRENT['platform_payloads'] for s in p['segments'])
-    skips = [t['arguments'].get('reason', 'irrelevant') for t in CURRENT['tool_calls'] if t['name'] == 'skip']
+    skips = skip_reasons(CURRENT)
     CURRENT.update(output=output, images=images, skip_reasons=skips)
+    CURRENT['reply_committed'] = dc.get_history_length(gid) > len(history or []) // 2
     checks = {'silent': not output and not images, 'wait': not output and not images and 'wait' in skips,
-        'reply': bool(output or images), 'brief': bool(output) and len(output) <= 2 and sum(map(len, output)) <= 160,
+        'reply': bool(output or images), 'brief': bool(output) and len(output) <= 2 and sum(map(len, output)) <= config.CHAT_BRIEF_MAX_CHARS,
         'sticker': images == 1, 'reference': bool(output) and not any(x in ''.join(output) for x in ['没收到图','没看到图'])}
     CURRENT['passed'] = not CURRENT.get('error') and checks[expected]
+    if expected not in {'silent','wait'}:
+        CURRENT['passed'] = CURRENT['passed'] and CURRENT['reply_committed']
+    elif group:
+        CURRENT['passed'] = CURRENT['passed'] and bool(CURRENT.get('intent_decisions') or skips)
     if name == 'search_brief':
         CURRENT['passed'] = CURRENT['passed'] and any(t['name']=='web_search' for t in CURRENT['tool_calls'])
+    if name == 'natural_sticker_opportunity':
+        CURRENT['passed'] = CURRENT['passed'] and len(output)<=2 and sum(map(len,output))<=config.CHAT_BRIEF_MAX_CHARS
     flush()
     return CURRENT
 
@@ -186,7 +207,7 @@ async def main(repeats):
         ('natural_sticker_opportunity', [entry('1','我刚写完的文件忘保存就关了，整个人无语住了',at_bot=True)], 'reply'),
         ('search_brief', [entry('1','帮我搜一下 GitHub Actions 是做什么的，只要一句话结论',at_bot=True)], 'brief'),
     ]
-    with patch.object(dc.client.chat.completions, 'create', recording_model), patch.object(dc, 'execute_tool', recording_tool):
+    with patch.object(dc.client.chat.completions, 'create', recording_model), patch.object(dc, 'execute_tool', recording_tool), patch.object(chat_intent, 'decide', recording_intent):
         for repeat in range(1, repeats + 1):
             for name, entries, expected in cases:
                 with contextlib.redirect_stdout(raw_log):

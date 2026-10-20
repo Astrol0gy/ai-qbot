@@ -67,8 +67,8 @@ class IncomingMessage:
     is_at_bot: bool = False        # 是否 @ 了机器人
     mention_user_ids: tuple[str, ...] = ()  # 结构化 @ 对象，使用通道内规范化用户 id
     is_interjection: bool = False  # 非直呼的群聊唤醒（AI 自行决定开不开口）
-    # 普通群聊唤醒：把 reply / skip 工具交给 AI，由它决定这一轮是否开口
-    # （私聊、跑团模式不注入，保持原有行为）
+    # 普通群聊参与判断：默认独立意图agent，兼容模式由主模型reply/skip决定。
+    # 私聊、跑团模式保持原有行为。
     ai_decides_reply: bool = False
 
     # 平台原始事件，供通道自身调试；群聊消息须在其中放入 "group_id"（平台原生群号），

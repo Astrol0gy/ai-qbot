@@ -131,6 +131,7 @@ class _SlowProvider(tools.ToolProvider):
 tools._registry.register_provider(_SlowProvider())
 
 from src import deepseek_client  # noqa: E402
+deepseek_client.CHAT_STYLE_SKILL_ENABLE = False
 from src import skills  # noqa: E402
 
 # 渐进式加载：测试工具也必须先由技能声明并加载，不能越过生产权限链。

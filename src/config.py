@@ -76,6 +76,11 @@ CHAT_SEGMENT_INTERVAL_SEC = float(os.getenv("CHAT_SEGMENT_INTERVAL_SEC", "0.6"))
 CHAT_COLLECT_SEC = float(os.getenv("CHAT_COLLECT_SEC", "1.2"))
 CHAT_MAX_COLLECT_SEC = float(os.getenv("CHAT_MAX_COLLECT_SEC", "4"))
 CHAT_WAIT_TIMEOUT_SEC = float(os.getenv("CHAT_WAIT_TIMEOUT_SEC", "12"))
+CHAT_BRIEF_MAX_CHARS = int(os.getenv("CHAT_BRIEF_MAX_CHARS", "80"))
+CHAT_STYLE_SKILL_ENABLE = os.getenv("CHAT_STYLE_SKILL_ENABLE", "true").lower() == "true"
+CHAT_INTENT_ENABLE = os.getenv("CHAT_INTENT_ENABLE", "true").lower() == "true"
+CHAT_INTENT_MODEL = os.getenv("CHAT_INTENT_MODEL", "").strip() or DEEPSEEK_MODEL
+CHAT_INTENT_MAX_TOKENS = int(os.getenv("CHAT_INTENT_MAX_TOKENS", "4096"))
 
 # ============================================
 # 图片理解（DeepSeek 官方视觉接口）
@@ -189,10 +194,11 @@ ONEBOT_GROUP_BLACKLIST = _parse_id_set("ONEBOT_GROUP_BLACKLIST")
 # ============================================
 # 唤醒策略（OneBot 通道的普通群聊）
 # ============================================
-# 两个状态：
+# 默认独立意图agent判断，以下概率和最小长度仅用于CHAT_INTENT_ENABLE=false兼容模式。
+# 兼容模式的两个状态：
 #   空闲   → 系统按概率决定要不要开一局（@ 必定开局）
 #   互动中 → 原参与者和引用机器人的消息免掷骰，其他成员仍按概率判断
-# 仅实际回复成功后重新计时；wait 不续期，irrelevant 退出互动。
+# 仅实际回复成功后重新计时；wait/irrelevant 不续期，只有 end 提前退出互动。
 # TRIGGER_ACTIVE_TIMEOUT_SEC 秒窗口到期就退出互动，
 # 回到空闲的概率唤醒。（原 TRIGGER_COOLDOWN_SEC 已废弃：互动窗口替代了它。）
 # ============================================
@@ -223,6 +229,8 @@ def validate():
         "CHAT_MAX_SEGMENTS": (1, 3), "CHAT_SEGMENT_INTERVAL_SEC": (0, 3),
         "CHAT_COLLECT_SEC": (0, 10), "CHAT_MAX_COLLECT_SEC": (0.01, 30),
         "CHAT_WAIT_TIMEOUT_SEC": (0.1, 120),
+        "CHAT_BRIEF_MAX_CHARS": (20, 2000),
+        "CHAT_INTENT_MAX_TOKENS": (256, 16384),
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
         "TOOL_CALL_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),
@@ -243,7 +251,7 @@ def validate():
         value = globals()[name]
         if not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f"{name} 必须在 {low}..{high} 范围内，收到 {value!r}")
-    for name in ("OFFICIAL_ENABLE", "ONEBOT_ENABLE", "OFFICIAL_DEBUG_RAW_EVENTS", "DEEPSEEK_ENABLE_THINKING", "DEEPSEEK_ENABLE_SEARCH", "VISION_ENABLE_THINKING", "STICKER_ENABLE", "TRIGGER_RECOGNIZE_IMAGES"):
+    for name in ("OFFICIAL_ENABLE", "ONEBOT_ENABLE", "OFFICIAL_DEBUG_RAW_EVENTS", "DEEPSEEK_ENABLE_THINKING", "DEEPSEEK_ENABLE_SEARCH", "VISION_ENABLE_THINKING", "STICKER_ENABLE", "TRIGGER_RECOGNIZE_IMAGES", "CHAT_INTENT_ENABLE", "CHAT_STYLE_SKILL_ENABLE"):
         if os.getenv(name, "true").lower() not in ("true", "false"):
             raise ValueError(f"{name} 只能填写 true 或 false")
     if VISION_FILES_API not in ("auto", "always", "off"):

@@ -79,17 +79,41 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
             result = self.trigger.decide(IncomingMessage(conv_id='g', user_id='a', text='接着说'))
         self.assertEqual(result.reason, '概率未命中')
 
-    async def test_skip_irrelevant_leaves_and_wait_preserves_fixed_deadline(self):
-        for reason in ('wait', 'irrelevant'):
+    async def test_only_explicit_end_closes_fixed_activity_window(self):
+        for reason in ('wait', 'irrelevant', 'end'):
             self.trigger.mark_answered('g', 'a')
             deadline = self.trigger._active_until['g']
             sender, _ = await self.chat([audit.response(calls=[('skip', {'reason':reason})]), audit.response()])
             self.assertEqual(sender.sent, [])
-            if reason == 'wait':
+            if reason != 'end':
                 self.assertEqual(self.trigger._active_until['g'], deadline)
+                with patch.object(tr.random, 'random', return_value=1):
+                    self.assertEqual(self.trigger.decide(IncomingMessage(conv_id='g', user_id='a', text='接着说')).decision,
+                                     tr.Decision.WAKE)
             else:
                 self.assertFalse(self.trigger.is_active('g'))
                 self.assertNotIn('g', self.trigger._session_users)
+
+    def test_bare_mention_keeps_actor_message_id_and_invitation(self):
+        result = self.trigger.decide(IncomingMessage(conv_id='g',user_id='a',user_name='甲',
+                                    message_id='bare',is_at_bot=True))
+        self.assertEqual(result.decision, tr.Decision.WAKE)
+        self.assertIn('仅@机器人', result.context)
+        self.assertIn('@了你', result.context)
+        self.assertEqual(self.trigger.buffer.ids('g'), {'bare'})
+        self.assertEqual(self.trigger.buffer.snapshot('g')[0].user_id, 'a')
+
+    async def test_irrelevant_does_not_extend_deadline_or_wake_other_users(self):
+        self.trigger.mark_answered('g', 'a')
+        deadline = self.trigger._active_until['g']
+        await self.chat([audit.response(calls=[('skip', {'reason':'irrelevant'})])])
+        self.assertEqual(self.trigger._active_until['g'], deadline)
+        with patch.object(tr.random, 'random', return_value=1):
+            other = self.trigger.decide(IncomingMessage(conv_id='g',user_id='b',text='另一个话题'))
+            self.assertEqual(other.reason, '概率未命中')
+            self.trigger._active_until['g'] = time.monotonic() - 1
+            expired = self.trigger.decide(IncomingMessage(conv_id='g',user_id='a',text='过期后的消息'))
+            self.assertEqual(expired.reason, '概率未命中')
 
     async def test_direct_prose_requires_decision_and_never_leaks(self):
         sender, model = await self.chat([audit.response('不应发出的抢话'),
@@ -183,8 +207,8 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
 
     async def test_total_budget_cannot_be_bypassed_by_multiple_calls(self):
         sender, _ = await self.chat([audit.response(calls=[
-            ('reply',{'text':'甲'*100}), ('reply',{'text':'乙'*100})]), audit.response()])
-        self.assertEqual([x['text'] for x in sender.sent], ['甲'*100])
+            ('reply',{'text':'甲'*60}), ('reply',{'text':'乙'*60})]), audit.response()])
+        self.assertEqual([x['text'] for x in sender.sent], ['甲'*60])
 
     async def test_detailed_task_can_exceed_casual_budget(self):
         text = '说明'*120

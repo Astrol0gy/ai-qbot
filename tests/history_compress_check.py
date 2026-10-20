@@ -26,6 +26,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 import src.deepseek_client as dc  # noqa: E402
+dc.CHAT_STYLE_SKILL_ENABLE = False  # History-only fake responses do not load style skills.
 
 # chat 会读取画像和跑团状态；离线检查只使用临时目录。
 _data = tempfile.TemporaryDirectory(prefix="qbot_history_check_")

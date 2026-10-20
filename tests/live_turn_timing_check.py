@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 import live_chat_intent_check as h
 
+CASES = ('burst_image_question','wait_then_followup','wait_timeout_once','wait_with_other_topic',
+         'inflight_followup','other_recipient_inflight','bare_mention','greeting_followups','explicit_end','multi_author_batch')
+
 
 def image(path):
     return 'data:image/png;base64,' + base64.b64encode(path.read_bytes()).decode('ascii')
@@ -31,7 +34,7 @@ async def run_case(name, repeat, screenshot, meme):
     bot = h.onebot.OneBotClient()
     bot.call_api_ex = h.FakeQQ().call_api_ex
     started = asyncio.Event()
-    gid = 800000000 + repeat
+    gid = 800000000 + repeat * 100 + CASES.index(name)
     conv = f'onebot_group_{gid}'
     case = {'name':name, 'repeat':repeat, 'model_calls':[], 'tool_calls':[],
             'platform_payloads':[], 'arrivals':[], '_start':time.monotonic()}
@@ -58,6 +61,7 @@ async def run_case(name, repeat, screenshot, meme):
 
     async def model(**kwargs):
         case.setdefault('requests', []).append({'at_sec':round(time.monotonic()-case['_start'],2),
+            'phase':'intent' if kwargs.get('response_format') else 'answer',
             'user_context':[m['content'] for m in kwargs['messages'] if isinstance(m,dict) and m.get('role')=='user']})
         started.set()
         return await h.recording_model(**kwargs)
@@ -68,6 +72,7 @@ async def run_case(name, repeat, screenshot, meme):
              patch.object(h.tr,'CHAT_WAIT_TIMEOUT_SEC',2), \
              patch.object(h.dc.client.chat.completions,'create',model), \
              patch.object(h.dc,'execute_tool',h.recording_tool), \
+             patch.object(h.chat_intent,'decide',h.recording_intent), \
              patch.object(h.tr.random,'random',return_value=1):
             if name == 'burst_image_question':
                 tasks.append(asyncio.create_task(send(at=True,picture=screenshot)))
@@ -99,6 +104,32 @@ async def run_case(name, repeat, screenshot, meme):
                 tasks.append(asyncio.create_task(send('请只回复「给甲的答复」',at=True)))
                 await started.wait()
                 await send('小丙，明天九点见',user=2,other=3)
+            elif name == 'multi_author_batch':
+                tasks.append(asyncio.create_task(send('请只回复「给甲的答复」',at=True)))
+                await asyncio.sleep(.1)
+                tasks.append(asyncio.create_task(send('请只回复「给乙的答复」',at=True,user=2)))
+            elif name == 'bare_mention':
+                await send(at=True)
+                case['bare_mention_context_kept'] = any('仅@机器人' in str(r['user_context']) for r in case.get('requests',[]))
+            elif name == 'greeting_followups':
+                await send(at=True)
+                case['phases'] = []
+                for text in ('你咋不理我','没什么','就是想看看你在不在','你会不会觉得我烦'):
+                    before = len(case['platform_payloads'])
+                    tool_before = len(case['tool_calls'])
+                    await send(text)
+                    phase = {'input':text, 'new_payloads':len(case['platform_payloads'])-before,
+                             'active':controller.is_active(conv),
+                             'decisions':[t['arguments'] for t in case['tool_calls'][tool_before:] if t['name']=='skip']}
+                    case['phases'].append(phase)
+                case['late_questions_evaluated'] = all(any(text in str(r['user_context']) for r in case.get('requests',[]))
+                    for text in ('就是想看看你在不在','你会不会觉得我烦'))
+            elif name == 'explicit_end':
+                await send('再见，先聊到这里，之后不用回复了',at=True)
+                case['session_closed'] = not controller.is_active(conv)
+                before = len(case['platform_payloads'])
+                await send('稍后再说')
+                case['no_further_delivery'] = len(case['platform_payloads']) == before
             await asyncio.gather(*tasks)
             # Allow canceled wait timers to finish; successful replies clear their tokens.
             await asyncio.sleep(.05)
@@ -111,24 +142,33 @@ async def run_case(name, repeat, screenshot, meme):
                 task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
     output = [s['data']['text'] for p in case['platform_payloads'] for s in p['segments'] if s['type']=='text']
-    skips = [t['arguments'].get('reason','irrelevant') for t in case['tool_calls'] if t['name']=='skip']
+    skips = h.skip_reasons(case)
     case.update(output=output, skip_reasons=skips,
         elapsed_sec=round(time.monotonic()-case.pop('_start'),2))
     answer = ''.join(output)
+    if name == 'burst_image_question':
+        case['image_facts_forwarded'] = any('10061' in str(r['user_context'])
+            for r in case.get('requests',[]) if r['phase']=='answer')
     checks = {
-        'burst_image_question': bool(output) and '3001' in answer and len(output)<=2,
+        'burst_image_question': bool(output) and '3001' in answer and len(output)<=2 and case.get('image_facts_forwarded'),
         'wait_then_followup': case.get('waiting_observed') and not case.get('payloads_before_followup') and bool(output) and 'wait' in skips,
         'wait_timeout_once': case.get('waiting_observed') and not output and len(case['requests'])>=2 and len(case['requests'])<=4,
         'wait_with_other_topic': case.get('waiting_observed') and not output and 'wait' in skips,
         'inflight_followup': bool(output) and '收到补充' in answer and '10061' not in answer,
         'other_recipient_inflight': answer.strip('。！ ')=='给甲的答复',
+        'multi_author_batch': len(output)==2 and output[0].strip('。！ ')=='给甲的答复'
+            and output[1].strip('。！ ')=='给乙的答复',
+        'bare_mention': case.get('bare_mention_context_kept') and bool(output) and not skips,
+        'greeting_followups': case.get('late_questions_evaluated') and bool(case.get('phases'))
+            and case['phases'][1]['active'] and case['phases'][-1]['new_payloads']>0,
+        'explicit_end': case.get('session_closed') and case.get('no_further_delivery') and 'end' in skips,
     }
     case['passed'] = not case.get('error') and bool(checks[name])
     h.flush()
     return case
 
 
-async def main(repeats):
+async def main(repeats, names=None):
     h.user_profile.PROFILES_DIR = str(h.REPORT_DIR/'profiles')
     h.campaign_state.CAMPAIGNS_DIR = str(h.REPORT_DIR/'campaigns')
     h.fixture_images()
@@ -139,8 +179,7 @@ async def main(repeats):
     screenshot, meme = image(h.REPORT_DIR/'screenshot.png'), image(h.REPORT_DIR/'meme.png')
     with (h.REPORT_DIR/'runtime.log').open('w',encoding='utf-8') as log:
         for repeat in range(1,repeats+1):
-            for name in ('burst_image_question','wait_then_followup','wait_timeout_once','wait_with_other_topic',
-                         'inflight_followup','other_recipient_inflight'):
+            for name in names or CASES:
                 with contextlib.redirect_stdout(log):
                     result = await asyncio.wait_for(run_case(name,repeat,screenshot,meme),180)
                 print(json.dumps({k:result.get(k) for k in ('name','repeat','passed','output','skip_reasons','elapsed_sec','error')},ensure_ascii=False),flush=True)
@@ -154,4 +193,6 @@ async def main(repeats):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--repeats',type=int,default=2)
-    asyncio.run(main(parser.parse_args().repeats))
+    parser.add_argument('--case',action='append',choices=CASES)
+    args = parser.parse_args()
+    asyncio.run(main(args.repeats,args.case))
