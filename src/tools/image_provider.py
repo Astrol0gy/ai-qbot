@@ -10,7 +10,7 @@ core 解析 ``[img]`` 时用 ``stickers_utils.resolve`` 认出这是库里的文
 """
 from __future__ import annotations
 
-from .. import stickers_utils
+from .. import sticker_rag, stickers_utils
 from ..config import STICKER_ENABLE
 from ..vision_utils import describe_image, text_to_image
 
@@ -121,7 +121,7 @@ class ImageProvider(ToolProvider):
                 "tag": "表情检索",
                 "description": (
                     "看本地表情包库里有什么：现有多少张、常用情绪标签有哪些。"
-                    "想发表情包之前先看这里，拿返回的标签词去调 send_sticker 命中率最高。"
+                    "send_sticker 已支持语义检索，通常不需要先调用；只有想了解库规模或标签风格时再看。"
                     "库是空的就别调了（群里有人发梗图会自动攒进去）。"
                 ),
                 "parameters": {"type": "object", "properties": {}},
@@ -132,11 +132,11 @@ class ImageProvider(ToolProvider):
                 "name": "send_sticker",
                 "tag": "表情选择",
                 "description": (
-                    "从本地表情包库里挑一张，单独发成一条消息 —— 用图片表达情绪"
-                    "（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"
-                    "挑中后会返回一行 [img]库里的文件路径[/img]：把它**原样**放进你的回复里，"
-                    "图片就会随这条消息一起发出，也可以只发图、不配文字。"
-                    "挑不到贴切的就不给路径，这时用文字说就行，别反复换关键词硬凑。"
+                    "用语义检索从本地表情包库挑图，返回按相似度排序的 top3 候选。"
+                    "用图片表达情绪或玩笑（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"
+                    "每条候选都带 rank、标签和一行 [img]库里的文件路径[/img]；"
+                    "挑最贴合的一条，把它**原样**放进回复里，也可以只发图、不配文字。"
+                    "不要一次把三条都放进回复；都不贴合就只用文字，别反复换关键词硬凑。"
                     "正经问答题（别人在问报错、要代码、查数据）和对方情绪明显认真时不要用；"
                     "一轮最多发一张，别刷屏。"
                 ),
@@ -147,7 +147,7 @@ class ImageProvider(ToolProvider):
                             "type": "string",
                             "description": (
                                 "想表达的情绪或场景，如 无语、震惊、点赞、求安慰；"
-                                "用 list_stickers 返回的标签词最准"
+                                "描述得越具体，语义检索越准"
                             ),
                         },
                     },
@@ -238,9 +238,34 @@ class ImageProvider(ToolProvider):
         return summary + "想发的时候调 send_sticker，query 用上面这些标签词最准。"
 
     @staticmethod
+    def _format_candidates(candidates) -> str:
+        lines = [
+            "按语义相似度选出的候选（挑最贴合的一条，把它的 [img]…[/img] 原样放进回复）："
+        ]
+        for candidate in candidates:
+            lines.append(f"{candidate.rank}. [img]{candidate.path}[/img]")
+            tags = "、".join(candidate.tags) or "无"
+            lines.append(f"   标签：{tags} ｜ 相似度：{candidate.score:.2f}")
+        lines.append("都不贴合就只用文字，不要为了发表情包硬选；一轮最多发一张。")
+        return "\n".join(lines)
+
+    @staticmethod
     def _send_sticker(query: str) -> str:
         if not STICKER_ENABLE:
             return "表情包功能当前是关闭的，别再用这个工具了。"
+        try:
+            candidates = sticker_rag.search(query, top_k=3)
+        except sticker_rag.RagUnavailable:
+            candidates = []
+        except Exception as exc:
+            print(f"[表情包] 语义检索异常，回退标签匹配：{type(exc).__name__}: {exc}")
+            candidates = []
+        if candidates:
+            print(f"[表情包] 语义检索「{query}」 -> "
+                  f"{', '.join(f'{c.rank}.{c.name}({c.score:.2f})' for c in candidates)}")
+            return ImageProvider._format_candidates(candidates)
+
+        # 模型未加载、索引未就绪或没有过阈值的结果：回退到原有标签匹配。
         picked = stickers_utils.pick(query)
         if picked is None:
             # 宁可这一轮不发，也不糊一张不相关的图上去；同时掐死"换个词再试一次"的循环
@@ -248,7 +273,7 @@ class ImageProvider(ToolProvider):
                 f"库里没有和「{query}」贴切的表情包，这张就不发了。"
                 "用文字说就行，别为了发表情包反复换关键词硬凑。"
             )
-        print(f"[表情包] 挑中 {picked.name}（{query}）")
+        print(f"[表情包] 标签匹配命中 {picked.name}（{query}）")
         return (
             f"[img]{picked.path}[/img]\n"
             f"挑中「{'、'.join(picked.tags)}」（{picked.name}）。"

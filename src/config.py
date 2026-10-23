@@ -121,6 +121,12 @@ STICKER_MAX_FILES = int(os.getenv("STICKER_MAX_FILES", "500"))
 STICKER_MAX_BYTES = int(os.getenv("STICKER_MAX_BYTES", str(5 * 1024 * 1024)))
 # 一轮回复里最多发几张表情包（防止刷屏）
 STICKER_MAX_PER_REPLY = int(os.getenv("STICKER_MAX_PER_REPLY", "1"))
+# CLIP 语义检索：用 Chinese-CLIP ONNX 给图片与标签做 embedding，按余弦相似度返回 top3。
+# 模型目录留空 = <项目根>/data/models/chinese-clip-vit-base-patch16
+STICKER_RAG_ENABLE = os.getenv("STICKER_RAG_ENABLE", "true").lower() == "true"
+STICKER_RAG_MODEL_DIR = os.getenv("STICKER_RAG_MODEL_DIR", "").strip()
+STICKER_RAG_MIN_SCORE = float(os.getenv("STICKER_RAG_MIN_SCORE", "0.15"))
+STICKER_RAG_TOP_K = int(os.getenv("STICKER_RAG_TOP_K", "3"))
 
 # ============================================
 # 文生图（Qwen-Image，DashScope 原生接口）
@@ -237,6 +243,7 @@ def validate():
         "DEEPSEEK_API_COOLDOWN_SEC": (0, 3600), "VISION_TIMEOUT_SEC": (0.01, 120),
         "VISION_FAIL_BACKOFF_SEC": (0, 86400), "STICKER_MAX_FILES": (1, 100000),
         "STICKER_MAX_BYTES": (1, 64 * 1024 * 1024), "STICKER_MAX_PER_REPLY": (0, 10),
+        "STICKER_RAG_MIN_SCORE": (-1, 1), "STICKER_RAG_TOP_K": (1, 10),
         "AMAP_TIMEOUT_SEC": (0.01, 60), "AMAP_POI_LIMIT": (1, 25),
         "ONEBOT_API_TIMEOUT": (0.01, 120), "ONEBOT_MAX_CONCURRENCY": (1, 32),
         "ONEBOT_IMAGE_CONCURRENCY": (1, 8), "ONEBOT_HEARTBEAT": (1, 600),
@@ -251,7 +258,7 @@ def validate():
         value = globals()[name]
         if not math.isfinite(value) or not low <= value <= high:
             raise ValueError(f"{name} 必须在 {low}..{high} 范围内，收到 {value!r}")
-    for name in ("OFFICIAL_ENABLE", "ONEBOT_ENABLE", "OFFICIAL_DEBUG_RAW_EVENTS", "DEEPSEEK_ENABLE_THINKING", "DEEPSEEK_ENABLE_SEARCH", "VISION_ENABLE_THINKING", "STICKER_ENABLE", "TRIGGER_RECOGNIZE_IMAGES", "CHAT_INTENT_ENABLE", "CHAT_STYLE_SKILL_ENABLE"):
+    for name in ("OFFICIAL_ENABLE", "ONEBOT_ENABLE", "OFFICIAL_DEBUG_RAW_EVENTS", "DEEPSEEK_ENABLE_THINKING", "DEEPSEEK_ENABLE_SEARCH", "VISION_ENABLE_THINKING", "STICKER_ENABLE", "STICKER_RAG_ENABLE", "TRIGGER_RECOGNIZE_IMAGES", "CHAT_INTENT_ENABLE", "CHAT_STYLE_SKILL_ENABLE"):
         if os.getenv(name, "true").lower() not in ("true", "false"):
             raise ValueError(f"{name} 只能填写 true 或 false")
     if VISION_FILES_API not in ("auto", "always", "off"):

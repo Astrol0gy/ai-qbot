@@ -8,3 +8,8 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 anthropic>=0.40.0
+# 表情包 CLIP 语义检索（ONNX CPU，不依赖 torch）
+onnxruntime>=1.20.0
+numpy>=1.26.0
+Pillow>=10.0.0
+tokenizers>=0.20.0

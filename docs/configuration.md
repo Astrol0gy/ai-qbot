@@ -138,6 +138,10 @@ OneBot先等安静`CHAT_COLLECT_SEC`秒（默认1.2秒），持续输入最多�
 
 OneBot 发送时会校验库内文件并读取为 `base64://` 图片，文字与每张表情包分别发送；NapCat 使用 Docker 时无需挂载表情包目录。仅发表情包遇到文件不可读、超限或明确的文件预处理错误时，尝试一次文字兜底，仍失败则结束；真正的发送超时不会重试或补发文字，以免重复。无需额外配置。
 
+**语义检索**：`send_sticker` 默认用 Chinese-CLIP 量化 ONNX 对图片和 `index.json` 里的名称/标签做 embedding，按余弦相似度返回 top3，由模型挑最贴合的一条。每个表情包同时保留图片向量和文字向量，分数为 `0.7 * 图片相似度 + 0.3 * 标签相似度`；query 命中标签时再给一个小加分（完全相等 +0.12，两个字以上互相包含 +0.06），避免「卖萌」「无语」这类明确标签被图片向量挤掉。向量缓存在 `data/stickers/embeddings.json`；新表情包入库时只补这一张，不重建全库（图片 hash 或标签变化时也只重算对应部分）。模型未加载、索引未就绪、推理失败或没有过阈值的结果时自动回退到原有标签匹配，不影响聊天。
+
+模型文件不提交到 git，部署时运行 `bash scripts/download_sticker_model.sh` 下载（约 190MB），并在项目根执行 `python -m src.sticker_rag --build` 预建索引。运行时依赖 `onnxruntime/numpy/Pillow/tokenizers`，不需要 torch。
+
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `STICKER_ENABLE` | 总开关：关掉后既不采集也不发（两个工具都会说自己关着，回复里的库内路径也不再认） | `true` |
@@ -145,6 +149,10 @@ OneBot 发送时会校验库内文件并读取为 `base64://` 图片，文字与
 | `STICKER_MAX_FILES` | 库容量上限，超出淘汰最久未使用的那张 | `500` |
 | `STICKER_MAX_BYTES` | 单张采集及发送大小上限（字节），动图尤其容易超标 | `5242880`（5MB） |
 | `STICKER_MAX_PER_REPLY` | 一轮回复最多发几张 | `1` |
+| `STICKER_RAG_ENABLE` | 是否启用 CLIP 语义检索；关闭后只走标签匹配 | `true` |
+| `STICKER_RAG_MODEL_DIR` | ONNX 模型目录，留空 = `<项目根>/data/models/chinese-clip-vit-base-patch16` | 空 |
+| `STICKER_RAG_MIN_SCORE` | 返回候选的最低余弦相似度 | `0.15` |
+| `STICKER_RAG_TOP_K` | 返回给模型的候选数 | `3` |
 
 ### 地图导航（navi）
 

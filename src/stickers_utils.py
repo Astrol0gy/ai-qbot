@@ -279,6 +279,12 @@ def save(data: bytes, mime: str, tags: list[str]) -> str | None:
                         "used": 0, "last_used": now}
         _evict()
         _flush()
+        # 新图只补这一张的 CLIP 向量，不重建全库；模型/索引未就绪时由 RAG 自己回退。
+        try:
+            from . import sticker_rag
+            sticker_rag.notify_added(name)
+        except Exception as exc:
+            print(f"[表情包] RAG 增量索引通知失败：{exc}")
         return name
 
 
@@ -487,6 +493,21 @@ def tag_summary(limit: int = 12) -> str:
     return f"库里现有 {total} 张表情包，常用标签：{top}。" if top else f"库里现有 {total} 张表情包。"
 
 
+def snapshot() -> list[dict]:
+    """当前库的只读快照，供 CLIP 索引按 hash 做增量更新。"""
+    with _LOCK:
+        _load()
+        return [
+            {
+                "name": name,
+                "tags": tuple(info.get("tags") or ()),
+                "hash": str(info.get("hash") or ""),
+                "path": str(_DIR / name),
+            }
+            for name, info in sorted(_FILES.items())
+        ]
+
+
 def stats() -> dict:
     """库统计（诊断用）"""
     with _LOCK:
@@ -558,3 +579,9 @@ def admin_edit(name: str, new_name: str | None = None) -> None:
             raise
         finally:
             temp_index.unlink(missing_ok=True)
+        if new_name is not None:
+            try:
+                from . import sticker_rag
+                sticker_rag.notify_added(new_name)
+            except Exception as exc:
+                print(f"[表情包] RAG 增量索引通知失败：{exc}")

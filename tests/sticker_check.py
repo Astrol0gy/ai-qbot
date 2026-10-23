@@ -54,6 +54,7 @@ for _stream in (sys.stdout, sys.stderr):
 _TMP_LIB = Path(tempfile.mkdtemp(prefix="sticker_check_"))
 os.environ["STICKER_DIR"] = str(_TMP_LIB)
 os.environ["STICKER_ENABLE"] = "true"
+os.environ["STICKER_RAG_ENABLE"] = "false"  # 本自检覆盖标签回退；CLIP 检索见 sticker_rag_check.py
 
 # 1x1 的 PNG（真实字节，够 _sniff_mime 认出 image/png）
 PNG_A = bytes.fromhex(

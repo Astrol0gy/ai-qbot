@@ -159,7 +159,7 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bool(sender.sent), call[0]=='reply')
 
     async def test_sticker_draft_is_not_mistaken_for_delivered_history(self):
-        responses = [audit.response(calls=[('load_skill',{'name':'图片理解'})]),
+        responses = [audit.response(calls=[('load_skill',{'name':'图片理解与表情包'})]),
                      audit.response(calls=[('send_sticker',{'query':'无语'})]),
                      audit.response('[img]chosen.gif[/img]'),
                      audit.response(calls=[('reply',{'text':'[img]chosen.gif[/img]'})])]
@@ -217,7 +217,7 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.sent[0]['text'], text)
 
     async def test_sticker_selection_still_loads_skill_progressively(self):
-        responses = [audit.response(calls=[('load_skill',{'name':'图片理解'})]),
+        responses = [audit.response(calls=[('load_skill',{'name':'图片理解与表情包'})]),
                      audit.response(calls=[('send_sticker',{'query':'无语'})]),
                      audit.response(calls=[('reply',{'text':'[img]chosen.gif[/img]'})]), audit.response()]
         execute = tools.execute
@@ -231,7 +231,7 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sender.sent[0]['stickers'], ['chosen.gif'])
         first = model.requests[0]
         self.assertNotIn('send_sticker', {t['function']['name'] for t in first['tools']})
-        self.assertIn('load_skill(name=图片理解)', first['messages'][0]['content'])
+        self.assertIn('load_skill(name=图片理解与表情包)', first['messages'][0]['content'])
         self.assertNotIn('## 场景分类', first['messages'][0]['content'])
 
     def test_vision_guide_does_not_assume_a_recipient(self):

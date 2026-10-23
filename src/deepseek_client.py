@@ -497,7 +497,7 @@ async def _chat_round(
                     '明确向你提问且表达完整时应调用reply；'
                     'send_sticker仅选图，不代表图片已发送，需要用reply提交含[img]标记的内容。'
                     '需要参与请调用 reply，不参与请调用 skip(reason=irrelevant)，等待补充请调用 skip(reason=wait)。'
-                    '若决定用表情包表达，再加载图片理解技能；不要求每轮使用表情包。'}
+                    '若决定用表情包表达，再加载图片理解与表情包技能；不要求每轮使用表情包。'}
                 log_event('chat.decision_required')
                 continue
             outbox.skipped = True
