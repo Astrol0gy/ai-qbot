@@ -494,6 +494,8 @@ class QBot(botpy.Client):
         sender = OfficialSender(message, self.api)
         log_event('message.received', **message_fields(incoming), text=user_msg, at_bot=True,
             image_count=len(image_urls), quote_id=ref_idx)
+        from .. import group_memory
+        await group_memory.observe(incoming)
         if not hasattr(self, "_queue"):
             self._queue = ConversationQueue()
         @traced_message

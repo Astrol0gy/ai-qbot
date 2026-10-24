@@ -82,6 +82,13 @@ CHAT_INTENT_ENABLE = os.getenv("CHAT_INTENT_ENABLE", "true").lower() == "true"
 CHAT_INTENT_MODEL = os.getenv("CHAT_INTENT_MODEL", "").strip() or DEEPSEEK_MODEL
 CHAT_INTENT_MAX_TOKENS = int(os.getenv("CHAT_INTENT_MAX_TOKENS", "4096"))
 
+# 独立的群聊记忆整理；批量观察原消息，不占用前台回答的模型闸门。
+GROUP_MEMORY_ENABLE = os.getenv("GROUP_MEMORY_ENABLE", "true").lower() == "true"
+GROUP_MEMORY_MODEL = os.getenv("GROUP_MEMORY_MODEL", "").strip() or DEEPSEEK_MODEL
+GROUP_MEMORY_BATCH_SIZE = int(os.getenv("GROUP_MEMORY_BATCH_SIZE", "24"))
+GROUP_MEMORY_INTERVAL_SEC = float(os.getenv("GROUP_MEMORY_INTERVAL_SEC", "180"))
+GROUP_MEMORY_MAX_TOKENS = int(os.getenv("GROUP_MEMORY_MAX_TOKENS", "4096"))
+
 # ============================================
 # 图片理解（DeepSeek 官方视觉接口）
 # ============================================
@@ -237,6 +244,8 @@ def validate():
         "CHAT_WAIT_TIMEOUT_SEC": (0.1, 120),
         "CHAT_BRIEF_MAX_CHARS": (20, 2000),
         "CHAT_INTENT_MAX_TOKENS": (256, 16384),
+        "GROUP_MEMORY_BATCH_SIZE": (3, 96), "GROUP_MEMORY_INTERVAL_SEC": (10, 86400),
+        "GROUP_MEMORY_MAX_TOKENS": (512, 16384),
         "MAX_HISTORY_LENGTH": (1, 1000), "DEEPSEEK_MAX_TOKENS": (1, 131072),
         "DEEPSEEK_TEMPERATURE": (0, 2), "DEEPSEEK_TOP_P": (0, 1),
         "TOOL_CALL_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_THINKING_NOTICE_SEC": (0.01, 3600), "DEEPSEEK_API_FAIL_LIMIT": (1, 100),

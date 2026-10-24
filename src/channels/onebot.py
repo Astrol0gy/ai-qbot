@@ -705,6 +705,8 @@ class OneBotClient:
             return
         log_event('message.received', **message_fields(incoming), text=text, at_bot=at_bot,
             image_count=len(incoming.image_urls), quote_id=reply_id, mention_user_ids=incoming.mention_user_ids)
+        from .. import group_memory
+        await group_memory.observe(incoming, f'onebot_{self._self_id}' if self._self_id else '')
         try:
             batch = self._prepare_batch if self._batchable(incoming) else None
             await self._queue.submit(conv_id, (incoming, sender), self._prepare_and_dispatch, batch_handler=batch)

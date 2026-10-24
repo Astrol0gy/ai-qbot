@@ -127,10 +127,10 @@ def recognize(path):
     return description
 
 
-async def run_case(name, entries, expected, *, repeat, history=None, group=True):
+async def run_case(name, entries, expected, *, repeat, history=None, group=True, conv_id=None):
     global CURRENT
     entries = copy.deepcopy(entries)
-    gid = f'live_intent_{repeat}_{name}'
+    gid = conv_id or f'live_intent_{repeat}_{name}'
     controller = tr.TriggerController()
     for entry in entries:
         controller.buffer.add(gid, entry)

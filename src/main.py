@@ -49,6 +49,7 @@ async def _run_onebot_channel() -> None:
 
 async def main() -> None:
     validate()  # 启动前检查配置
+    from . import group_memory
     from pathlib import Path
     from .user_profile import PROFILES_DIR
     legacy_count = sum(1 for _ in Path(PROFILES_DIR).glob("*.md"))
@@ -64,6 +65,7 @@ async def main() -> None:
         channel_names.append("OneBot")
         tasks.append(_run_onebot_channel())
 
+    await group_memory.start()
     print(f"🚀 启动通道：{' + '.join(channel_names)}")
     running = [asyncio.create_task(task) for task in tasks]
     try:
@@ -72,6 +74,7 @@ async def main() -> None:
         for task in running:
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
+        await group_memory.close()
         from . import runtime, deepseek_client, vision_utils, stickers_utils
         await runtime.shutdown()
         await asyncio.to_thread(stickers_utils.shutdown, 3)
