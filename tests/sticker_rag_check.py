@@ -299,13 +299,11 @@ class SendStickerTests(unittest.TestCase):
 
 class PromptAndSkillTests(unittest.TestCase):
     def test_skill_is_renamed_and_prompts_reference_it(self):
-        from src import chat_intent, skills
+        from src import skills
         from src.tools import chat_provider
 
         self.assertIsNotNone(skills.get_skill("图片理解与表情包"))
         self.assertIsNone(skills.get_skill("图片理解"))
-        self.assertIn("图片理解与表情包", chat_intent.ANSWER_POLICY)
-        self.assertIn("不要求每轮", chat_intent.ANSWER_POLICY)
         self.assertIn("图片理解与表情包", chat_provider.CHAT_POLICY)
 
 

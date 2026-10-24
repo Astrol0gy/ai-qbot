@@ -136,9 +136,9 @@ class ImageProvider(ToolProvider):
                     "用图片表达情绪或玩笑（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"
                     "每条候选都带 rank、标签和一行 [img]库里的文件路径[/img]；"
                     "挑最贴合的一条，把它**原样**放进回复里，也可以只发图、不配文字。"
-                    "不要一次把三条都放进回复；都不贴合就只用文字，别反复换关键词硬凑。"
-                    "正经问答题（别人在问报错、要代码、查数据）和对方情绪明显认真时不要用；"
-                    "一轮最多发一张，别刷屏。"
+                    "有贴合候选就选一条，无需等用户索要；都不贴合就用文字，不反复检索硬凑。"
+                    "认真求助、严肃问答、现实痛苦或冲突、用户要求纯文字时专注文字；轻松吐槽和打趣可以用。"
+                    "一轮最多发一张，不连续重复同一张。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -246,7 +246,7 @@ class ImageProvider(ToolProvider):
             lines.append(f"{candidate.rank}. [img]{candidate.path}[/img]")
             tags = "、".join(candidate.tags) or "无"
             lines.append(f"   标签：{tags} ｜ 相似度：{candidate.score:.2f}")
-        lines.append("都不贴合就只用文字，不要为了发表情包硬选；一轮最多发一张。")
+        lines.append("有贴合候选就选一条放进最终回复，可只发图或配一句短话；都不贴合则用文字。一轮最多一张。")
         return "\n".join(lines)
 
     @staticmethod
