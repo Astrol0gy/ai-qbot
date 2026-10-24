@@ -173,6 +173,7 @@ class RoundLease:
         self.reply_only = False
         self.intent_decision = None
         self.reply_to = None
+        self.current_message_id = ""
         self.writes = {}
         self.after_commit = []
         self.history = None

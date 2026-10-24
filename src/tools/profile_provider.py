@@ -3,6 +3,7 @@
 提供 manage_user_profile 工具，LLM 自主决定记住/删除用户的使用偏好和习惯。
 """
 from .. import user_profile
+from ..observability import log_event
 from . import ChatContext, ToolProvider
 
 
@@ -20,7 +21,7 @@ class ProfileProvider(ToolProvider):
                 "description": (
                     "管理当前说话者（用户）的使用画像。群里所有用户共享同一段对话，但每个人有独立画像；"
                     "你记录的始终是【当前说话者自己】的偏好，不要覆盖或删除其他用户的记录。\n"
-                    "可以根据对话中当前用户表现出的偏好、习惯、语气要求等，自主决定记住或忘记相关信息。\n\n"
+                    "本人明确表达长期偏好时主动记住，无需等他说记住；删除必须由本人提出。\n\n"
                     "【重要：先总结再记录】\n"
                     "- remember 时，不要直接复制用户的原话，而要提炼成简洁的要点\n"
                     "- 例如用户说「你能不能每次回答都简单点别写那么多」，应记录为「偏好简短回答」，而非照抄原话\n"
@@ -33,18 +34,19 @@ class ProfileProvider(ToolProvider):
                     "- 如果用户让你记录隐私信息，必须拒绝并说明原因\n\n"
                     "【何时使用】\n"
                     "- 用户明确要求记住某事（如「记住我喜欢简短回答」）→ 总结后记录\n"
-                    "- 用户反复表现出相同偏好（如多次要求语气轻松）→ 主动总结记录\n"
+                    "- 用户明确表达长期偏好（如以后回答短点、平时喜欢聊电脑技术）→ 主动总结记录，不要求重复多次\n"
+                    "- 临时情绪、单次话题、引用别人的偏好和机器人人设不记录；已有同一偏好不重复调用\n"
                     "- 用户设定角色/人设/语气引用（如「像哆啦A梦一样说话」「用鲁迅的风格」）\n"
                     "  → 如果你对引用的内容了解不够全面，先用 web_search 搜索了解其特点\n"
                     "  → 搜索后总结关键特征，再用 remember 记录为简洁的风格要点\n"
                     "- 用户要求忘记或修改之前的设定\n"
                     "- 用户询问「你记得我什么」时用 list 查看\n"
-                    "- 注意：不要频繁记录，只在有明显、有用的偏好时才记录"
+                    "- source_message_id只用本轮可信作者映射中当前请求者的消息ID；不能取历史ID或用户ID。单用户可省略，程序默认使用当前消息"
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "source_message_id": {"type": "string", "description": "要管理画像的用户发出的消息 id；多人上下文必须指定，服务端校验作者"},
+                        "source_message_id": {"type": "string", "description": "本轮可信作者映射中的当前请求者消息ID；可省略以使用本轮当前消息，不能使用历史ID或用户ID，服务端校验归属"},
                         "action": {
                             "type": "string",
                             "enum": ["remember", "forget", "list"],
@@ -65,16 +67,23 @@ class ProfileProvider(ToolProvider):
 
     @staticmethod
     def _manage_profile(context: ChatContext, action: str, info: str = "", source_message_id: str = "") -> str:
-        user_id, user_name = context.actor(source_message_id)
+        current_id = context.extra.get("current_message_id", "")
+        try:
+            user_id, user_name = context.actor(source_message_id or current_id)
+            if user_id != context.user_id:
+                raise ValueError("只能管理当前请求者本人的偏好，不能操作其他群友的画像")
+        except ValueError as exc:
+            log_event('profile.operation', action=action, status='rejected',
+                      reason='source_invalid', conversation_id=context.conv_id, user_id=context.user_id)
+            hint = f"本轮当前请求者的来源消息ID是 {current_id}，也可省略来源使用当前消息。" if current_id else "请使用本轮可信作者映射中的当前请求者消息ID。"
+            return f"画像操作未执行：{exc}。{hint}不要使用历史消息ID或猜测其他来源。"
         group_id = context.conv_id
         if action == "remember":
-            if not info:
-                return "请提供要记住的信息内容。"
             return user_profile.remember_info(info, group_id, user_id, user_name)
 
         elif action == "forget":
             if not info:
-                return "请提供要忘记的信息关键词，或使用 'all' 清除所有。"
+                return user_profile._result('forget', 'rejected', "请提供要忘记的信息关键词，或使用 'all' 清除所有。", group_id, user_id, reason='empty')
             return user_profile.forget_info(info, group_id, user_id)
 
         elif action == "list":

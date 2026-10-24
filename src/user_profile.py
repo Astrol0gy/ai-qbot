@@ -9,6 +9,7 @@ import os
 import re
 from datetime import datetime
 from . import runtime
+from .observability import log_event
 
 PROFILES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "user_profiles")
 
@@ -58,26 +59,52 @@ def _header(gid, uid, name):
             + f"\n用户名: {name}\n创建时间: {datetime.now():%Y-%m-%d %H:%M}\n\n")
 
 
+def _result(action, status, message, group_id, user_id, *, reason=""):
+    # Keep preference text and private values out of operation telemetry.
+    log_event('profile.operation', action=action, status=status, reason=reason,
+              conversation_id=group_id, user_id=user_id)
+    return message
+
+
+def _change(action, path, content, group_id, user_id):
+    try:
+        runtime.write_text(path, content)
+    except Exception as exc:
+        log_event('profile.operation', action=action, status='failed',
+                  error_type=type(exc).__name__, conversation_id=group_id, user_id=user_id)
+        raise
+    lease = runtime.current()
+    log_event('profile.operation', action=action, status='staged' if lease else 'committed',
+              conversation_id=group_id, user_id=user_id)
+    def persisted():
+        log_event('profile.persist', action=action, status='committed',
+                  conversation_id=group_id, user_id=user_id)
+    if lease:
+        lease.after_commit.append(persisted)
+    else:
+        persisted()
+
+
 @runtime.serialized
 def remember_info(info: str, group_id: str, user_id: str, user_name: str = "") -> str:
     if not group_id or not user_id:
-        return "无法确定当前用户，请稍后重试。"
+        return _result('remember', 'rejected', "无法确定当前用户，请稍后重试。", group_id, user_id, reason='identity_missing')
     personal_type = _detect_personal_data(info)
     if personal_type:
-        return f"【隐私保护】检测到{personal_type}信息，我不会记录。只记录使用偏好。"
+        return _result('remember', 'rejected', f"【隐私保护】检测到{personal_type}信息，我不会记录。只记录使用偏好。", group_id, user_id, reason='privacy')
     info = info.strip().replace("\n", " ")
     if not info:
-        return "请提供要记住的信息。"
+        return _result('remember', 'rejected', "请提供要记住的信息。", group_id, user_id, reason='empty')
     if len(info) > 1000:
-        return "单条偏好最多 1000 字。"
+        return _result('remember', 'rejected', "单条偏好最多 1000 字。", group_id, user_id, reason='too_long')
     path = _get_profile_path(group_id, user_id)
     content = runtime.read_text(path) or _header(group_id, user_id, user_name)
     records = [line for line in content.splitlines() if line.startswith("- [")]
     if any(line.split("] ", 1)[-1] == info for line in records):
-        return "这条信息已经记录过了。"
+        return _result('remember', 'duplicate', "这条信息已经记录过了。", group_id, user_id)
     if len(records) >= 100:
-        return "已达 100 条偏好上限，请先删除旧记录。"
-    runtime.write_text(path, content + f"- [{datetime.now():%Y-%m-%d %H:%M}] {info}\n")
+        return _result('remember', 'rejected', "已达 100 条偏好上限，请先删除旧记录。", group_id, user_id, reason='record_limit')
+    _change('remember', path, content + f"- [{datetime.now():%Y-%m-%d %H:%M}] {info}\n", group_id, user_id)
     return f"已记住：{info}"
 
 
@@ -88,13 +115,13 @@ def forget_info(info: str, group_id: str, user_id: str) -> str:
     path = _get_profile_path(group_id, user_id)
     content = runtime.read_text(path)
     if content is None:
-        return "你还没有任何已记录的信息。"
+        return _result('forget', 'not_found', "你还没有任何已记录的信息。", group_id, user_id)
     lines = content.splitlines(keepends=True)
     kept = [line for line in lines if not (line.startswith("- [") and info in line)]
     count = len(lines) - len(kept)
     if not count:
-        return f"没有找到包含「{info}」的记录。"
-    runtime.write_text(path, "".join(kept))
+        return _result('forget', 'not_found', f"没有找到包含「{info}」的记录。", group_id, user_id)
+    _change('forget', path, "".join(kept), group_id, user_id)
     return f"已删除 {count} 条匹配的记录。"
 
 
@@ -102,8 +129,8 @@ def forget_info(info: str, group_id: str, user_id: str) -> str:
 def forget_all(group_id: str, user_id: str) -> str:
     path = _get_profile_path(group_id, user_id)
     if runtime.read_text(path) is None:
-        return "你还没有任何已记录的信息。"
-    runtime.write_text(path, None)
+        return _result('forget', 'not_found', "你还没有任何已记录的信息。", group_id, user_id)
+    _change('forget', path, None, group_id, user_id)
     return "已清除所有记录。"
 
 

@@ -240,10 +240,13 @@ async def _chat_round(
         raise ValueError('表达技能缺失：' + skills.STYLE_SKILL_NAME)
     lease = runtime.current()
     ctx.extra["actors"] = getattr(lease, "actors", {})
-    if ctx.extra["actors"]:
-        system_actors = "\n".join(f"??id={mid} ??id={uid} ??={name}" for mid, (uid, name) in ctx.extra["actors"].items())
-    else:
-        system_actors = ""
+    ctx.extra["current_message_id"] = getattr(lease, "current_message_id", "")
+    system_actors = json.dumps({
+        "current_message_id": ctx.extra["current_message_id"],
+        "current_user_id": user_id,
+        "messages": [{"message_id": mid, "user_id": uid, "user_name": name}
+                     for mid, (uid, name) in ctx.extra["actors"].items()],
+    }, ensure_ascii=False)
 
     # 公共系统提示（日期 + 群聊说明 + 回复格式）
     common_prompt = (
@@ -314,6 +317,12 @@ async def _chat_round(
         )
 
     system_prompt += "\n【本轮消息的可信作者映射】\n" + system_actors
+    system_prompt += ("\nsource_message_id只能取本轮messages里的message_id，不能用历史消息ID或user_id。"
+                      "用户偏好只管理current_user_id本人；省略来源时程序优先使用current_message_id。\n")
+    if not dm_mode:
+        system_prompt += ("【偏好记忆】当前用户明确表达长期的回答风格、称呼、语气或话题兴趣时，"
+                          "主动按需加载「用户偏好」并保存，无需等他说记住；保存后继续简短回应。"
+                          "已有相同记录不重复保存；临时情绪、单次话题、引用他人和机器人人设不是用户偏好。\n")
     messages = [{"role": "system", "content": system_prompt}]
 
     # --- 滑动窗口对话压缩（全局启用）---

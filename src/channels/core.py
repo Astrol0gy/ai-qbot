@@ -242,7 +242,9 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             if not raw_info:
                 await _send_notice(sender, "请提供要记住的信息，例如：/look 我喜欢简短的回答")
                 return
-            user_msg = f"用户要求记住偏好：「{raw_info}」。加载用户偏好技能，提炼后记录当前用户的偏好并简短确认。"
+            user_msg = (f"用户要求记住偏好：「{raw_info}」。加载用户偏好技能，提炼后记录当前用户的偏好并简短确认。"
+                        f"本条来源消息ID={msg.message_id or '未提供，可省略source_message_id'}，"
+                        "只记录当前请求者，不使用历史消息ID。")
             msg.ai_decides_reply = False
     user_msg = user_msg or msg.reply_ctx
     try:
@@ -312,6 +314,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         return
     lease = runtime.RoundLease(msg.conv_id, None)
     lease.focus_text = msg.text
+    lease.current_message_id = msg.message_id
     set_round(lease.id)
     log_event('model.round.start', round_id=lease.id, notice_after_sec=DEEPSEEK_THINKING_NOTICE_SEC)
     lease.actors = {entry.message_id: (entry.user_id, entry.speaker) for entry in entries if entry.message_id and entry.user_id}
