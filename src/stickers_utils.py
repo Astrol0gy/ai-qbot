@@ -1,8 +1,8 @@
 """
 表情包库 —— 采集、入库、检索（``tools/image_provider.py`` 里 list_stickers / send_sticker 两个工具的后端）
 
-VLM 认出「表情包」时按 ``vision_utils._TYPE_GUIDE`` 的要求补一行五个标签（情绪｜动作｜主体｜风格｜文字），
-这里把原图下载到 ``data/stickers/``，文件名就是那五个标签加一个序号：
+VLM 按 ``vision_utils._TYPE_GUIDE`` 判为「表情包」，给出可独立复用的可见依据与五个标签
+（情绪｜动作｜主体｜风格｜文字）后，这里把原图下载到 ``data/stickers/``，文件名就是标签加序号：
 
     无语_捂脸_熊猫_拼贴_无文字_1.gif
     ^^^^^^^^ ^^^^ ^^^^^ ^^^^^^ ^^^^^^^ ^ 同一组五个标签里的第 1 张
@@ -55,7 +55,9 @@ _EXT_BY_MIME = {
     "image/webp": ".webp",
 }
 
-# 「标签：无语｜捂脸｜熊猫｜拼贴｜无文字」——只认这一行的第一个匹配
+# 分类协议各只允许一行；不能从矛盾输出中挑一个肯定结论入库。
+_TYPE_LINE = re.compile(r"^\s*类型\s*[：:]", re.MULTILINE)
+_ASSESSMENT_LINE = re.compile(r"^\s*采集判定\s*[：:]\s*(.+?)\s*$", re.MULTILINE)
 _TAG_LINE = re.compile(r"^\s*(?:[-·•*]|\d+[.、])?\s*标\s*签\s*[：:]\s*(.+?)\s*$", re.MULTILINE)
 _TAG_SPLIT = re.compile(r"[｜|/\\、,，;；:：\s_]+")
 _ILLEGAL = re.compile(r'[\\/:*?"<>|\r\n\t]')
@@ -80,31 +82,67 @@ class Sticker:
 
 # ---- 标签解析与文件名规则 --------------------------------------------------
 
+def _unique_fields(pairs: list[tuple]) -> dict:
+    """JSON duplicate keys are contradictory evidence, not last-value-wins."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate collection assessment field')
+        result[key] = value
+    return result
+
+
 def _explicit_sticker(desc: str) -> bool:
-    """Only a positive classification in the first nonempty line permits harvesting."""
+    """Require an unambiguous type AND visible evidence of a reusable reaction.
+
+    Legacy type/tags-only descriptions remain readable, but cannot add new files.
+    Evidence is judged by the visual model; words such as 截图 are not a blacklist.
+    """
     if not desc or not desc.strip():
         return False
-    header = desc.strip().splitlines()[0]
+    lines = [line.strip() for line in desc.splitlines() if line.strip()]
+    if len(lines) < 2 or len(_TYPE_LINE.findall(desc)) != 1:
+        return False
+    header = lines[0]
     match = re.match(r'^类型\s*[：:]\s*([^｜|\r\n]+)', header)
     if match is None:
         return False
     category = re.sub(r'\s+', '', match.group(1))
-    return category in {'表情包', '梗图', '表情包/梗图', '表情包／梗图', '表情包或梗图', '表情包（梗图）'}
+    if category not in {'表情包', '梗图', '表情包/梗图', '表情包／梗图', '表情包或梗图', '表情包（梗图）'}:
+        return False
+    if len(_ASSESSMENT_LINE.findall(desc)) != 1:
+        return False
+    assessment = _ASSESSMENT_LINE.fullmatch(lines[1])
+    if assessment is None:
+        return False
+    try:
+        fields = json.loads(assessment.group(1), object_pairs_hook=_unique_fields)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(fields, dict) or set(fields) != {'可复用反应', '依赖特定内容', '可见依据'}:
+        return False
+    evidence = fields['可见依据']
+    return (fields['可复用反应'] is True and fields['依赖特定内容'] is False
+            and isinstance(evidence, str) and bool(evidence.strip())
+            and evidence.strip() not in {_NONE, '未知', '不确定', _NO_TEXT})
 
 
 def parse_tags(desc: str) -> list[str] | None:
     """
-    必须明确判定为表情包，且有有效标签行，才返回五个标签。
-    内容图片、否定/不确定的类型、缺失类型都不采集；额外标签不能推翻类型判断。
+    必须明确判定为可独立复用的反应图，且有唯一有效标签行，才返回五个标签。
+    内容图片、缺少可见依据、否定/不确定/矛盾的判读都不采集。
     """
     if not _explicit_sticker(desc):
         return None
-    match = _TAG_LINE.search(desc)
-    if match is None:
+    matches = list(_TAG_LINE.finditer(desc))
+    if len(matches) != 1:
         return None
+    match = matches[0]
     tags = [_clean_tag(part) for part in _TAG_SPLIT.split(match.group(1))]
     tags = [t for t in tags if t]
     if len(tags) < 3:  # 少于三个多半是那句「标签：」被模型写歪了，宁可不收
+        return None
+    if tags[0] in {_NONE, _NO_TEXT, '未知', '不确定'}:
         return None
     tags = tags[:5]
     while len(tags) < 5:
@@ -424,6 +462,18 @@ def _score(tags: list[str], tokens: list[str]) -> int:
 
 
 # ---- 回复里的本地路径 → 库文件 ---------------------------------------------
+
+def prepare_sticker(path: str | Path) -> str | None:
+    """发送前派生至多 320px 的缓存图；失败返回 None，原图/索引/RAG 不变。
+
+    不调用 _load/resolve，兼容旧库且不因准备发送重写索引。调用方保留原路径
+    做 receipt、mark_used；这里只返回发送文件。异步通道请用 asyncio.to_thread。
+    """
+    if not STICKER_ENABLE:
+        return None
+    from .sticker_media import prepare_sticker as prepare
+    return prepare(path, library_dir=_DIR)
+
 
 def resolve(payload: str) -> str | None:
     """

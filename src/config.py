@@ -85,7 +85,7 @@ CHAT_INTENT_MAX_TOKENS = int(os.getenv("CHAT_INTENT_MAX_TOKENS", "4096"))
 # 独立的群聊记忆整理；批量观察原消息，不占用前台回答的模型闸门。
 GROUP_MEMORY_ENABLE = os.getenv("GROUP_MEMORY_ENABLE", "true").lower() == "true"
 GROUP_MEMORY_MODEL = os.getenv("GROUP_MEMORY_MODEL", "").strip() or DEEPSEEK_MODEL
-GROUP_MEMORY_BATCH_SIZE = int(os.getenv("GROUP_MEMORY_BATCH_SIZE", "24"))
+GROUP_MEMORY_BATCH_SIZE = int(os.getenv("GROUP_MEMORY_BATCH_SIZE", "20"))
 GROUP_MEMORY_INTERVAL_SEC = float(os.getenv("GROUP_MEMORY_INTERVAL_SEC", "180"))
 GROUP_MEMORY_MAX_TOKENS = int(os.getenv("GROUP_MEMORY_MAX_TOKENS", "4096"))
 

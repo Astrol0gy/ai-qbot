@@ -1,17 +1,21 @@
 """Program/storage/scheduling contracts. Semantic checks live in live_group_memory_check."""
 import asyncio
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace as NS
+from unittest.mock import patch, AsyncMock
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from src import group_memory as gm
 from src.channels.base import IncomingMessage
 from src.group_memory.store import MemoryStore, RAW_TTL, FACT_TTL
+from src.group_memory.agent import analyze
 
 
 def message(mid, uid='a', text='收到捏，晚上开月亮船？', **kw):
@@ -145,6 +149,35 @@ class StoreCases(unittest.TestCase):
         self.assertEqual([],facts['habits'])
         self.assertEqual(1,rejected)
 
+    def test_rejection_diagnostics_explain_counts_without_raw_chat(self):
+        snapshot=self.store.snapshot('g')
+        bad_owner=habit()
+        bad_owner['user_id']='b'
+        output={'habits':[bad_owner,habit(ids=('missing',))], 'glossary':[]}
+        log=io.StringIO()
+        with contextlib.redirect_stdout(log):
+            facts,rejected=self.store.validate(snapshot,output)
+        self.assertEqual({'habits':[], 'glossary':[]},facts)
+        self.assertEqual(2,rejected)
+        events=[json.loads(line) for line in log.getvalue().splitlines()]
+        self.assertTrue(any(e['event']=='memory.validation.rejected' for e in events))
+        diagnostic=next(e for e in events if e['event']=='memory.validation.rejected')
+        self.assertEqual({'habit_owner_or_samples':1,'evidence':1},diagnostic['reasons'])
+        self.assertNotIn('收到捏',log.getvalue())
+
+    def test_identical_fact_and_delivery_do_not_duplicate_after_restart(self):
+        first,_=self.save(habits=[habit()])
+        reopened=MemoryStore(self.store.root)
+        self.assertFalse(reopened.append('g',message('3')))
+        reopened.append('g',message('4'))
+        snapshot=reopened.snapshot('g')
+        facts,rejected=reopened.validate(snapshot,{'habits':[habit(ids=('2','3','4'))],'glossary':[]})
+        self.assertEqual(0,rejected)
+        reopened.complete('g',snapshot,facts)
+        rows=reopened.snapshot('g')['habits']
+        self.assertEqual(1,len(rows))
+        self.assertEqual(first['habits'][0]['id'],rows[0]['id'])
+
 
 class ServiceCases(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -218,6 +251,91 @@ class ServiceCases(unittest.IsolatedAsyncioTestCase):
         service.ingester=asyncio.create_task(service.ingest())
         await service.close()
         self.assertEqual(['1','2','3'],self.store.snapshot('g')['pending_ids'])
+
+    async def test_twenty_pending_triggers_before_timer_but_nineteen_does_not(self):
+        batches=[]
+        async def analyzer(store,snapshot):
+            batches.append(snapshot['pending_ids'])
+            return {'habits':[],'glossary':[]}
+        service=gm.MemoryService(self.store,batch_size=20,interval=180,analyzer=analyzer)
+        for mid in range(1,20):
+            self.store.append('g',message(str(mid)))
+        self.assertFalse(await service.process('g'))
+        self.store.append('g',message('20'))
+        self.assertTrue(await service.process('g'))
+        self.assertEqual([list(map(str,range(1,21)))],batches)
+        self.assertEqual([],self.store.snapshot('g')['pending_ids'])
+
+    async def test_interval_flushes_one_new_message_with_historical_evidence(self):
+        for mid in ('1','2','3'):
+            self.store.append('g',message(mid))
+        old=self.store.snapshot('g')
+        self.store.complete('g',old,{'habits':[],'glossary':[]})
+        now=time.time()
+        self.store.append('g',message('4') | {'time':now})
+        async def analyzer(store,snapshot):
+            facts,rejected=store.validate(snapshot,{'habits':[habit(ids=('2','3','4'))],'glossary':[]})
+            self.assertEqual(0,rejected)
+            return facts
+        service=gm.MemoryService(self.store,batch_size=20,interval=180,analyzer=analyzer)
+        with patch.object(gm.time,'time',return_value=now+179):
+            self.assertFalse(await service.process('g'))
+        with patch.object(gm.time,'time',return_value=now+180):
+            self.assertTrue(await service.process('g'))
+        self.assertEqual([],self.store.snapshot('g')['pending_ids'])
+        self.assertTrue(self.store.relevant('g',['a'],'')['users'])
+
+
+class AnalyzerCases(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        tmp=tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store=MemoryStore(tmp.name)
+        for mid in ('1','2','3'):
+            self.store.append('g',message(mid))
+
+    def response(self,output):
+        return NS(choices=[NS(message=NS(content=json.dumps(output)),finish_reason='stop')],usage=None)
+
+    async def test_all_rejected_output_preserves_pending_after_correction_fails(self):
+        bad=habit()
+        bad['user_id']='wrong-author'
+        create=AsyncMock(return_value=self.response({'habits':[bad],'glossary':[]}))
+        service=gm.MemoryService(self.store,batch_size=3,analyzer=analyze)
+        with patch('src.deepseek_client.client.chat.completions.create',create):
+            self.assertFalse(await service.process('g'))
+        reopened=MemoryStore(self.store.root)
+        self.assertEqual(['1','2','3'],reopened.snapshot('g')['pending_ids'])
+        self.assertEqual(0,reopened.snapshot('g')['processed_at'])
+        self.assertEqual({},reopened.relevant('g',['a'],''))
+        self.assertIn('g',service.retry_at)
+
+    async def test_all_rejected_output_can_be_corrected_into_valid_memory(self):
+        bad=habit(ids=('invented',))
+        create=AsyncMock(side_effect=[
+            self.response({'habits':[bad],'glossary':[]}),
+            self.response({'habits':[habit()],'glossary':[]})])
+        service=gm.MemoryService(self.store,batch_size=3,analyzer=analyze)
+        with patch('src.deepseek_client.client.chat.completions.create',create):
+            self.assertTrue(await service.process('g'))
+        self.assertEqual([],self.store.snapshot('g')['pending_ids'])
+        self.assertEqual(1,len(self.store.snapshot('g')['habits']))
+        self.assertEqual('确认时常用“收到捏”',self.store.relevant('g',['a'],'')['users'][0]['habits'][0]['description'])
+
+    async def test_empty_conclusion_is_a_successful_batch(self):
+        create=AsyncMock(return_value=self.response({'habits':[],'glossary':[]}))
+        service=gm.MemoryService(self.store,batch_size=3,analyzer=analyze)
+        with patch('src.deepseek_client.client.chat.completions.create',create):
+            self.assertTrue(await service.process('g'))
+        self.assertEqual([],self.store.snapshot('g')['pending_ids'])
+
+    async def test_partial_rejection_keeps_valid_facts(self):
+        create=AsyncMock(return_value=self.response({'habits':[habit(),habit(ids=('invented',))],'glossary':[]}))
+        service=gm.MemoryService(self.store,batch_size=3,analyzer=analyze)
+        with patch('src.deepseek_client.client.chat.completions.create',create):
+            self.assertTrue(await service.process('g'))
+        self.assertEqual(1,len(self.store.snapshot('g')['habits']))
+        self.assertEqual([],self.store.snapshot('g')['pending_ids'])
 
 
 if __name__=='__main__':

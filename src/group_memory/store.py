@@ -48,7 +48,7 @@ class MemoryStore:
         fd, name = tempfile.mkstemp(prefix='.memory-', dir=self.root)
         try:
             with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
-                json.dump(data, stream, ensure_ascii=False, separators=(',', ':'))
+                json.dump(data, stream, ensure_ascii=False, indent=2)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(name, self.path(group_id))
@@ -124,6 +124,7 @@ class MemoryStore:
         for r in records.values():
             pool.update({m['id']:m for m in r['evidence'] if m['id'] not in pool})
         valid, rejected = {'habits':[], 'glossary':[]}, 0
+        reasons = {}
         for kind in valid:
             items = output[kind]
             if not isinstance(items, list) or len(items)>16:
@@ -179,8 +180,13 @@ class MemoryStore:
                         common.update(term=item['term'].strip(), meaning=item['meaning'].strip(),
                                       scope=item['scope'].strip(), referent_type=target_type, referent_user_id=target)
                     valid[kind].append(common)
-                except (ValueError, TypeError, KeyError):
+                except (ValueError, TypeError, KeyError) as exc:
                     rejected += 1
+                    reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                    reasons[reason] = reasons.get(reason, 0) + 1
+        if rejected:
+            log_event('memory.validation.rejected', conversation_id=data['group_id'],
+                      rejected=rejected, reasons=reasons)
         return valid, rejected
 
     def complete(self, group_id, snapshot, facts):

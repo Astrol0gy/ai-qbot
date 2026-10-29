@@ -55,7 +55,7 @@ class RoutingCases(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('tools',model.requests[0])
         self.assertEqual(model.requests[0]['response_format'],{'type':'json_object'})
         names={t['function']['name'] for t in model.requests[1]['tools']}
-        self.assertEqual(names,{'load_skill','read_skill_resource'})
+        self.assertEqual(names,{'load_skill','read_skill_resource','quote_message'})
         self.assertNotIn('这一轮开不开口',model.requests[1]['messages'][-1]['content'])
         self.assertNotIn('群聊使用本轮提供的 reply/skip 决定参与',model.requests[1]['messages'][0]['content'])
         self.assertEqual(sender.sent[0]['text'],'在呢～')

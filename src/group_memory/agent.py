@@ -28,6 +28,7 @@ bot类型必须有@机器人的原消息支持，不能把群友说的“你”�
 新证据与旧结论冲突而不能判定时，用旧ID标记uncertain=true，不把矛盾结论当事实。
 confidence>=0.8才可用于理解；不是每个用户都必须生成记录，不为凑数输出。
 只选messages或existing.evidence里的真实ID，引用证据必须能支持所写结论，并包含至少一条pending_ids里的新消息。
+每条记录的evidence_ids最多8个不同ID，选最有代表性的证据；习惯至少3个，词典至少2个。
 """
 
 
@@ -50,13 +51,20 @@ async def analyze(store, snapshot):
         log_event('memory.response',conversation_id=snapshot['group_id'],
                   finish_reason=getattr(choice,'finish_reason',None),
                   usage=usage.model_dump() if hasattr(usage,'model_dump') else None)
+        invalid_reason='structure'
         try:
             facts,rejected=store.validate(snapshot,json.loads(choice.message.content))
+            if rejected and not any(facts.values()):
+                # Rejected candidates are not a successful empty conclusion.
+                invalid_reason='all_records_rejected'
+                raise ValueError('群记忆候选记录全部被拒绝')
         except (ValueError,TypeError) as exc:
-            log_event('memory.invalid',conversation_id=snapshot['group_id'],attempt=attempt+1)
+            log_event('memory.invalid',conversation_id=snapshot['group_id'],attempt=attempt+1,
+                      reason=invalid_reason)
             if attempt:
                 raise ValueError('群记忆协议校验失败') from exc
-            messages[0]={'role':'system','content':PROMPT+'\n上次结构不合法，请严格按上述JSON结构重新输出。'}
+            messages[0]={'role':'system','content':PROMPT+'\n上次结构不合法或候选全部校验失败。请重新检查JSON字段、作者归属、证据数量和真实ID，'
+                         '每条必须含pending_ids中的新证据。没有符合要求的结论则返回两个空数组。'}
             continue
         log_event('memory.validated',conversation_id=snapshot['group_id'],
                   habits=len(facts['habits']),glossary=len(facts['glossary']),rejected=rejected)

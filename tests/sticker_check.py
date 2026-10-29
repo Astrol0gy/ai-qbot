@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import shutil
@@ -39,6 +40,8 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -56,21 +59,25 @@ os.environ["STICKER_DIR"] = str(_TMP_LIB)
 os.environ["STICKER_ENABLE"] = "true"
 os.environ["STICKER_RAG_ENABLE"] = "false"  # 本自检覆盖标签回退；CLIP 检索见 sticker_rag_check.py
 
-# 1x1 的 PNG（真实字节，够 _sniff_mime 认出 image/png）
-PNG_A = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-    "0000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
-)
-PNG_B = bytes.fromhex(
-    "89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d24"
-    "0000001749444154789c6360f8cf801b18a9c1e40c0c000ea0010d0a3d1e1e0000"
-    "000049454e44ae426082"
-)
-PNG_C = PNG_B[:-1] + b"\x00"  # 第三张：字节不同（避开内容去重），头还是 PNG 魔数
-PNG_D = PNG_B[:-1] + b"\x01"  # 第四张：留给"采集链路真的下载了新图"用
+# 四张合法且内容不同的 PNG；发送准备会实际解码，不能只伪造 PNG 魔数。
+def _png(color: str) -> bytes:
+    out = io.BytesIO()
+    with Image.new('RGB', (32, 24), color) as image:
+        image.save(out, format='PNG')
+    return out.getvalue()
 
+
+PNG_A = _png('red')
+PNG_B = _png('green')
+PNG_C = _png('blue')  # 与 A/B 不同，覆盖换标签后的内容去重。
+PNG_D = _png('yellow')  # 采集链路的新图，确保真下载入库。
+
+# 新采集协议要求可复用反应的可见依据；旧的类型/标签两段式有意不再入库。
+DESC_ASSESSMENT = ('采集判定：{"可复用反应":true,"依赖特定内容":false,'
+                   '"可见依据":"熊猫夸张捂脸配我裂开了，独立表达无语"}\n')
 DESC_STICKER = (
     "类型：表情包 ｜ 意图：表达无语和「你在说什么」\n"
+    + DESC_ASSESSMENT +
     "一只熊猫捂着脸，图上有「我裂开了」几个字。\n"
     "标签：无语｜捂脸｜熊猫｜拼贴配字｜我裂开了"
 )
@@ -128,15 +135,15 @@ async def main() -> int:
     check("内容图片没有标签行 → 不认", stickers_utils.parse_tags(DESC_PHOTO) is None)
     check(
         "不足三维不认（模型写歪时不入库）",
-        stickers_utils.parse_tags("类型：表情包 ｜ 意图：无\n标签：无语") is None,
+        stickers_utils.parse_tags("类型：表情包 ｜ 意图：无\n" + DESC_ASSESSMENT + "标签：无语") is None,
     )
     check(
         "标签内混进下划线：按分隔符切开，仍然只留五个",
         stickers_utils._clean_tag("无_语") == "无语"
-        and stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n标签：无语_了｜捂脸｜猫｜实拍｜无文字")
+        and stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n" + DESC_ASSESSMENT + "标签：无语_了｜捂脸｜猫｜实拍｜无文字")
         == ["无语", "了", "捂脸", "猫", "实拍"],
     )
-    check("缺的维度补「无」", stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n标签：无语｜捂脸｜猫｜实拍") == ["无语", "捂脸", "猫", "实拍", "无"])
+    check("缺的维度补「无」", stickers_utils.parse_tags("类型：表情包 ｜ 意图：无语\n" + DESC_ASSESSMENT + "标签：无语｜捂脸｜猫｜实拍") == ["无语", "捂脸", "猫", "实拍", "无"])
 
     # ---------- 2. 入库命名与去重 ----------
     print("\n2. 入库命名与去重")
@@ -244,10 +251,16 @@ async def main() -> int:
     seg = params["message"][0]
     check("action 是 send_group_msg", action == "send_group_msg", action)
     import base64
-    check("段数组里有 image 段且 Base64 内容与库内文件一致",
+    import io
+    from PIL import Image
+    encoded = base64.b64decode(seg['data']['file'].removeprefix('base64://'))
+    with Image.open(io.BytesIO(encoded)) as sent_image, Image.open(paths[0]) as original:
+        image_matches = (sent_image.convert('RGBA').getpixel((0, 0)) == original.convert('RGBA').getpixel((0, 0))
+                         and max(sent_image.size) <= 320)
+    check("段数组使用表情子类型，图片内容正确且尺寸有界",
           len(sent) == 2 and len(params["message"]) == 1
           and seg["type"] == "image"
-          and seg["data"]["file"] == 'base64://' + base64.b64encode(Path(paths[0]).read_bytes()).decode('ascii'))
+          and seg['data']['sub_type'] == 1 and image_matches)
     check("文字独立为前一条消息", sent[0][1]["message"] == [{"type": "text", "data": {"text": "行吧"}}])
     await sender.send("", sticker_paths=paths)
     check("纯表情包（text 为空）也会发出去", len(sent[-1][1]["message"]) == 1)
@@ -341,7 +354,10 @@ async def main() -> int:
              "一只熊猫捂着脸，图上有「我裂开了」几个字。",
           repr(vu.strip_tag_line(DESC_STICKER)))
     brief_msg = IncomingMessage(channel="onebot", image_descs=[DESC_STICKER])
-    check("缓冲里的图注不带标签行", "标签：" not in brief_msg.buffer_text(), brief_msg.buffer_text())
+    brief = brief_msg.buffer_text()
+    check("缓冲里的图注保留画面、不带采集元数据",
+          "一只熊猫捂着脸" in brief and "标签：" not in brief and "采集判定：" not in brief,
+          brief)
 
     # ---------- 10. 真图真模型（可选，会计费） ----------
     if "--live" in sys.argv:

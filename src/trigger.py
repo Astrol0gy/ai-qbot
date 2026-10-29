@@ -150,6 +150,16 @@ class MessageBuffer:
     def snapshot(self, conv_id):
         return tuple(self._buf.get(conv_id, ()))
 
+    def for_user(self, conv_id, user_id):
+        """A turn may consume only this author's expression addressed to the bot.
+
+        Other recipients remain available through recent() as routing background.
+        Including them here would let a successful answer erase unrelated input.
+        """
+        return tuple(e for e in self._buf.get(conv_id, ()) if e.user_id == user_id
+            and (e.at_bot or not (e.mention_user_ids or e.quote_author_id
+                and not e.quote_is_bot and e.quote_author_id != user_id)))
+
     def recent(self, conv_id):
         """Includes consumed messages so replying does not erase recipient evidence."""
         return tuple(self._recent.get(conv_id, ()))

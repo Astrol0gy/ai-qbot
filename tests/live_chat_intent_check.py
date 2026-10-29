@@ -81,7 +81,7 @@ def recording_tool(name, arguments, ctx):
     start = time.monotonic()
     # No unrelated external work or durable user state in this test.
     allowed = {'load_skill', 'read_skill_resource', 'reply', 'skip', 'list_stickers',
-               'send_sticker', 'web_search', 'fetch_url'}
+               'send_sticker', 'web_search', 'fetch_url', 'quote_message'}
     result = EXECUTE_ORIGINAL(name, arguments, ctx) if name in allowed else '本次测试不执行无关工具。'
     CURRENT['tool_calls'].append({'at_sec': round(start - CURRENT['_start'], 2),
         'elapsed_sec': round(time.monotonic() - start, 2), 'name': name,
@@ -101,7 +101,10 @@ class FakeQQ:
 def fixture_images():
     screenshot = Image.new('RGB', (1000, 500), '#20252b')
     draw = ImageDraw.Draw(screenshot)
-    font = ImageFont.truetype('C:/Windows/Fonts/consola.ttf', 28)
+    try:
+        font = ImageFont.truetype('C:/Windows/Fonts/consola.ttf', 28)
+    except OSError:
+        font = ImageFont.load_default(size=28)
     draw.text((30, 30), 'Python application - Connection error', font=font, fill='white')
     draw.multiline_text((30, 100), 'Traceback (most recent call last):\nConnectionRefusedError: [WinError 10061]\nNo connection could be made\nHost: 127.0.0.1    Port: 3001', font=font, fill='#ff8888', spacing=14)
     screenshot.save(REPORT_DIR / 'screenshot.png')

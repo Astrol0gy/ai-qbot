@@ -1,6 +1,7 @@
 """Separate sticker delivery, precise receipts and shared round budgets."""
 import asyncio
 import base64
+import io
 import json
 import tempfile
 from collections import defaultdict
@@ -9,6 +10,7 @@ import sys
 import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import deepseek_client as dc, runtime, stickers_utils
@@ -47,8 +49,8 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
                 messages = [call.args[1]["message"] for call in calls]
                 self.assertEqual([segment["type"] for segment in messages[0]], ["reply", "text"])
                 for message, path in zip(messages[1:], ("one.png", "two.png")):
-                    self.assertEqual(message, [{"type": "reply", "data": {"id": "42"}},
-                                               {"type": "image", "data": {"file": "base64://aW1hZ2U="}}])
+                    self.assertEqual(message, [{"type": "image", "data": {
+                        "file": "base64://aW1hZ2U=", "sub_type": 1, "summary": "[表情]"}}])
                 self.assertEqual(result.status, "ok")
                 self.assertEqual(result.text, "hello")
                 self.assertEqual(result.stickers, ("one.png", "two.png"))
@@ -70,7 +72,8 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
             receipt = await sender.send("", sticker_paths=["one.png"])
             self.assertEqual(api.await_count, 1)
             self.assertEqual(api.call_args.args[1]["message"],
-                             [{"type": "image", "data": {"file": "base64://aW1hZ2U="}}])
+                             [{"type": "image", "data": {
+                                 "file": "base64://aW1hZ2U=", "sub_type": 1, "summary": "[表情]"}}])
             self.assertEqual((receipt.status, receipt.text, receipt.stickers), ("ok", "", ("one.png",)))
 
     async def test_sticker_only_failure_sends_text_once(self):
@@ -83,7 +86,6 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
                         receipt = await sender.send("", reply_to="42", sticker_paths=["one.png"])
                     self.assertEqual(api.await_count, 2)
                     self.assertEqual(api.call_args.args[1]["message"], [
-                        {"type": "reply", "data": {"id": "42"}},
                         {"type": "text", "data": {"text": "（无语）"}}])
                     self.assertEqual((receipt.status, receipt.text, receipt.stickers), ("ok", "（无语）", ()))
                     used.assert_not_called()
@@ -168,7 +170,8 @@ class DeliveryCases(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipt.status, "ok")
         messages = [call.args[1]["message"] for call in api.call_args_list]
         self.assertEqual(messages[0], [{"type": "text", "data": {"text": "hello"}}])
-        self.assertEqual(messages[1:], [[{"type": "image", "data": {"file": "base64://aW1hZ2U="}}]] * 2)
+        self.assertEqual(messages[1:], [[{"type": "image", "data": {
+            "file": "base64://aW1hZ2U=", "sub_type": 1, "summary": "[表情]"}}]] * 2)
         used.assert_called_once_with("one.png")
 
     async def test_cancelled_offline_wait_keeps_only_confirmed_text(self):
@@ -223,15 +226,19 @@ class StickerTransportCases(unittest.IsolatedAsyncioTestCase):
     async def test_real_file_is_encoded_and_path_stays_out_of_platform_payload(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '表情.png'
-            data = b'\x89PNG\r\n\x1a\nimage'
-            path.write_bytes(data)
+            Image.new('RGB', (1280, 640), 'red').save(path)
+            data = path.read_bytes()
             api = AsyncMock(return_value=({}, 'ok'))
             sender = onebot.OneBotSender(NS(call_api_ex=api), False, 10, 20)
             with patch.object(stickers_utils, 'resolve', return_value=str(path)), \
+                 patch.object(stickers_utils, '_DIR', Path(folder)), \
                  patch.object(stickers_utils, 'mark_used'):
                 receipt = await sender.send('', sticker_paths=[str(path)])
             encoded = api.call_args.args[1]['message'][0]['data']['file']
-            self.assertEqual(base64.b64decode(encoded.removeprefix('base64://')), data)
+            with Image.open(io.BytesIO(base64.b64decode(encoded.removeprefix('base64://')))) as image:
+                self.assertEqual(image.size, (320, 160))
+                self.assertEqual(image.convert('RGB').getpixel((160, 80)), (255, 0, 0))
+            self.assertEqual(path.read_bytes(), data, '发送不能改动原图')
             self.assertNotIn(str(path), str(api.call_args))
             self.assertEqual(receipt.stickers, (str(path),))
 

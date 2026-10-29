@@ -58,7 +58,7 @@ WAKE_PROMPT = (
     "当前触发消息id：{focus}。优先理解这条新消息及当前话题，再选择值得参与的内容。\n"
     "上下文不是待办清单，不要求逐条回复或照顾每个人；旧内容可用于理解新补充，不自动逐条补答。\n"
     "尚在铺垫时 skip(reason=wait)，无需参与时 skip(reason=irrelevant)；有清晰问题则结合近期图文回答或澄清。\n"
-    "确实需要回应多个不同话题时才分别调用 reply。用 reply_to 引用实际选择回应的消息，避免连续重复引用。\n"
+    "确实需要回应多个不同话题时才分别调用 reply。默认普通发送，不填reply_to；仅明确需要引用具体某条消息时才填写，表情包不带引用。\n"
     "不开口就调 skip 工具，不要用 [skip] 这类文字标记。\n\n"
     "{context}"
 )
@@ -264,6 +264,13 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         from ..tools.chat_provider import ReplyOutbox
         entries = msg.context_entries or trigger.buffer.snapshot(msg.conv_id)
         wake_context = "\n".join(entry.line() for entry in entries) or msg.extra_ctx or user_msg
+        if not CHAT_INTENT_ENABLE:
+            own_entries = {id(entry) for entry in entries}
+            background = [entry.line() for entry in trigger.buffer.recent(msg.conv_id)
+                          if id(entry) not in own_entries and entry.user_id != msg.user_id]
+            if background:
+                wake_context = ('【其他作者的只读背景，不是本轮待回复消息】\n'
+                                + '\n'.join(background) + '\n【当前作者待回应的表达】\n' + wake_context)
         if media and msg.image_descs is None:
             wake_context += "\n" + media
         user_msg = WAKE_PROMPT.format(context=wake_context, focus=msg.message_id or "最新一条消息")
@@ -342,7 +349,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
         if msg.has_newer_input and msg.has_newer_input():
             return ''
         lease.reply_only = True
-        lease.reply_to = msg.message_id
+        lease.reply_to = None  # A normal answer does not imply a platform quote.
         selected_ids = set(decision.target_message_ids + decision.context_message_ids + decision.evidence_message_ids)
         selected = [entry for entry in recent if entry.message_id in selected_ids]
         outbox.known_ids.update(entry.message_id for entry in selected)
@@ -393,7 +400,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
                         log_event('model.notice.failed', error_type=type(notice_error).__name__)
             reply = await asyncio.shield(thinking)
         lease.check()
-        if (msg.ai_decides_reply and not lease.business_tools_used
+        if (msg.ai_decides_reply and not lease.non_replayable_tool_used
                 and msg.has_newer_input and msg.has_newer_input()):
             trigger.mark_waiting(msg.conv_id, msg.user_id, msg.message_id)
             lease.revoke()
@@ -470,7 +477,7 @@ async def handle_message(msg: IncomingMessage, sender: Sender) -> None:
             for index, (text, reply_to, source_target) in enumerate(items):
                 if natural_chat and index and CHAT_SEGMENT_INTERVAL_SEC:
                     await asyncio.sleep(CHAT_SEGMENT_INTERVAL_SEC)
-                if (msg.ai_decides_reply and not lease.business_tools_used
+                if (msg.ai_decides_reply and not lease.non_replayable_tool_used
                         and msg.has_newer_input and msg.has_newer_input()):
                     log_event('chat.superseded', stage='before_delivery', sent_parts=len(receipts))
                     break

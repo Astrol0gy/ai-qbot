@@ -190,8 +190,11 @@ def _sticker_base64(payload):
     path = stickers_utils.resolve(payload)
     if path is None:
         return None
+    prepared = stickers_utils.prepare_sticker(path)
+    if prepared is None:
+        return None
     try:
-        with Path(path).open('rb') as image:
+        with Path(prepared).open('rb') as image:
             data = image.read(STICKER_MAX_BYTES + 1)
     except OSError:
         return None
@@ -267,11 +270,11 @@ class OneBotSender(Sender):
                 segments.append({"type": "text", "data": {"text": text}})
             parts.append((segments, SendResult(API_OK, text, tuple(urls))))
         for path, encoded in stickers:
-            parts.append(([{"type": "image", "data": {"file": encoded}}],
+            parts.append(([{"type": "image", "data": {"file": encoded, "sub_type": 1, "summary": "[表情]"}}],
                           SendResult(API_OK, stickers=(path,))))
         receipts = []
         for segments, content in parts:
-            if reply_to:
+            if reply_to and not content.stickers:
                 segments.insert(0, {"type": "reply", "data": {"id": str(reply_to)}})
             receipt = await self._send_part(segments, content, receipts,
                                             max_attempts=1 if sticker_only else 3)
@@ -291,8 +294,6 @@ class OneBotSender(Sender):
         from .. import stickers_utils
         text = stickers_utils.fallback_text(path)
         segments = [{"type": "text", "data": {"text": text}}]
-        if reply_to:
-            segments.insert(0, {"type": "reply", "data": {"id": str(reply_to)}})
         print("[表情包降级] 尝试文字兜底")
         receipt = await self._send_part(segments, SendResult(API_OK, text), earlier, max_attempts=1)
         self._pending_result = self._combine([*earlier, receipt])
@@ -723,39 +724,47 @@ class OneBotClient:
     def _has_newer_input(self, incoming):
         for later, _ in self._queue.pending(incoming.conv_id):
             if (later.user_id == incoming.user_id and self._batchable(later)
-                    and not later.wait_recheck and not later.addressed_to_others
-                    and (not later.raw.get('reply_id') or later.is_at_bot)):
-                return True
+                    and not later.wait_recheck and not later.addressed_to_others):
+                reply_id = later.raw.get('reply_id')
+                if not reply_id or later.is_at_bot:
+                    return True
+                if later.quote and (later.quote.is_bot or later.quote.author_id == incoming.user_id):
+                    return True
+                # Queued messages have not fetched their quote yet. An explicit
+                # reply to this author's known input is still their supplement;
+                # unknown/other authors' quotes cannot interrupt this answer.
+                if reply_id == incoming.message_id or any(
+                        e.message_id == reply_id and e.user_id == incoming.user_id
+                        for e in trigger.buffer.recent(incoming.conv_id)):
+                    return True
         return False
 
     async def _prepare_batch(self, items):
         candidates = []
+        contexts = {}
         for incoming, sender in items:
             result = await self._prepare(incoming, batching=True)
+            # The recent-context cache can be smaller than a collected batch.
+            # Retain the actual entries while enriching, before later authors
+            # or supplements evict them; rebuilding at dispatch loses input.
+            author_entries = contexts.setdefault(incoming.user_id, {})
+            for entry in trigger.buffer.for_user(incoming.conv_id, incoming.user_id):
+                author_entries[id(entry)] = entry
             if result.decision is Decision.WAKE:
                 candidates.append((incoming, sender))
         if not candidates:
             return
-        if CHAT_INTENT_ENABLE:
-            # Merge each author's burst, not different people's pending requests.
-            # Otherwise a later bystander's statement can erase an earlier @.
-            authors = {}
-            for candidate in candidates:
-                user = candidate[0].user_id
-                authors.pop(user, None)
-                authors[user] = candidate
-            for incoming, sender in authors.values():
-                incoming.context_entries = tuple(e for e in trigger.buffer.snapshot(incoming.conv_id)
-                                                 if e.user_id == incoming.user_id)
-                incoming.extra_ctx = trigger.buffer.peek(incoming.conv_id)
-                await self._dispatch(incoming, sender)
-            return
-        # Keep every message in the shared buffer, including other participants.
-        # The last eligible wake provides focus, not authorship for the entire batch.
-        incoming, sender = candidates[-1]
-        incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
-        incoming.extra_ctx = trigger.buffer.peek(incoming.conv_id)
-        await self._dispatch(incoming, sender)
+        # Both routing modes merge by author. A later bystander must not erase
+        # another author's request or consume their still-unanswered expression.
+        authors = {}
+        for candidate in candidates:
+            user = candidate[0].user_id
+            authors.pop(user, None)
+            authors[user] = candidate
+        for incoming, sender in authors.values():
+            incoming.context_entries = tuple(contexts[incoming.user_id].values())
+            incoming.extra_ctx = trigger.buffer.peek(incoming.conv_id)
+            await self._dispatch(incoming, sender)
 
     @traced_message
     async def _prepare_and_dispatch(self, item):
@@ -764,7 +773,7 @@ class OneBotClient:
             state = trigger.waiting_for(incoming.conv_id, incoming.user_id)
             if state is not incoming.waiting_token:
                 return
-            incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
+            incoming.context_entries = trigger.buffer.for_user(incoming.conv_id, incoming.user_id)
             if not incoming.context_entries:
                 trigger.clear_waiting(incoming.conv_id, incoming.user_id)
                 return
@@ -809,7 +818,7 @@ class OneBotClient:
             incoming.ai_decides_reply = True
             incoming.is_interjection = not incoming.is_at_bot
             incoming.extra_ctx = result.context
-            incoming.context_entries = trigger.buffer.snapshot(incoming.conv_id)
+            incoming.context_entries = trigger.buffer.for_user(incoming.conv_id, incoming.user_id)
         incoming.wake_started_at = time.monotonic()
         return result
 
@@ -837,6 +846,12 @@ class OneBotClient:
         await asyncio.sleep(max(0, state[0] - time.monotonic()))
         if trigger.waiting_for(incoming.conv_id, incoming.user_id) is not state:
             return
+        # Once submitted, this task can own the entire conversation queue.
+        # Retire the timer handle first: replacing a wait must never cancel the
+        # queue owner and discard messages enqueued behind the timeout recheck.
+        key = (incoming.conv_id, incoming.user_id)
+        if self._wait_tasks.get(key) is asyncio.current_task():
+            self._wait_tasks.pop(key)
         retry = replace(incoming, wait_recheck=True, waiting_token=state,
                         is_at_bot=False, is_interjection=True, context_entries=(),
                         trace_id=uuid.uuid4().hex)

@@ -167,6 +167,7 @@ class RoundLease:
         self.valid = True
         self.progress = ("model", "", time.monotonic(), object())
         self.business_tools_used = False
+        self.non_replayable_tool_used = False
         self.chat_segments_allowed = True
         self.brief_chat = False
         self.focus_text = None
@@ -241,6 +242,8 @@ def reset_context(conv_id):
         from . import deepseek_client
         from .trigger import trigger
         invalidate(conv_id)
+        if deepseek_client._history_store is not None:
+            deepseek_client._history_store.clear(conv_id)
         deepseek_client._conversations.pop(conv_id, None)
         trigger.buffer.clear(conv_id)
         trigger.clear_waiting(conv_id)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from .. import sticker_rag, stickers_utils
 from ..config import STICKER_ENABLE
-from ..vision_utils import describe_image, text_to_image
+from ..vision_utils import describe_image, text_to_image, strip_tag_line
 
 from . import ToolProvider
 from .search_provider import extract_page_images, official_search_results
@@ -135,6 +135,7 @@ class ImageProvider(ToolProvider):
                     "用语义检索从本地表情包库挑图，返回按相似度排序的 top3 候选。"
                     "用图片表达情绪或玩笑（无语、震惊、好笑、赞同、委屈、卖萌、认输……）。"
                     "每条候选都带 rank、标签和一行 [img]库里的文件路径[/img]；"
+                    "随后系统会把这些候选的真实图片交给你看图，核对实际画面和文字后再选；标签可能有误。"
                     "挑最贴合的一条，把它**原样**放进回复里，也可以只发图、不配文字。"
                     "有贴合候选就选一条，无需等用户索要；都不贴合就用文字，不反复检索硬凑。"
                     "认真求助、严肃问答、现实痛苦或冲突、用户要求纯文字时专注文字；轻松吐槽和打趣可以用。"
@@ -171,7 +172,7 @@ class ImageProvider(ToolProvider):
                 "不要换 URL 反复重试，也不要猜图里的内容：按「没看到图」继续回应，"
                 "需要图才能答就直接说明没看清、请对方描述一下。"
             )
-        return result
+        return strip_tag_line(result)
 
     # --- search_images ---
     @staticmethod
@@ -240,7 +241,7 @@ class ImageProvider(ToolProvider):
     @staticmethod
     def _format_candidates(candidates) -> str:
         lines = [
-            "按语义相似度选出的候选（挑最贴合的一条，把它的 [img]…[/img] 原样放进回复）："
+            "按语义相似度选出的候选（随后先看真实图片核对内容，不只凭标签；确认贴合后再选一条[img]）："
         ]
         for candidate in candidates:
             lines.append(f"{candidate.rank}. [img]{candidate.path}[/img]")

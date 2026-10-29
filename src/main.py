@@ -50,6 +50,13 @@ async def _run_onebot_channel() -> None:
 async def main() -> None:
     validate()  # 启动前检查配置
     from . import group_memory
+    from . import deepseek_client
+    from .history_store import HistoryStore
+    deepseek_client._history_store = HistoryStore()
+    restored = deepseek_client._history_store.load_all()
+    deepseek_client._conversations.update(restored)
+    from .observability import log_event
+    log_event('history.loaded', conversations=len(restored))
     from pathlib import Path
     from .user_profile import PROFILES_DIR
     legacy_count = sum(1 for _ in Path(PROFILES_DIR).glob("*.md"))

@@ -43,7 +43,7 @@ from .tools import (
     has_tool,
     needs_context as tool_needs_context,
 )
-from .tools.chat_provider import (CHAT_POLICY, CHAT_TOOL_NAMES, ReplyOutbox, ChatProvider,
+from .tools.chat_provider import (CHAT_POLICY, CHAT_TOOL_NAMES, QUOTE_TOOL, ReplyOutbox, ChatProvider,
                                  reply_text_length, style_requirement)
 from . import runtime
 from . import skills
@@ -68,6 +68,7 @@ client = AsyncOpenAI(
 
 # 按群维度存储对话历史（群内所有用户共享同一上下文，消息带说话者标识区分是谁说的）
 _conversations: dict[str, list[dict]] = defaultdict(list)
+_history_store = None  # Enabled by the service entrypoint; standalone callers remain in-memory.
 
 
 # ============================================
@@ -233,8 +234,13 @@ async def _chat_round(
     if outbox is not None and not reply_only:
         controls.update(CHAT_TOOL_NAMES)
         enabled_names.update(CHAT_TOOL_NAMES)
+    if reply_only:
+        controls.add(QUOTE_TOOL)
+        enabled_names.add(QUOTE_TOOL)
     skill_session = skills.SkillSession(enabled_names, set(get_tool_names()))
     ctx.extra["skills"] = skill_session
+    ctx.extra['sticker_previews'] = frozenset()
+    ctx.extra['delivery'] = {'quote_to': None}
     ctx.extra['style_skill'] = skills.STYLE_SKILL_NAME if CHAT_STYLE_SKILL_ENABLE and not dm_mode else None
     if ctx.extra['style_skill'] and skills.get_skill(skills.STYLE_SKILL_NAME) is None:
         raise ValueError('表达技能缺失：' + skills.STYLE_SKILL_NAME)
@@ -361,14 +367,15 @@ async def _chat_round(
 
     def queue_answer(text):
         before = len(outbox.items)
-        result = ChatProvider._reply(ctx, text=text, reply_to=lease.reply_to,
+        result = ChatProvider._reply(ctx, text=text, reply_to=ctx.extra['delivery']['quote_to'],
             recipient=lease.intent_decision.recipient, expression='complete')
         return len(outbox.items) > before, result
 
     def plain_answer_problem(text):
         if not text.strip():
             return '请输出可发送的回答正文。'
-        problem = style_requirement(ctx, text)
+        from .sticker_preview import selection_problem
+        problem = selection_problem(ctx, text) or style_requirement(ctx, text)
         if not problem and brief_chat and reply_text_length(text) > CHAT_BRIEF_MAX_CHARS:
             problem = (f'草稿实际{reply_text_length(text)}字符，上限{CHAT_BRIEF_MAX_CHARS}，中英文、数字和标点都计数。'
                 f'请重写成约{max(10,CHAT_BRIEF_MAX_CHARS//2)}字的一两句，只留用户问到的内容，删去未要求的科普和建议；不直接截断，不删必要事实或限定词。')
@@ -417,6 +424,7 @@ async def _chat_round(
             messages.append(msg)
 
             all_blocked = True
+            preview_results = []
             available_names = ", ".join(sorted(allowed_for_request))
             for tc in msg.tool_calls:
                 tool_name = tc.function.name
@@ -458,8 +466,12 @@ async def _chat_round(
                 else:
                     all_blocked = False
                     _tool_call_counts[tool_name] = count + 1
-                    if lease and tool_name not in CHAT_TOOL_NAMES and tool_name not in skills.SKILL_TOOL_NAMES:
+                    if lease and tool_name not in CHAT_TOOL_NAMES and tool_name != QUOTE_TOOL and tool_name not in skills.SKILL_TOOL_NAMES:
                         lease.business_tools_used = True
+                    if lease and tool_name == 'text_to_image':
+                        # This external paid operation cannot be rolled back by revoking
+                        # a local lease. Preserve its result rather than charging twice.
+                        lease.non_replayable_tool_used = True
                     # 工具实现全是同步阻塞的（requests，单次 8~10s）。直接在事件循环里调，
                     # 一次高德/搜索往返就把所有群、两条通道一起冻住，长考提示与取消也无法
                     # 及时处理。丢进工作线程后，事件循环才能继续处理其他会话和定时器。
@@ -479,6 +491,17 @@ async def _chat_round(
                         "tool_call_id": tc.id,
                         "content": result,
                     })
+                    if tool_name == 'send_sticker':
+                        preview_results.append(str(result))
+
+            # Append pixels only after all tool responses, so the protocol remains valid.
+            # The next main-model request, rather than a tag-only/secondary agent, sees them.
+            if preview_results:
+                from .sticker_preview import build_previews
+                preview, viewed = await runtime.run_blocking(build_previews, '\n'.join(preview_results))
+                ctx.extra['sticker_previews'] = ctx.extra['sticker_previews'] | viewed
+                if preview:
+                    messages.append(preview)
 
             if outbox is not None and (outbox.has_items or outbox.skipped):
                 # A control decision completes this round. Further model turns
@@ -762,6 +785,13 @@ def _stage_history(key, history):
 def _store_history(key, history):
     _conversations.pop(key, None)
     _conversations[key] = history[-max(2, MAX_HISTORY_LENGTH * 2 + 2):]
+    if _history_store is not None:
+        try:
+            _history_store.save(key, _conversations[key])
+            log_event('history.saved', conversation_id=key, messages=len(_conversations[key]),
+                      has_summary=any(m.get('content', '').startswith(_SUMMARY_MARKER) for m in _conversations[key]))
+        except (OSError, ValueError):
+            log_event('history.save.failed', conversation_id=key)
     while len(_conversations) > 500:
         _conversations.pop(next(iter(_conversations)))
 

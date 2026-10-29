@@ -22,6 +22,10 @@
 
 ## 离线检查
 
+表情/记忆/连续消息专项：`sticker_vision_check.py`、`reply_delivery_check.py`、`sticker_media_check.py`、`sticker_classification_check.py`、`group_memory_check.py`、`history_persistence_check.py`、`history_compress_check.py`及`turn_timing_check.py`。Windows建议设置`PYTHONUTF8=1`和`PYTHONIOENCODING=utf-8`；假模型检查使用测试占位Key。
+
+真实表情自查：在带有现有API配置的隔离副本中，运行`python tests/live_sticker_vision_check.py --repeats 2`，`STICKER_DIR`指向复制出的测试库，CLIP模型目录可只读复用。只运行主回答模型、真实RAG和看图，QQ发送不执行，验证错误标签不能替代可见画面。分类复测使用`live_sticker_classification_check.py --root <复制库目录> --repeats 2`；不触发采集或QQ发送。报告在`data/live_checks/`，不得提交凭据、原始聊天或生产图片。
+
 以下检查使用假模型、假平台 API 和临时数据；表情包和代理检查只启动本机测试服务，不调用付费服务。
 
 ```bash

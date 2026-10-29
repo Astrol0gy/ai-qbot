@@ -88,7 +88,7 @@ class MemoryService:
             return False
         snapshot=await asyncio.to_thread(self.store.snapshot,group_id,prune=True)
         pending=snapshot['pending_ids']
-        if len(pending)<2:
+        if not pending:
             return False
         first=next(m['time'] for m in snapshot['messages'] if m['id']==pending[0])
         if not force and len(pending)<self.batch_size and now-first<self.interval:

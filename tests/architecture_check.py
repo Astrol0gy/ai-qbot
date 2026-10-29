@@ -97,11 +97,13 @@ class ArchitectureCases(unittest.IsolatedAsyncioTestCase):
             args = {"action":"remember", "info":"甲的偏好"}
             if source:
                 args["source_message_id"] = source
-            self.assertIn("失败", tools.execute("manage_user_profile", json.dumps(args), context))
+            self.assertIn("未执行", tools.execute("manage_user_profile", json.dumps(args), context))
         args["source_message_id"] = "m1"
+        self.assertIn("未执行", tools.execute("manage_user_profile", json.dumps(args), context))
+        self.assertNotIn("甲的偏好", up.list_profile("g", "a"))
+        args["source_message_id"] = "m2"
         self.assertIn("已记住", tools.execute("manage_user_profile", json.dumps(args), context))
-        self.assertIn("甲的偏好", up.list_profile("g", "a"))
-        self.assertNotIn("甲的偏好", up.list_profile("g", "b"))
+        self.assertIn("甲的偏好", up.list_profile("g", "b"))
 
     def test_schema_checks_required_enum_boolean_and_nonfinite_numbers(self):
         definitions = tools.get_definitions()

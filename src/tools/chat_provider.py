@@ -28,6 +28,7 @@ from ..config import CHAT_BRIEF_MAX_CHARS
 
 REPLY_TOOL = "reply"
 SKIP_TOOL = "skip"
+QUOTE_TOOL = "quote_message"
 
 #: 本 Provider 的工具名（普通群聊唤醒路径按它显式注入；私聊、跑团不要注入）
 CHAT_TOOL_NAMES = frozenset({REPLY_TOOL, SKIP_TOOL})
@@ -115,6 +116,14 @@ class ChatProvider(ToolProvider):
     def get_tools(self) -> list[dict]:
         return [
             {
+                'name': QUOTE_TOOL, 'tag': '引用选择',
+                'description': '仅在用户明确要求引用某条消息，或跨话题回答不引用就会指代不清时使用。'
+                    '指定要引用的本轮message_id。普通接话直接输出正文，不调用此工具；表情包始终独立发送、不带引用。',
+                'parameters': {'type': 'object', 'properties': {'message_id': {'type': 'string'}},
+                               'required': ['message_id'], 'additionalProperties': False},
+                'handler': self._quote, 'max_calls': 1, 'needs_context': True, 'hidden': True,
+            },
+            {
                 "name": REPLY_TOOL,
                 "tag": "回复整理",
                 "description": (
@@ -122,7 +131,8 @@ class ChatProvider(ToolProvider):
                     "先确认用户自己的文字表达完整；截图报错和表情不能补全未说完的时间、条件、原因等铺垫从句，未说完必须用 skip(reason=wait)，不能提前排错。"
                     "旧内容仍可用于理解补充，不逐条补答已回应或不参与的话题。同一话题可以合并回应。"
                     "确实需要分别回应不同话题时才多次调用。普通聊天想自然分条时，用一次 text 内的空行表示语义停顿。"
-                    "reply_to 可引用你实际选择回应的消息；不想参与时用 skip。"
+                    "普通接话不要填写reply_to；只有明确需要指向具体某条消息、避免歧义或用户要求引用时才填写。"
+                    "reply是提交回答的控制工具，不代表要使用QQ的引用排版；不想参与时用 skip。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -134,8 +144,7 @@ class ChatProvider(ToolProvider):
                         "reply_to": {
                             "type": "string",
                             "description": (
-                                "可选：要引用的那条消息的 id（上下文里每条消息末尾给出）。"
-                                "留空就是普通发言"
+                                "默认留空，普通发言不引用。仅用户要求引用或必须明确指向某条消息时填写其id。表情包不带引用。"
                             ),
                         },
                         "recipient": {"type": "string", "enum": ["bot", "group", "others", "unclear"],
@@ -174,6 +183,14 @@ class ChatProvider(ToolProvider):
     # ------------------------------------------------------------------
     # handler：第一个参数是本轮的会话上下文（注册表按 needs_context 传入）
     @staticmethod
+    def _quote(context: ChatContext, message_id: str) -> str:
+        outbox = context.outbox
+        if not isinstance(outbox, ReplyOutbox) or message_id not in outbox.known_ids:
+            return '引用未设置：message_id必须来自本轮可回应消息。普通接话直接回答即可。'
+        context.extra['delivery']['quote_to'] = message_id
+        return '已选择引用该消息；最终正文由程序投递，表情包仍不带引用。'
+
+    @staticmethod
     def _outbox_of(context: ChatContext) -> ReplyOutbox | None:
         """表态箱在 ChatContext 里；私聊/跑团等路径不注入这两个工具，也不该走到这里"""
         outbox = getattr(context, "outbox", None)
@@ -188,6 +205,10 @@ class ChatProvider(ToolProvider):
         if not str(text).strip():
             return "reply 缺少 text，没有记录任何内容。"
         content = str(text).strip()
+        from ..sticker_preview import selection_problem
+        sticker_error = selection_problem(context, content)
+        if sticker_error:
+            return sticker_error
         style_error = style_requirement(context, content)
         if style_error:
             return style_error

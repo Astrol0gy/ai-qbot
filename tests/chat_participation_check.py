@@ -166,7 +166,9 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
         execute = tools.execute
         def fake_tool(name, args, ctx):
             return '[img]chosen.gif[/img]' if name=='send_sticker' else execute(name,args,ctx)
-        with patch.object(dc,'execute_tool',fake_tool), patch.object(stickers_utils,'resolve',return_value='chosen.gif'):
+        with patch.object(dc,'execute_tool',fake_tool), patch.object(stickers_utils,'resolve',return_value='chosen.gif'), \
+             patch('src.sticker_preview.build_previews', return_value=(
+                 {'role':'user','content':[{'type':'text','text':'已读取候选真实图片'}]}, frozenset({'chosen.gif'}))):
             sender, model = await self.chat(responses,text='发一张表情包')
         self.assertEqual(sender.sent[0]['stickers'], ['chosen.gif'])
         self.assertEqual(len(model.requests), 4)
@@ -226,7 +228,9 @@ class ParticipationCases(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(name, ctx.allowed_tools)
                 return '[img]chosen.gif[/img]'
             return execute(name,args,ctx)
-        with patch.object(dc,'execute_tool',fake_tool), patch.object(stickers_utils,'resolve',return_value='chosen.gif'):
+        with patch.object(dc,'execute_tool',fake_tool), patch.object(stickers_utils,'resolve',return_value='chosen.gif'), \
+             patch('src.sticker_preview.build_previews', return_value=(
+                 {'role':'user','content':[{'type':'text','text':'已读取候选真实图片'}]}, frozenset({'chosen.gif'}))):
             sender, model = await self.chat(responses, text='发个表情包')
         self.assertEqual(sender.sent[0]['stickers'], ['chosen.gif'])
         first = model.requests[0]
